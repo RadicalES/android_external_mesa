@@ -3055,6 +3055,8 @@ cc_library_shared {
         "liblog",
         "libnativewindow",
         "libsync",
+        "libui",
+        "libutils",
         "libz",
     ],
     static_libs: [
@@ -3101,6 +3103,7 @@ cc_library_shared {
         "desktop_mesa3d_panvk_src_util_libmesa_util_simd_a",
         "desktop_mesa3d_panvk_src_util_libxmlconfig_a",
         "desktop_mesa3d_panvk_src_util_u_gralloc_lib_mesa_u_gralloc_a",
+        "rock5_mesa_u_gralloc_imapper5",
         "desktop_mesa3d_panvk_src_vulkan_util_libvulkan_util_a",
         "libperfetto_client_experimental",
     ],
@@ -4088,6 +4091,7 @@ cc_library_static {
 cc_library_static {
     name: "desktop_mesa3d_panvk_src_util_u_gralloc_lib_mesa_u_gralloc_a",
     srcs: ["src/util/u_gralloc/*.c"],
+    cflags: ["-DUSE_IMAPPER4_METADATA_API"],
     local_include_dirs: [
         "include",
         "include/android_stub",
@@ -4928,4 +4932,33 @@ python_defaults {
         "mako",
         "pyyaml",
     ],
+}
+
+// Added by hand (rock5): meson only builds this backend when it finds libui,
+// which the android-stub build lacks. Without it Mesa uses the fallback
+// gralloc, which reports DRM_FORMAT_MOD_INVALID for every buffer.
+cc_library_static {
+    name: "rock5_mesa_u_gralloc_imapper5",
+    srcs: ["src/util/u_gralloc/u_gralloc_imapper5_api.cpp"],
+    cflags: [
+        "-DUSE_IMAPPER4_METADATA_API",
+        "-Wno-error",
+        "-Wno-unused-parameter",
+    ],
+    cpp_std: "c++17",
+    local_include_dirs: [
+        "include",
+        "meson_generated/src",
+        "src",
+        "src/util/u_gralloc",
+    ],
+    shared_libs: [
+        "libcutils",
+        "liblog",
+        "libnativewindow",
+        "libui",
+        "libutils",
+    ],
+    defaults: ["android.hardware.graphics.common-ndk_shared"],
+    soc_specific: true,
 }
