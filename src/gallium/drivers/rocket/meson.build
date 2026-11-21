@@ -5,6 +5,7 @@ rocket_registers = custom_target(
   'rkt_registers.h',
   input : ['gen_header.py', 'registers.xml'],
   output : 'rkt_registers.h',
+  depend_files : files('gen_parser.py'),
   command : [prog_python, '@INPUT0@', '--rnn', '.', '--xml', '@INPUT1@', 'c-defines'],
   capture : true,
 )
