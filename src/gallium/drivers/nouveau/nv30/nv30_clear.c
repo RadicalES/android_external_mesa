@@ -51,7 +51,9 @@ pack_zeta(enum pipe_format format, double depth, unsigned stencil)
 }
 
 static void
-nv30_clear(struct pipe_context *pipe, unsigned buffers, const struct pipe_scissor_state *scissor_state,
+nv30_clear(struct pipe_context *pipe, unsigned buffers,
+           uint32_t color_clear_mask, uint8_t stencil_clear_mask,
+           const struct pipe_scissor_state *scissor_state,
            const union pipe_color_union *color, double depth, unsigned stencil)
 {
    struct nv30_context *nv30 = nv30_context(pipe);
@@ -119,6 +121,11 @@ nv30_clear(struct pipe_context *pipe, unsigned buffers, const struct pipe_scisso
    nv30->state.scissor_off = 0;
 }
 
+/* Callers may pass a plain pipe_surface template, such as the one
+ * util_clear_texture_as_surface builds on the stack, rather than a surface
+ * made by nv30_miptree_surface_new. Reading nv30_surface fields from a
+ * template reads past its end, so fill the driver surface here.
+ */
 static void
 nv30_clear_render_target(struct pipe_context *pipe, struct pipe_surface *ps,
                          const union pipe_color_union *color,
@@ -126,11 +133,14 @@ nv30_clear_render_target(struct pipe_context *pipe, struct pipe_surface *ps,
                          bool render_condition_enabled)
 {
    struct nv30_context *nv30 = nv30_context(pipe);
-   struct nv30_surface *sf = nv30_surface(ps);
+   struct nv30_surface surf = {0};
+   struct nv30_surface *sf = &surf;
    struct nv30_miptree *mt = nv30_miptree(ps->texture);
    struct nouveau_pushbuf *push = nv30->base.pushbuf;
    struct nouveau_object *eng3d = nv30->screen->eng3d;
    uint32_t rt_format;
+
+   nv30_miptree_surface_init(sf, ps->texture, ps);
 
    rt_format = nv30_format(pipe->screen, ps->format)->hw;
    if (util_format_get_blocksize(ps->format) == 4)
@@ -184,11 +194,14 @@ nv30_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *ps,
                          bool render_condition_enabled)
 {
    struct nv30_context *nv30 = nv30_context(pipe);
-   struct nv30_surface *sf = nv30_surface(ps);
+   struct nv30_surface surf = {0};
+   struct nv30_surface *sf = &surf;
    struct nv30_miptree *mt = nv30_miptree(ps->texture);
    struct nouveau_pushbuf *push = nv30->base.pushbuf;
    struct nouveau_object *eng3d = nv30->screen->eng3d;
    uint32_t rt_format, mode = 0;
+
+   nv30_miptree_surface_init(sf, ps->texture, ps);
 
    rt_format = nv30_format(pipe->screen, ps->format)->hw;
    if (util_format_get_blocksize(ps->format) == 4)

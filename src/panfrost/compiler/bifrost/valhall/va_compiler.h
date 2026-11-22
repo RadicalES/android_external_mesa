@@ -24,6 +24,7 @@ void va_assign_slots(bi_context *ctx);
 void va_insert_flow_control_nops(bi_context *ctx);
 void va_merge_flow(bi_context *ctx);
 void va_mark_last(bi_context *ctx);
+void va_gather_hsr_info(bi_context *ctx, struct pan_shader_info *info);
 uint64_t va_pack_instr(const bi_instr *I, unsigned arch);
 
 static inline unsigned
@@ -76,7 +77,7 @@ struct va_stats {
    unsigned nr_fau_uniforms;
 };
 
-void va_count_instr_stats(bi_instr *I, struct va_stats *stats);
+void va_count_instr_stats(bi_instr *I, struct va_stats *stats, unsigned arch);
 
 #ifdef __cplusplus
 } /* extern C */

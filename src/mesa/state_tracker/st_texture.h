@@ -30,6 +30,8 @@
 
 
 #include "pipe/p_context.h"
+#include "pipe/p_screen.h"
+#include "util/format/u_format.h"
 #include "util/u_sampler.h"
 #include "util/simple_mtx.h"
 
@@ -62,8 +64,6 @@ struct st_sampler_view
 
    /** The glsl version of the shader seen during validation */
    bool glsl130_or_later;
-   /** Derived from the sampler's sRGBDecode state during validation */
-   bool srgb_skip_decode;
 };
 
 
@@ -126,6 +126,18 @@ st_get_view_format(struct gl_texture_object *stObj)
    if (!stObj)
       return PIPE_FORMAT_NONE;
    return stObj->surface_based ? stObj->surface_format : stObj->pt->format;
+}
+
+static inline bool
+st_needs_yuv_plane_views(struct pipe_screen *screen,
+                         enum pipe_format view_format,
+                         const struct pipe_resource *pt)
+{
+   if (view_format != pt->format)
+      return true;
+
+   return util_format_is_yuv(view_format) &&
+          screen->caps.needs_split_planar_samplers;
 }
 
 
@@ -222,6 +234,21 @@ st_astc_format_fallback(const struct st_context *st, mesa_format format);
 bool
 st_compressed_format_fallback(struct st_context *st, mesa_format format);
 
+static inline unsigned
+st_image_access(GLenum access)
+{
+   switch (access) {
+   case GL_READ_ONLY:
+      return PIPE_IMAGE_ACCESS_READ;
+   case GL_WRITE_ONLY:
+      return PIPE_IMAGE_ACCESS_WRITE;
+   case GL_READ_WRITE:
+      return PIPE_IMAGE_ACCESS_READ_WRITE;
+   default:
+      UNREACHABLE("bad image access");
+   }
+}
+
 void
 st_convert_image(const struct st_context *st, const struct gl_image_unit *u,
                  struct pipe_image_view *img, enum gl_access_qualifier shader_access);
@@ -251,7 +278,9 @@ st_convert_sampler_from_unit(const struct st_context *st,
 struct pipe_sampler_view *
 st_update_single_texture(struct st_context *st,
                          GLuint texUnit, bool glsl130_or_later,
-                         bool ignore_srgb_decode);
+                         bool ignore_srgb_decode,
+                         unsigned num_norelease_views,
+                         const struct pipe_sampler_view **norelease_views);
 
 unsigned
 st_get_sampler_views(struct st_context *st,

@@ -8,12 +8,10 @@
 
 #include "aco_ir.h"
 
+#include "nir.h"
 #include "util/memstream.h"
 
 #include "ac_gpu_info.h"
-#include "nir.h"
-#include <array>
-#include <iostream>
 #include <vector>
 
 using namespace aco;
@@ -182,6 +180,36 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
    return llvm_ir;
 }
 
+static void
+finish_program(Program* program, bool append_endpgm, const std::string& ir,
+               const struct aco_compiler_options* options, aco_callback* build_binary,
+               void** binary)
+{
+   aco_callback_params params = {};
+
+   std::vector<uint32_t> code;
+   std::vector<struct aco_symbol> symbols;
+   emit_program(program, code, symbols, append_endpgm, &params);
+
+   if (program->collect_statistics)
+      collect_postasm_stats(program, code);
+
+   std::string disasm;
+   if (options->record_asm)
+      disasm = get_disasm_string(program, options->family, code, params.exec_size);
+
+   params.config = *program->config;
+   params.wave_size = program->wave_size;
+   params.stats = program->collect_statistics ? &program->statistics : NULL;
+   params.ir_str = ir.data();
+   params.ir_size = ir.size();
+   params.disasm_str = disasm.c_str();
+   params.disasm_size = disasm.size();
+   params.debug_info = program->debug_info.data();
+   params.debug_info_count = program->debug_info.size();
+   (*build_binary)(binary, &params);
+}
+
 typedef void(select_shader_part_callback)(Program* program, void* pinfo, ac_shader_config* config,
                                           const struct aco_compiler_options* options,
                                           const struct aco_shader_info* info,
@@ -191,8 +219,7 @@ static void
 aco_compile_shader_part(const struct aco_compiler_options* options,
                         const struct aco_shader_info* info, const struct ac_shader_args* args,
                         select_shader_part_callback select_shader_part, void* pinfo,
-                        aco_shader_part_callback* build_binary, void** binary,
-                        bool is_prolog = false)
+                        aco_callback* build_binary, void** binary, bool is_prolog = false)
 {
    init();
 
@@ -202,9 +229,6 @@ aco_compile_shader_part(const struct aco_compiler_options* options,
    program->collect_statistics = options->record_stats;
    memset(&program->statistics, 0, sizeof(program->statistics));
 
-   program->debug.func = options->debug.func;
-   program->debug.private_data = options->debug.private_data;
-
    program->is_prolog = is_prolog;
    program->is_epilog = !is_prolog;
 
@@ -213,17 +237,8 @@ aco_compile_shader_part(const struct aco_compiler_options* options,
 
    aco_postprocess_shader(options, program);
 
-   /* assembly */
-   std::vector<uint32_t> code;
    bool append_endpgm = !(options->is_opengl && is_prolog);
-   unsigned exec_size = emit_program(program.get(), code, NULL, append_endpgm);
-
-   std::string disasm;
-   if (options->record_asm)
-      disasm = get_disasm_string(program.get(), options->family, code, exec_size);
-
-   (*build_binary)(binary, config.num_sgprs, config.num_vgprs, code.data(), code.size(),
-                   disasm.data(), disasm.size());
+   finish_program(program.get(), append_endpgm, "", options, build_binary, binary);
 }
 
 } /* end namespace */
@@ -241,83 +256,22 @@ aco_compile_shader(const struct aco_compiler_options* options, const struct aco_
    program->collect_statistics = options->record_stats;
    memset(&program->statistics, 0, sizeof(program->statistics));
 
-   program->debug.func = options->debug.func;
-   program->debug.private_data = options->debug.private_data;
-
    /* Instruction Selection */
    select_program(program.get(), shader_count, shaders, &config, options, info, args);
 
    std::string llvm_ir = aco_postprocess_shader(options, program);
 
-   /* assembly */
-   std::vector<uint32_t> code;
-   std::vector<struct aco_symbol> symbols;
    /* OpenGL combine multi shader parts into one continous code block,
     * so only last part need the s_endpgm instruction.
     */
    bool append_endpgm = !(options->is_opengl && info->ps.has_epilog);
-   unsigned exec_size = emit_program(program.get(), code, &symbols, append_endpgm);
-
-   if (program->collect_statistics)
-      collect_postasm_stats(program.get(), code);
-
-   std::string disasm;
-   if (options->record_asm)
-      disasm = get_disasm_string(program.get(), options->family, code, exec_size);
-
-   (*build_binary)(binary, &config, llvm_ir.c_str(), llvm_ir.size(), disasm.c_str(), disasm.size(),
-                   &program->statistics, exec_size, code.data(), code.size(), symbols.data(),
-                   symbols.size(), program->debug_info.data(), program->debug_info.size());
-}
-
-void
-aco_compile_rt_prolog(const struct aco_compiler_options* options,
-                      const struct aco_shader_info* info, const struct ac_shader_args* in_args,
-                      const struct ac_arg* descriptors, unsigned raygen_param_count,
-                      nir_parameter* raygen_params, aco_callback* build_prolog, void** binary)
-{
-   init();
-
-   /* create program */
-   ac_shader_config config = {0};
-   std::unique_ptr<Program> program{new Program};
-   program->collect_statistics = false;
-   program->debug.func = NULL;
-   program->debug.private_data = NULL;
-
-   select_rt_prolog(program.get(), &config, options, info, in_args, descriptors, raygen_param_count,
-                    raygen_params);
-   validate(program.get());
-   insert_waitcnt(program.get());
-   insert_NOPs(program.get());
-   if (program->gfx_level >= GFX11)
-      insert_delay_alu(program.get());
-   if (program->gfx_level >= GFX10)
-      form_hard_clauses(program.get());
-   if (program->gfx_level >= GFX11)
-      combine_delay_alu(program.get());
-
-   if (options->dump_ir)
-      aco_print_program(program.get(), stderr);
-
-   /* assembly */
-   std::vector<uint32_t> code;
-   code.reserve(align(program->blocks[0].instructions.size() * 2, 16));
-   unsigned exec_size = emit_program(program.get(), code);
-
-   std::string disasm;
-   if (options->record_asm)
-      disasm = get_disasm_string(program.get(), options->family, code, exec_size);
-
-   (*build_prolog)(binary, &config, NULL, 0, disasm.c_str(), disasm.size(), NULL, exec_size,
-                   code.data(), code.size(), NULL, 0, NULL, 0);
+   finish_program(program.get(), append_endpgm, llvm_ir, options, build_binary, binary);
 }
 
 void
 aco_compile_vs_prolog(const struct aco_compiler_options* options,
                       const struct aco_shader_info* info, const struct aco_vs_prolog_info* pinfo,
-                      const struct ac_shader_args* args, aco_shader_part_callback* build_prolog,
-                      void** binary)
+                      const struct ac_shader_args* args, aco_callback* build_prolog, void** binary)
 {
    init();
 
@@ -338,24 +292,13 @@ aco_compile_vs_prolog(const struct aco_compiler_options* options,
    if (options->dump_ir)
       aco_print_program(program.get(), stderr);
 
-   /* assembly */
-   std::vector<uint32_t> code;
-   code.reserve(align(program->blocks[0].instructions.size() * 2, 16));
-   unsigned exec_size = emit_program(program.get(), code);
-
-   std::string disasm;
-   if (options->record_asm)
-      disasm = get_disasm_string(program.get(), options->family, code, exec_size);
-
-   (*build_prolog)(binary, config.num_sgprs, config.num_vgprs, code.data(), code.size(),
-                   disasm.data(), disasm.size());
+   finish_program(program.get(), true, "", options, build_prolog, binary);
 }
 
 void
 aco_compile_ps_epilog(const struct aco_compiler_options* options,
                       const struct aco_shader_info* info, const struct aco_ps_epilog_info* pinfo,
-                      const struct ac_shader_args* args, aco_shader_part_callback* build_epilog,
-                      void** binary)
+                      const struct ac_shader_args* args, aco_callback* build_epilog, void** binary)
 {
    aco_compile_shader_part(options, info, args, select_ps_epilog, (void*)pinfo, build_epilog,
                            binary);
@@ -364,8 +307,7 @@ aco_compile_ps_epilog(const struct aco_compiler_options* options,
 void
 aco_compile_ps_prolog(const struct aco_compiler_options* options,
                       const struct aco_shader_info* info, const struct aco_ps_prolog_info* pinfo,
-                      const struct ac_shader_args* args, aco_shader_part_callback* build_prolog,
-                      void** binary)
+                      const struct ac_shader_args* args, aco_callback* build_prolog, void** binary)
 {
    aco_compile_shader_part(options, info, args, select_ps_prolog, (void*)pinfo, build_prolog,
                            binary, true);
@@ -400,17 +342,7 @@ aco_compile_trap_handler(const struct aco_compiler_options* options,
    insert_waitcnt(program.get());
    insert_NOPs(program.get());
 
-   /* assembly */
-   std::vector<uint32_t> code;
-   code.reserve(align(program->blocks[0].instructions.size() * 2, 16));
-   unsigned exec_size = emit_program(program.get(), code);
-
-   std::string disasm;
-   if (options->record_asm)
-      disasm = get_disasm_string(program.get(), options->family, code, exec_size);
-
-   (*build_binary)(binary, &config, NULL, 0, disasm.c_str(), disasm.size(), NULL, exec_size,
-                   code.data(), code.size(), NULL, 0, NULL, 0);
+   finish_program(program.get(), true, "", options, build_binary, binary);
 }
 
 uint64_t
@@ -429,24 +361,20 @@ aco_is_gpu_supported(const struct radeon_info* info)
    switch (info->gfx_level) {
    case GFX6:
    case GFX7:
-   case GFX8:
-      return true;
-   case GFX9:
-      return info->has_graphics; /* no CDNA support */
+   case GFX8: return true;
+   case GFX9: return info->has_graphics; /* no CDNA support */
    case GFX10:
    case GFX10_3:
    case GFX11:
    case GFX11_5:
-   case GFX12:
-      return true;
-   default:
-      return false;
+   case GFX11_7:
+   case GFX12: return true;
+   default: return false;
    }
 }
 
 void
-aco_print_asm(const struct radeon_info *info, unsigned wave_size,
-              uint32_t *binary, unsigned num_dw)
+aco_print_asm(const struct radeon_info* info, unsigned wave_size, uint32_t* binary, unsigned num_dw)
 {
    std::vector<uint32_t> binarray(binary, binary + num_dw);
    aco::Program prog;

@@ -11,9 +11,10 @@ dEQP-VK.dynamic_rendering.primary_cmd_buff.dedicated_allocation.formats.r8g8b8a8
 dEQP-VK.dynamic_rendering.primary_cmd_buff.suballocation.formats..*.input.load.dont_care.draw
 dEQP-VK.dynamic_rendering.primary_cmd_buff.suballocation.formats..*.input.load.store.self_dep_clear_draw
 dEQP-VK.dynamic_rendering.primary_cmd_buff.suballocation.formats.r8g8b8a8_unorm.input.dont_care.store.self_dep_draw
-dEQP-VK.dynamic_rendering.primary_cmd_buff.suballocation.formats.r8g8b8a8_unorm.input.dont_care.store.self_dep_draw
 
 dEQP-VK.image.general_layout.input_attachment.sampled.memory.render_pass
+
+dEQP-VK.pipeline.shader_object_unlinked_spirv.blend.dual_source.multi_attachments.a2r10g10b10_unorm_pack32
 
 dEQP-VK.rasterization.culling.front_triangle_fan_point
 dEQP-VK.rasterization.primitives.dynamic_stipple.smooth_lines_with_adjacency_wide
@@ -128,5 +129,11 @@ dEQP-VK.tessellation.user_defined_io.per_patch_block_array.vertex_io_array_size_
 dEQP-VK.tessellation.winding.lower_left_domain.hlsl_quads_ccw_yflip
 
 dEQP-VK.texture.explicit_lod.2d.sizes.128x128_nearest_linear_mipmap_linear_repeat
+
+dEQP-VK.compute.shader_object_binary.cooperative_matrix.khr_a.subgroupscope.spacetodepth.float16_float16.buffer.rowmajor.tensorlayout
+dEQP-VK.compute.shader_object_binary.cooperative_matrix.khr_a.subgroupscope.spacetodepth.sint8_sint8.buffer.rowmajor.tensorlayout
+dEQP-VK.compute.shader_object_spirv.cooperative_matrix.khr_a.subgroupscope.spacetodepth.float16_float16.buffer.rowmajor.tensorlayout
+dEQP-VK.compute.shader_object_spirv.cooperative_matrix.khr_a.subgroupscope.spacetodepth.sint8_sint8.buffer.rowmajor.tensorlayout
+dEQP-VK.compute.shader_object_spirv.cooperative_matrix.khr_a.subgroupscope.tensorlayout2d.float16_float16.buffer.rowmajor.tensorlayout
 
 nir-stress=dEQP-VK.sparse_resources.buffer.vertex_buffer.sparse_binding

@@ -51,15 +51,6 @@
 #endif
 #define MSAA_VISUAL_MAX_SAMPLES 32
 
-#undef false
-
-const __DRIconfigOptionsExtension gallium_config_options = {
-   .base = { __DRI_CONFIG_OPTIONS, 2 },
-   .getXml = pipe_loader_get_driinfo_xml
-};
-
-#define false 0
-
 void
 dri_init_options(struct dri_screen *screen)
 {
@@ -74,11 +65,14 @@ dri_init_options(struct dri_screen *screen)
 static unsigned
 dri_loader_get_cap(struct dri_screen *screen, enum dri_loader_cap cap)
 {
-   const __DRIimageLoaderExtension *image_loader = screen->image.loader;
+   const __DRIimageLoaderExtension *image_loader = screen->loader.image;
+   const __DRIkopperLoaderExtension *kopper_loader = screen->loader.kopper;
 
-   if (image_loader && image_loader->base.version >= 2 &&
-       image_loader->getCapability)
+   if (image_loader && image_loader->getCapability)
       return image_loader->getCapability(screen->loaderPrivate, cap);
+
+   if (kopper_loader && kopper_loader->getCapability)
+      return kopper_loader->getCapability(screen->loaderPrivate, cap);
 
    return 0;
 }
@@ -153,9 +147,11 @@ driCreateConfigs(enum pipe_format format,
    unsigned num_accum_bits = (enable_accum) ? 2 : 1;
    bool is_srgb;
    bool is_float;
+   bool is_unorm16;
 
    is_srgb = util_format_is_srgb(format);
    is_float = util_format_is_float(format);
+   is_unorm16 = util_format_is_unorm16(util_format_description(format));
 
    for (i = 0; i < 4; i++) {
       color_bits[i] =
@@ -168,7 +164,11 @@ driCreateConfigs(enum pipe_format format,
          shifts[i] = -1;
       }
 
-      if (is_float || color_bits[i] == 0)
+      /* is_float and is_unorm16 is only true on non-x11 target platforms, which
+       * don't actually use redMask, greenMask, ..., so avoid setting masks[]
+       * to prevent a meaningless "undefined behaviour" build warning.
+       */
+      if (is_float || is_unorm16 || color_bits[i] == 0)
          masks[i] = 0;
       else
          masks[i] = ((1u << color_bits[i]) - 1) << shifts[i];
@@ -260,6 +260,17 @@ driCreateConfigs(enum pipe_format format,
     *c = NULL;
 
     return configs;
+}
+
+void
+driDestroyConfigs(const struct dri_config **configs)
+{
+   if (!configs)
+      return;
+
+   for (unsigned i = 0; configs[i]; i++)
+      free((struct dri_config *)configs[i]);
+   free(configs);
 }
 
 static struct dri_config **
@@ -376,6 +387,8 @@ dri_fill_in_modes(struct dri_screen *screen)
 
    if (HAS_ZS(Z32_UNORM))
       zs_formats[num_zs_formats++] = PIPE_FORMAT_Z32_UNORM;
+   else if (HAS_ZS(Z32_FLOAT))
+      zs_formats[num_zs_formats++] = PIPE_FORMAT_Z32_FLOAT;
 
 #undef HAS_ZS
 
@@ -513,7 +526,7 @@ dri_get_egl_image(struct pipe_frontend_screen *fscreen,
                   struct st_egl_image *stimg)
 {
    struct dri_screen *screen = (struct dri_screen *)fscreen;
-   const __DRIimageLookupExtension *loader = screen->dri2.image;
+   const __DRIimageLookupExtension *loader = screen->loader.image_lookup;
    struct dri_image *img = NULL;
    const struct dri2_format_mapping *map;
 
@@ -550,19 +563,12 @@ dri_validate_egl_image(struct pipe_frontend_screen *fscreen,
                        void *egl_image)
 {
    struct dri_screen *screen = (struct dri_screen *)fscreen;
-   const __DRIimageLookupExtension *loader = screen->dri2.image;
+   const __DRIimageLookupExtension *loader = screen->loader.image_lookup;
 
    if (loader)
       return loader->validateEGLImage(egl_image, screen->loaderPrivate);
    else
       return true;
-}
-
-static int
-dri_get_param(struct pipe_frontend_screen *fscreen,
-              enum st_manager_param param)
-{
-   return 0;
 }
 
 void
@@ -588,6 +594,7 @@ dri_destroy_screen(struct dri_screen *screen)
 {
    dri_release_screen(screen);
 
+   free(screen->options.force_explicit_uniform_loc_zero);
    free(screen->options.force_gl_vendor);
    free(screen->options.force_gl_renderer);
    free(screen->options.mesa_extension_override);
@@ -597,17 +604,6 @@ dri_destroy_screen(struct dri_screen *screen)
 
    /* The caller in dri_util preserves the fd ownership */
    free(screen);
-}
-
-static void
-dri_postprocessing_init(struct dri_screen *screen)
-{
-   unsigned i;
-
-   for (i = 0; i < PP_FILTERS; i++) {
-      screen->pp_enabled[i] = driQueryOptioni(&screen->dev->option_cache,
-                                              pp_filters[i].name);
-   }
 }
 
 static void
@@ -627,17 +623,10 @@ dri_init_screen(struct dri_screen *screen,
 {
    screen->base.screen = pscreen;
    screen->base.get_egl_image = dri_get_egl_image;
-   screen->base.get_param = dri_get_param;
    screen->base.set_background_context = dri_set_background_context;
    screen->base.validate_egl_image = dri_validate_egl_image;
 
-   if (pscreen->caps.npot_textures)
-      screen->target = PIPE_TEXTURE_2D;
-   else
-      screen->target = PIPE_TEXTURE_RECT;
-
    dri_init_options(screen);
-   dri_postprocessing_init(screen);
 
    st_api_query_versions(&screen->base,
                          &screen->options,
@@ -645,6 +634,17 @@ dri_init_screen(struct dri_screen *screen,
                          &screen->max_gl_compat_version,
                          &screen->max_gl_es1_version,
                          &screen->max_gl_es2_version);
+
+   /* GL 2.0 and GLES 2.0 support normalized sampling from level-zero NPOT
+    * textures, which is sufficient for window-system images.
+    */
+   if (pscreen->caps.npot_textures ||
+       screen->max_gl_compat_version >= 20 ||
+       screen->max_gl_core_version >= 31 ||
+       screen->max_gl_es2_version >= 20)
+      screen->target = PIPE_TEXTURE_2D;
+   else
+      screen->target = PIPE_TEXTURE_RECT;
 
    screen->throttle = pscreen->caps.throttle;
    if (pscreen->caps.device_protected_context)

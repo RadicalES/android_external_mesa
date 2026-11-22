@@ -133,6 +133,7 @@ INSTANTIATE_TEST_SUITE_P(Opcodes, DisasmTest,
       disasm_state{ {0x0081100c, 0x00000000, 0x00000000, 0x00000018}, "rcp.pack          t1.x___, void, void, t1.xxxx\n" },
       disasm_state{ {0x0080100d, 0x00000004, 0x00000000, 0x00000008}, "rsq               t0.x___, void, void, t0.xxxx\n" },
       disasm_state{ {0x0783108f, 0x39002800, 0x05c800c0, 0x00390028}, "select.lt.pack    t3, t2.xyzw, |t1.xyzw|, t2.xyzw\n"},
+      disasm_state{ {0x01001071, 0x15600c04, 0x800000c0, 0x7400001a}, "cmp.gt.denorm.u32 t0._y__, t0.yyyy, u1.xxxx, 1:s20\n"},
       disasm_state{ {0x008010d0, 0x00000800, 0x00000040, 0x00000002}, "set.ge.pack       t0.x___, t0.xxxx, u0.xxxx, void\n" },
       disasm_state{ {0x01001011, 0x00000004, 0x00000000, 0x00154008}, "exp               t0._y__, void, void, t0.yyyy\n" },
       disasm_state{ {0x01801012, 0x00000005, 0x00000000, 0x00000008}, "log.rtz           t0.xy__, void, void, t0.xxxx\n" },
@@ -141,7 +142,7 @@ INSTANTIATE_TEST_SUITE_P(Opcodes, DisasmTest,
       disasm_state{ {0x00000015, 0x00000000, 0x00000000, 0x00000000}, "ret               void, void, void, void\n" },
       disasm_state{ {0x00000016, 0x00000000, 0x00000000, 0x00001080}, "branch            void, void, void, 33\n"},
       disasm_state{ {0x00000017, 0x00000000, 0x00000000, 0x00000000}, "texkill.pack      void, void, void, void\n" },
-      disasm_state{ {0x00000057, 0x00002800, 0x00000040, 0x00000002}, "texkill.gt.pack   void, t2.xxxx, u0.xxxx, void\n", FLAG_FAILING_PARSE | FLAG_FAILING_ASM },
+      disasm_state{ {0x00000057, 0x00002800, 0x00000040, 0x00000002}, "texkill.gt.pack   void, t2.xxxx, u0.xxxx, void\n" },
       disasm_state{ {0x07811018, 0x15001f20, 0x00000000, 0x00000000}, "texld             t1, tex0.xyzw, t1.xyyy, void, void\n" },
       disasm_state{ {0x07811019, 0x39002f20, 0x00000000, 0x00000000}, "texldb            t1, tex0.xyzw, t2.xyzw, void, void\n", FLAG_FAILING_PARSE | FLAG_FAILING_ASM },
       disasm_state{ {0x0781101a, 0x15001f20, 0x00a80140, 0x003f8018}, "texldd            t1, tex0.xyzw, t1.xyyy, t2.xyyy, t1.zwww\n" },
@@ -175,6 +176,7 @@ INSTANTIATE_TEST_SUITE_P(Opcodes, DisasmTest,
       disasm_state{ {0x0080101e, 0x00001804, 0x40010000, 0x00000008}, "xor.s32           t0.x___, t1.xxxx, void, t0.xxxx\n"},
       disasm_state{ {0x0080101f, 0x00000004, 0x40010000, 0x00000018}, "not.s32           t0.x___, void, void, t1.xxxx\n"},
       disasm_state{ {0x00811020, 0x00001804, 0x40010140, 0x00000038}, "bit_extract.s32   t1.x___, t1.xxxx, t2.xxxx, t3.xxxx\n"},
+      disasm_state{ {0x01811015, 0x15001804, 0x40a90140, 0x003f8018}, "bit_insert.s32    t1.xy__, t1.xyyy, t2.xyyy, t1.zwww\n"},
       disasm_state{ {0x00801021, 0x00000004, 0x00010000, 0x00000008}, "popcount          t0.x___, void, void, t0.xxxx\n"},
       disasm_state{ {0x02000016, 0x00200000, 0x80010000, 0x003fc018}, "movai.u32.pack    void, void, void, t1.wwww\n", FLAG_FAILING_ASM},
       disasm_state{ {0x00801017, 0x00000004, 0x40010000, 0x00000018}, "iabs.s32          t0.x___, void, void, t1.xxxx\n"},
@@ -182,7 +184,7 @@ INSTANTIATE_TEST_SUITE_P(Opcodes, DisasmTest,
       disasm_state{ {0x00801019, 0x15400804, 0x40010000, 0x74000028}, "lshift.s32        t0.x___, t0.yyyy, void, 2:s20\n"},
       disasm_state{ {0x0080101a, 0x00001804, 0x40010000, 0x78000018}, "rshift.s32        t0.x___, t1.xxxx, void, 1:u20\n"},
       disasm_state{ {0x0080101b, 0x00001804, 0x40010000, 0x00000008}, "rotate.s32        t0.x___, t1.xxxx, void, t0.xxxx\n"},
-      disasm_state{ {0x03001024, 0x00000005, 0x04098040, 0x0015400f}, "div.rtz           t0.zy, void, 4.500000:f20, t0.yyyy\n"},
+      disasm_state{ {0x03001024, 0x00000005, 0x04098040, 0x0015400f}, "div.rtz           t0.zy, void, 4.5:f20, t0.yyyy\n"},
       disasm_state{ {0x01061025, 0x2aa00804, 0xa0010050, 0x7800001f}, "atomic_add.u32    t6._y__, u0.zzzz, 0:u20, 1:u20\n"},
       disasm_state{ {0x00801025, 0x2a800884, 0x50010050, 0x0000000f}, "atomic_add.skpHp.s32 t0.x___, u0.zzzz, 0:s20, t0.xxxx\n"},
       disasm_state{ {0x00821026, 0x2a800884, 0x50010050, 0x0000001f}, "atomic_xchg.skpHp.s32 t2.x___, u0.zzzz, 0:s20, t1.xxxx\n"},
@@ -202,7 +204,9 @@ INSTANTIATE_TEST_SUITE_P(Opcodes, DisasmTest,
       disasm_state{ {0x0780083a, 0x39200c00, 0x80a90050, 0x00390018}, "img_store.sat.denorm.u32.pack mem, u0.xyzw, t0.xyyy, t1.xyzw\n"},
       disasm_state{ {0x0781103d, 0x15001f20, 0x100101c0, 0x00000007}, "tg4               t1, tex0.xyzw, t1.xyyy, 3:s20, void\n"},
       disasm_state{ {0x0381103f, 0x29201804, 0x80010000, 0x780000b8}, "bit_findlsb.u32   t1.xyz_, t1.xyzz, void, void\n"},
-      disasm_state{ {0x0081103f, 0x00001804, 0x40010000, 0x780000c8}, "bit_findmsb.s32   t1.x___, t1.xxxx, void, void\n"}
+      disasm_state{ {0x0081103f, 0x00001804, 0x40010000, 0x780000c8}, "bit_findmsb.s32   t1.x___, t1.xxxx, void, void\n"},
+      disasm_state{ {0x0082103f, 0x15001f20, 0x10010040, 0x780000df}, "txf_ms            t2.x___, tex0.xyzw, t1.xyyy, 0:s20, void\n"},
+      disasm_state{ {0x0082103f, 0x15001f20, 0x100100c0, 0x780000df}, "txf_ms            t2.x___, tex0.xyzw, t1.xyyy, 1:s20, void\n"}
    )
 );
 // clang-format on
@@ -273,7 +277,7 @@ INSTANTIATE_TEST_SUITE_P(Threads, DisasmTest,
       disasm_state{ {0x0101102e, 0x00202804, 0x80000020, 0x01000000}, "f2i.u32.t1        t1._y__, th2.xxxx, void, void\n"},
       disasm_state{ {0x00811171, 0x15601804, 0x80000040, 0x76fffffa}, "cmp.eq.u32.t0     t1.x___, t1.yyyy, u0.xxxx, -1:s20\n"},
       disasm_state{ {0x00811171, 0x15601804, 0x80000040, 0x77ffdffa}, "cmp.eq.u32.t1     t1.x___, t1.yyyy, u0.xxxx, -1:s20\n"},
-      disasm_state{ {0x0081158f, 0x00201804, 0x700000c0, 0x7c00000f}, "select.selmsb.s16 t1.x___, t1.xxxx, 0.000000:f16, 0.000000:f16\n", FLAG_FAILING_ASM},
+      disasm_state{ {0x0081158f, 0x00201804, 0x700000c0, 0x7c00000f}, "select.selmsb.s16 t1.x___, t1.xxxx, 5.9605e-08:f16, 0.0:f16\n"},
       disasm_state{ {0x0381102d, 0x00201804, 0x40000000, 0x00000000}, "i2f.s16           t1.xyz_, t1.xxxx, void, void\n"},
       disasm_state{ {0x04011009, 0x00000004, 0x00000000, 0x20154008}, "mov               t1.___w, void, void, u0.yyyy\n"}
    )
@@ -284,7 +288,7 @@ INSTANTIATE_TEST_SUITE_P(Threads, DisasmTest,
 INSTANTIATE_TEST_SUITE_P(ImmediateValues, DisasmTest,
    testing::Values(
       // taken from deqp3 run on GC3000
-      disasm_state{ {0x00801001, 0x7e000805, 0x00000038, 0x00800008}, "add.rtz           t0.x___, 0.500000:f20, void, |t0.xxxx|\n"}, /* type: 0 */
+      disasm_state{ {0x00801001, 0x7e000805, 0x00000038, 0x00800008}, "add.rtz           t0.x___, 0.5:f20, void, |t0.xxxx|\n"}, /* type: 0 */
       disasm_state{ {0x00811131, 0x95401804, 0x00aa0060, 0x76fffffa}, "cmp.le.t0         t1.x___, |th1.yyyy|, u0.yyyy, -1:s20\n"}, /* type: 1 */
       disasm_state{ {0x0080101a, 0x00001804, 0x40010000, 0x78000018}, "rshift.s32        t0.x___, t1.xxxx, void, 1:u20\n"}, /* type: 2*/
       disasm_state{ {0x020211b1, 0x00001804, 0x01fe0040, 0x7c1fdffa}, "cmp.ne            t2.__z_, t1.xxxx, u0.wwww, -nan:f16\n"} /* type: 3 */
@@ -319,7 +323,7 @@ INSTANTIATE_TEST_SUITE_P(CLRoundShader, DisasmTest,
       // taken from opencl shader on GC3000
       disasm_state{ {0x00801032, 0x15400c04, 0x10000050, 0x00000007}, "load.denorm       t0.x___, u0.yyyy, 0:s20, void\n"},
       disasm_state{ {0x00811027, 0x00000004, 0x00000000, 0x00000008}, "sign              t1.x___, void, void, t0.xxxx\n"},
-      disasm_state{ {0x00801001, 0x7e000805, 0x00000038, 0x00800008}, "add.rtz           t0.x___, 0.500000:f20, void, |t0.xxxx|\n"},
+      disasm_state{ {0x00801001, 0x7e000805, 0x00000038, 0x00800008}, "add.rtz           t0.x___, 0.5:f20, void, |t0.xxxx|\n"},
       disasm_state{ {0x00801025, 0x00000004, 0x00000000, 0x00000008}, "floor             t0.x___, void, void, t0.xxxx\n"},
       disasm_state{ {0x00801003, 0x00001805, 0x00000040, 0x00000000}, "mul.rtz           t0.x___, t1.xxxx, t0.xxxx, void\n"}
    )
@@ -337,7 +341,7 @@ INSTANTIATE_TEST_SUITE_P(TFShader, DisasmTest,
       disasm_state{ {0x0201102d, 0x00000800, 0x40000010, 0x00000000}, "i2f.s32.pack      t1.__z_, u0.xxxx, void, void\n"},
       disasm_state{ {0x00000156, 0x2a801800, 0x01540040, 0x00000402}, "branch.eq         void, t1.zzzz, u0.zzzz, 8\n"},
       disasm_state{ {0x0081100c, 0x3fc00800, 0x400100d0, 0x20154008}, "imadlo0.s32.pack  t1.x___, u0.wwww, t1.xxxx, u0.yyyy\n"},
-      disasm_state{ {0x07820033, 0x00001800, 0x01540040, 0x0039002a}, "store.pack        mem, t1.xxxx, u0.zzzz, t2.xyzw\t; dontcare bits in store: 00000000000000000000000000020000\n", FLAG_FAILING_ASM}
+      disasm_state{ {0x07820033, 0x00001800, 0x01540040, 0x0039002a}, "store.pack        mem, t1.xxxx, u0.zzzz, t2.xyzw\n", FLAG_FAILING_ASM}
    )
 );
 // clang-format on
@@ -382,8 +386,16 @@ INSTANTIATE_TEST_SUITE_P(LoadStoreVariants, DisasmTest,
       disasm_state{ {0x01001032, 0x15400c14, 0x00000050, 0x00000000}, "load.denorm.ls2   t0._y__, u0.yyyy, t0.xxxx, void\n"},
       disasm_state{ {0x01001032, 0x15400d14, 0x00000040, 0x00000000}, "load.denorm.local.ls2 t0._y__, t0.yyyy, t0.xxxx, void\n"},
       disasm_state{ {0x00800033, 0x00000c14, 0x00000050, 0x00154008}, "store.denorm.ls2  mem.x___, u0.xxxx, t0.xxxx, t0.yyyy\n"},
-      disasm_state{ {0x00861033, 0x15400d04, 0x100efe40, 0x7085860f}, "store.denorm.local mem.x___, t0.yyyy, 4092:s20, 99.000000:f20\t; dontcare bits in store: 00000000000000000000000000061000\n", FLAG_FAILING_ASM},
+      disasm_state{ {0x00861033, 0x15400d04, 0x100efe40, 0x7085860f}, "store.denorm.local t6.x___, t0.yyyy, 4092:s20, 99.0:f20\n"},
       disasm_state{ {0x07800033, 0x00200c34, 0x80000050, 0x00390018}, "store.denorm.u32.ls6 mem, u0.xxxx, t0.xxxx, t1.xyzw\n"}
+   )
+);
+// clang-format on
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(StoreDstUse, DisasmTest,
+   testing::Values(
+      disasm_state{ {0x00811033, 0x00200d04, 0x50000040, 0x7400000f}, "store.denorm.local.s16 t1.x___, t0.xxxx, 0:s20, 0:s20\n"}
    )
 );
 // clang-format on
@@ -415,7 +427,7 @@ INSTANTIATE_TEST_SUITE_P(SwizzleVariants, DisasmTest,
       disasm_state{ {0x0782102b, 0x00002804, 0xa0000040, 0x7800002f}, "swizzle.s8        t2, t2.xxxx, 0:u20, 2:u20\n"},
       disasm_state{ {0x0780102b, 0x00002804, 0xa0000040, 0x7800001f}, "swizzle.s8        t0, t2.xxxx, 0:u20, 1:u20\n"},
       disasm_state{ {0x0781102b, 0x00002804, 0xa00000c0, 0x7800001f}, "swizzle.s8        t1, t2.xxxx, 1:u20, 1:u20\n"},
-      disasm_state{ {0x0781102b, 0x00200804, 0x6000007e, 0x7800003f}, "swizzle.s16       t1, 0.000000:f16, 0:u20, 3:u20\n"},
+      disasm_state{ {0x0781102b, 0x00200804, 0x6000007e, 0x7800003f}, "swizzle.s16       t1, 0.0:f16, 0:u20, 3:u20\n"},
       disasm_state{ {0x0781102b, 0x00201804, 0x60000040, 0x780000cf}, "swizzle.s16       t1, t1.xxxx, 0:u20, 12:u20\n"},
       disasm_state{ {0x0780102b, 0x00201804, 0x60000040, 0x7800003f}, "swizzle.s16       t0, t1.xxxx, 0:u20, 3:u20\n"},
       disasm_state{ {0x0781102b, 0x00202804, 0x600000c0, 0x7800003f}, "swizzle.s16       t1, t2.xxxx, 1:u20, 3:u20\n"}
@@ -430,6 +442,23 @@ INSTANTIATE_TEST_SUITE_P(InfNaN, DisasmTest,
       disasm_state{ {0x00811009, 0x00000004, 0x00000000, 0x72ff0008}, "mov               t1.x___, void, void, -inf:f20\n"},
       disasm_state{ {0x00811009, 0x00000004, 0x00000000, 0x70ff8008}, "mov               t1.x___, void, void, nan:f20\n"},
       disasm_state{ {0x00811009, 0x00000004, 0x00000000, 0x72ff8008}, "mov               t1.x___, void, void, -nan:f20\n"}
+   )
+);
+// clang-format on
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(Image, DisasmTest,
+   testing::Values(
+      disasm_state{ {0x0780003a, 0x39000c00, 0x00a90050, 0x00390018}, "img_store.denorm.pack mem, u0.xyzw, t0.xyyy, t1.xyzw\n"},
+      disasm_state{ {0x0780083a, 0x39000c00, 0x40a90050, 0x00390018}, "img_store.sat.denorm.s32.pack mem, u0.xyzw, t0.xyyy, t1.xyzw\n"},
+      disasm_state{ {0x0780083a, 0x39200c00, 0x80a90050, 0x00390018}, "img_store.sat.denorm.u32.pack mem, u0.xyzw, t0.xyyy, t1.xyzw\n"},
+      disasm_state{ {0x07800835, 0x39001800, 0x41480150, 0x00390018}, "img_store_3d.sat.s32.pack mem, u1.xyzw, t2.xyzz, t1.xyzw\n"},
+      disasm_state{ {0x00811034, 0x39001800, 0x414800d0, 0x00000000}, "img_load_3d.s32.pack t1.x___, u1.xyzw, t1.xyzz, void\n"},
+      disasm_state{ {0x00811037, 0x39201800, 0x80a800d0, 0x00000000}, "img_addr.u32.pack t1.x___, u1.xyzw, t1.xyyy, void\n"},
+      disasm_state{ {0x00801038, 0x39201800, 0x814800d0, 0x00000000}, "img_addr_3d.u32.pack t0.x___, u1.xyzw, t1.xyzz, void\n"},
+      disasm_state{ {0x07801039, 0x39004c00, 0x00a90050, 0x00000000}, "img_load.denorm.pack t0, u4.xyzw, t0.xyyy, void\n"},
+      disasm_state{ {0x07801039, 0x39004c00, 0x40a90050, 0x00000000}, "img_load.denorm.s32.pack t0, u4.xyzw, t0.xyyy, void\n"},
+      disasm_state{ {0x07801039, 0x39204c00, 0x80a90050, 0x00000000}, "img_load.denorm.u32.pack t0, u4.xyzw, t0.xyyy, void\n"}
    )
 );
 // clang-format on

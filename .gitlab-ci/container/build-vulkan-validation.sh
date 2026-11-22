@@ -6,9 +6,9 @@
 
 set -uex
 
-uncollapsed_section_start vulkan-validation "Building Vulkan validation layers"
+section_start vulkan-validation "Building Vulkan validation layers"
 
-VALIDATION_TAG="f384bd565c752f53aae10849aff6ffeb035d9ec4"
+VALIDATION_TAG="c93a48d963e7f311d8ca0511b5f41dc3abe63bff"
 
 mkdir Vulkan-ValidationLayers
 pushd Vulkan-ValidationLayers

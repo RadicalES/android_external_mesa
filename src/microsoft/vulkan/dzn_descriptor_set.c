@@ -29,7 +29,7 @@
 
 #include "dxil_spirv_nir.h"
 
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 
 static uint32_t
 translate_desc_stages(VkShaderStageFlags in)
@@ -459,12 +459,12 @@ dzn_descriptor_set_layout_get_heap_offset(const struct dzn_descriptor_set_layout
    assert(b < layout->binding_count);
    D3D12_SHADER_VISIBILITY visibility = layout->bindings[b].visibility;
    assert(visibility < ARRAY_SIZE(layout->ranges));
-   assert(type < NUM_POOL_TYPES);
+   assert((unsigned)type < NUM_POOL_TYPES);
 
    if (bindless)
       type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 
-   uint32_t range_idx = layout->bindings[b].range_idx[type];
+   uint32_t range_idx = layout->bindings[b].range_idx[(unsigned)type];
 
    if (range_idx == ~0)
       return ~0;
@@ -535,7 +535,7 @@ dzn_GetDescriptorSetLayoutSupport(VkDevice _device,
          upper_bound = is_sampler ? sampler_upper_bound : MIN2(sampler_upper_bound, upper_bound);
       }
 
-      if (binding_flags && binding_flags->bindingCount &&
+      if (variable_count && binding_flags && binding_flags->bindingCount &&
           (binding_flags->pBindingFlags[i] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT))
          variable_count->maxVariableDescriptorCount = device->bindless ? INT32_MAX : upper_bound;
 
@@ -592,9 +592,9 @@ dzn_pipeline_layout_hash_stages(struct dzn_pipeline_layout *layout,
       if (!(stages & BITFIELD_BIT(stage)))
          continue;
 
-      struct mesa_sha1 ctx;
+      blake3_hasher ctx;
 
-      _mesa_sha1_init(&ctx);
+      _mesa_blake3_init(&ctx);
       for (uint32_t set = 0; set < info->setLayoutCount; set++) {
          VK_FROM_HANDLE(dzn_descriptor_set_layout, set_layout, info->pSetLayouts[set]);
          if (!(BITFIELD_BIT(stage) & set_layout->stages))
@@ -604,12 +604,12 @@ dzn_pipeline_layout_hash_stages(struct dzn_pipeline_layout *layout,
             if (!(BITFIELD_BIT(stage) & set_layout->bindings[b].stages))
                continue;
 
-            _mesa_sha1_update(&ctx, &b, sizeof(b));
-            _mesa_sha1_update(&ctx, &set_layout->bindings[b].base_shader_register,
+            _mesa_blake3_update(&ctx, &b, sizeof(b));
+            _mesa_blake3_update(&ctx, &set_layout->bindings[b].base_shader_register,
                               sizeof(set_layout->bindings[b].base_shader_register));
          }
       }
-      _mesa_sha1_final(&ctx, layout->stages[stage].hash);
+      _mesa_blake3_final(&ctx, layout->stages[stage].hash);
    }
 }
 
@@ -1960,7 +1960,7 @@ dzn_descriptor_heap_pool_alloc_slots(struct dzn_descriptor_heap_pool *pool,
             dzn_descriptor_heap_init(&new_heap->heap, device, pool->type,
                                      heap_desc_count, pool->shader_visible);
          if (result != VK_SUCCESS) {
-            vk_free(&device->vk.alloc, new_heap);
+            vk_free(pool->alloc, new_heap);
             return result;
          }
       }

@@ -1,7 +1,7 @@
 /*
 ************************************************************************************************************************
 *
-*  Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.
+*  Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
 *  SPDX-License-Identifier: MIT
 *
 ***********************************************************************************************************************/
@@ -121,6 +121,13 @@ Lib::Lib(const Client* pClient) :
     m_pElemLib(NULL)
 {
     m_configFlags.value = 0;
+
+    // Historial maximum image dimensions prior to GFX11 parts.
+    m_maxDims.extent.width  = 16384;
+    m_maxDims.extent.height = 16384;
+    m_maxDims.extent.depth  = 8192;
+    m_maxDims.mipLevels  = 14;
+    m_maxDims.samples    = 8;
 }
 
 /**
@@ -222,6 +229,7 @@ ADDR_E_RETURNCODE Lib::Create(
                     case FAMILY_NV3:
                     case FAMILY_STX:
                     case FAMILY_PHX:
+                    case FAMILY_GFX1170:
                         pLib = Gfx11HwlInit(&client);
                         break;
                     case FAMILY_NV4:
@@ -257,6 +265,7 @@ ADDR_E_RETURNCODE Lib::Create(
         pLib->m_configFlags.forceDccAndTcCompat = pCreateIn->createFlags.forceDccAndTcCompat;
         pLib->m_configFlags.nonPower2MemConfig  = pCreateIn->createFlags.nonPower2MemConfig;
         pLib->m_configFlags.enableAltTiling     = pCreateIn->createFlags.enableAltTiling;
+        pLib->m_configFlags.padValidEqBits      = pCreateIn->createFlags.padValidEqBits;
         pLib->m_configFlags.disableLinearOpt    = FALSE;
 
         pLib->SetChipFamily(pCreateIn->chipFamily, pCreateIn->chipRevision);
@@ -306,6 +315,44 @@ ADDR_E_RETURNCODE Lib::Create(
 
 /**
 ****************************************************************************************************
+*   Lib::GetFormatProperties
+*
+*   @brief
+*       Returns the properties of the format as specifed in the input.
+*   @return
+*       ADDR_E_RETURNCODE
+****************************************************************************************************
+*/
+ADDR_E_RETURNCODE Lib::GetFormatProperties(
+    const ADDR_FORMAT_PROPERTIES_IN&  in,
+    ADDR_FORMAT_PROPERTIES_OUT*       pOut
+    ) const
+{
+    ADDR_E_RETURNCODE  returnCode = ADDR_OK;
+
+    if (GetFillSizeFieldsFlags() == TRUE)
+    {
+        if ((in.size    != sizeof(ADDR_FORMAT_PROPERTIES_IN)) ||
+            (pOut->size != sizeof(ADDR_FORMAT_PROPERTIES_OUT)))
+        {
+            returnCode = ADDR_PARAMSIZEMISMATCH;
+        }
+    }
+
+    if (returnCode == ADDR_OK)
+    {
+        pOut->bpp = GetElemLib()->GetBitsPerPixel(in.format,
+                                                  nullptr,                  // elemMode, unused
+                                                  &pOut->expand.width,
+                                                  &pOut->expand.height,
+                                                  nullptr);                 // unused bits
+    }
+
+    return returnCode;
+}
+
+/**
+****************************************************************************************************
 *   Lib::SetChipFamily
 *
 *   @brief
@@ -315,7 +362,7 @@ ADDR_E_RETURNCODE Lib::Create(
 ****************************************************************************************************
 */
 VOID Lib::SetChipFamily(
-    UINT_32 uChipFamily,        ///< [in] chip family defined in atiih.h
+    UINT_32 uChipFamily,        ///< [in] chip family defined in atiid.h
     UINT_32 uChipRevision)      ///< [in] chip revision defined in "asic_family"_id.h
 {
     ChipFamily family = HwlConvertChipFamily(uChipFamily, uChipRevision);
@@ -462,6 +509,20 @@ ADDR_E_RETURNCODE Lib::GetMaxMetaAlignments(
     }
 
     return returnCode;
+}
+
+/**
+****************************************************************************************************
+*   Lib::GetMaxDims
+*
+*   @return
+*       Returns the maximum supported image dimensions.
+*
+****************************************************************************************************
+*/
+const ADDR_MAX_IMAGE_DIMS* Lib::GetMaxDims() const
+{
+    return &m_maxDims;
 }
 
 /**
@@ -666,6 +727,47 @@ BOOL_32 Lib::GetExportNorm(
 UINT_32 Lib::GetBpe(AddrFormat format) const
 {
     return GetElemLib()->GetBitsPerPixel(format);
+}
+
+/**
+****************************************************************************************************
+*   Lib::GetSwizzleModePreferenceRatio
+*
+*   @brief
+*       Get ratio driving swizzle mode selection heuristic. Ratio is returned as fraction nominator
+*       and denominator
+*   @return
+*       void
+****************************************************************************************************
+*/
+void Lib::GetSwizzleModePreferenceRatio(
+    const ADDR2_GET_PREFERRED_SURF_SETTING_INPUT* pIn,
+    UINT_32*                                      pOutRatioLo,
+    UINT_32*                                      pOutRatioHi
+    ) const
+{
+    const BOOL_32 computeMinSize = (pIn->flags.minimizeAlign == 1) || (pIn->memoryBudget >= 1.0);
+
+    if (computeMinSize)
+    {
+        *pOutRatioLo = 1;
+        *pOutRatioHi = 1;
+    }
+    else if (pIn->flags.opt4space)
+    {
+        *pOutRatioLo = 3;
+        *pOutRatioHi = 2;
+    }
+    else if (pIn->flags.computeMaxSize)
+    {
+        *pOutRatioLo = 1024;
+        *pOutRatioHi = 1;
+    }
+    else
+    {
+        *pOutRatioLo = 2;
+        *pOutRatioHi = 1;
+    }
 }
 
 /**

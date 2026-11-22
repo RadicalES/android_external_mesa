@@ -8,11 +8,12 @@
 #include "ac_surface.h"
 
 #include "radv_meta.h"
+#include "vk_shader_module.h"
 
 static VkResult
 get_pipeline_layout(struct radv_device *device, VkPipelineLayout *layout_out)
 {
-   enum radv_meta_object_key_type key = RADV_META_OBJECT_KEY_DCC_RETILE;
+   enum radv_meta_object_key_type key = RADV_META_OBJECT_KEY_DCC_RETILE_CS;
 
    const VkDescriptorSetLayoutBinding bindings[] = {
       {
@@ -46,7 +47,7 @@ get_pipeline_layout(struct radv_device *device, VkPipelineLayout *layout_out)
                                       layout_out);
 }
 
-struct radv_dcc_retile_key {
+struct radv_compute_dcc_retile_key {
    enum radv_meta_object_key_type type;
    uint32_t swizzle;
 };
@@ -63,8 +64,9 @@ static VkResult
 get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *pipeline_out,
              VkPipelineLayout *layout_out)
 {
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    const unsigned swizzle_mode = image->planes[0].surface.u.gfx9.swizzle_mode;
-   struct radv_dcc_retile_key key;
+   struct radv_compute_dcc_retile_key key;
    VkResult result;
 
    result = get_pipeline_layout(device, layout_out);
@@ -72,7 +74,7 @@ get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *p
       return result;
 
    memset(&key, 0, sizeof(key));
-   key.type = RADV_META_OBJECT_KEY_DCC_RETILE;
+   key.type = RADV_META_OBJECT_KEY_DCC_RETILE_CS;
    key.swizzle = swizzle_mode;
 
    VkPipeline pipeline_from_cache = vk_meta_lookup_pipeline(&device->meta_state.device, &key, sizeof(key));
@@ -81,7 +83,8 @@ get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *p
       return VK_SUCCESS;
    }
 
-   nir_shader *cs = radv_meta_nir_build_dcc_retile_compute_shader(device, &image->planes[0].surface);
+   nir_shader *cs = radv_meta_nir_build_dcc_retile_compute_shader(pdev->info.gfx_level, pdev->info.gb_addr_config,
+                                                                  &image->planes[0].surface);
 
    const VkPipelineShaderStageCreateInfo stage_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -105,10 +108,9 @@ get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *p
    return result;
 }
 
-void
-radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
+static void
+radv_compute_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
 {
-   struct radv_meta_saved_state saved_state;
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    VkPipelineLayout layout;
@@ -118,21 +120,13 @@ radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
    assert(image->vk.image_type == VK_IMAGE_TYPE_2D);
    assert(image->vk.array_layers == 1 && image->vk.mip_levels == 1);
 
-   struct radv_cmd_state *state = &cmd_buffer->state;
-
    result = get_pipeline(device, image, &pipeline, &layout);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
       return;
    }
 
-   state->flush_bits |= radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                              VK_ACCESS_2_SHADER_READ_BIT, 0, image, NULL);
-
-   radv_meta_save(&saved_state, cmd_buffer,
-                  RADV_META_SAVE_DESCRIPTORS | RADV_META_SAVE_COMPUTE_PIPELINE | RADV_META_SAVE_CONSTANTS);
-
-   radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
 
    const uint64_t va = image->bindings[0].addr;
 
@@ -177,22 +171,46 @@ radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
       image->planes[0].surface.u.gfx9.color.display_dcc_height,
    };
 
-   const VkPushConstantsInfoKHR pc_info = {
-      .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
-      .layout = layout,
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      .offset = 0,
-      .size = sizeof(constants),
-      .pValues = constants,
-   };
-
-   radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
+   radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
 
    radv_unaligned_dispatch(cmd_buffer, dcc_width, dcc_height, 1);
+}
 
-   radv_meta_restore(&saved_state, cmd_buffer);
+void
+radv_retile_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image)
+{
+   const bool use_gang = cmd_buffer->qf == RADV_QUEUE_TRANSFER;
 
-   state->flush_bits |=
-      RADV_CMD_FLAG_CS_PARTIAL_FLUSH | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                                             VK_ACCESS_2_SHADER_WRITE_BIT, 0, image, NULL);
+   /* Fallback to compute because retiling DCC on SDMA isn't possible. */
+   if (use_gang) {
+      if (!radv_gang_init(cmd_buffer))
+         return;
+
+      /* Wait for all pending work on SDMA. */
+      if (radv_flush_gang_leader_semaphore(cmd_buffer))
+         radv_wait_gang_leader(cmd_buffer);
+
+      /* Emit pending cache fluses on ACE. */
+      radv_gang_cache_flush(cmd_buffer);
+   }
+
+   assert(cmd_buffer->qf == RADV_QUEUE_GENERAL || cmd_buffer->qf == RADV_QUEUE_COMPUTE ||
+          (cmd_buffer->qf == RADV_QUEUE_TRANSFER && cmd_buffer->gang.cs->hw_ip == AMD_IP_COMPUTE));
+
+   const enum ac_barrier_flags dst_flush = radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                                 VK_ACCESS_2_SHADER_READ_BIT, 0, image, NULL);
+   if (use_gang)
+      cmd_buffer->gang.flush_bits |= dst_flush;
+   else
+      cmd_buffer->state.flush_bits |= dst_flush;
+
+   radv_compute_retile_dcc(cmd_buffer, image);
+
+   const enum ac_barrier_flags src_flush =
+      AC_BARRIER_SYNC_CS | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                                 VK_ACCESS_2_SHADER_WRITE_BIT, 0, image, NULL);
+   if (use_gang)
+      cmd_buffer->gang.flush_bits |= src_flush;
+   else
+      cmd_buffer->state.flush_bits |= src_flush;
 }

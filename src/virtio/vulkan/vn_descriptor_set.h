@@ -11,27 +11,7 @@
 #ifndef VN_DESCRIPTOR_SET_H
 #define VN_DESCRIPTOR_SET_H
 
-#include "vn_common.h"
-
-enum vn_descriptor_type {
-   VN_DESCRIPTOR_TYPE_SAMPLER,
-   VN_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-   VN_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-   VN_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-   VN_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
-   VN_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
-   VN_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-   VN_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-   VN_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-   VN_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
-   VN_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
-   VN_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK,
-   VN_DESCRIPTOR_TYPE_MUTABLE_EXT,
-   VN_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
-
-   /* add new enum types before this line */
-   VN_NUM_DESCRIPTOR_TYPES,
-};
+#include "vn_descriptor.h"
 
 struct vn_descriptor_set_layout_binding {
    enum vn_descriptor_type type;
@@ -78,11 +58,17 @@ enum vn_async_set_alloc_state {
     * freeing up any descriptor set and that will change the state to NONE.
     */
    VN_ASYNC_SET_ALLOC_BEFORE_FREE,
-   /* Can still do async set alloc, and the sets allocated are with the same
-    * number of descriptors and types. Allocating a set with different number
-    * of descriptors or types will change the state to BEFORE_FREE.
+   /* Can still do async set alloc with the same layout, but the pool might
+    * have become fragmented already. Requesting to allocate a different set
+    * will change the state to NONE before making the allocation.
     */
    VN_ASYNC_SET_ALLOC_SAME_ALLOC,
+   /* Can still do async set alloc, and the sets allocated are with the same
+    * number of descriptors and types without any sets freed yet.
+    * - Allocating a different set will change the state to BEFORE_FREE.
+    * - Freeing a set will change the state to SAME_ALLOC.
+    */
+   VN_ASYNC_SET_ALLOC_SAME_ALLOC_BEFORE_FREE,
    /* Will always do async set alloc, since the pool is not created with
     * VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT.
     */
@@ -138,6 +124,7 @@ struct vn_descriptor_update_template {
    uint32_t bview_count;
    uint32_t iub_count;
    uint32_t accel_count;
+   uint32_t accel_handle_count;
    VkDescriptorUpdateTemplateEntry entries[];
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_descriptor_update_template,
@@ -158,6 +145,7 @@ struct vn_descriptor_set_update {
    VkBufferView *bview_handles;
    VkWriteDescriptorSetInlineUniformBlock *iubs;
    VkWriteDescriptorSetAccelerationStructureKHR *accels;
+   VkAccelerationStructureKHR *accel_handles;
 };
 
 uint32_t

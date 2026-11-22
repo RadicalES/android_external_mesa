@@ -134,12 +134,12 @@ replace_tex_src(nir_tex_src *dst, nir_tex_src_type src_type, nir_def *src_def,
                 nir_instr *src_parent)
 {
    *dst = nir_tex_src_for_ssa(src_type, src_def);
-   nir_src_set_parent_instr(&dst->src, src_parent);
+   nir_src_set_use_instr(&dst->src, src_parent);
    list_addtail(&dst->src.use_link, &dst->src.ssa->uses);
 }
 
-void
-gl_nir_inline_functions(nir_shader *shader)
+static void
+gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
 {
    /* We have to lower away local constant initializers right before we
     * inline functions.  That way they get properly initialized at the top
@@ -181,6 +181,10 @@ gl_nir_inline_functions(nir_shader *shader)
                if (!nir_deref_mode_is(deref, nir_var_uniform) ||
                    nir_deref_instr_get_variable(deref)->data.bindless) {
                   nir_def *load = nir_load_deref(&b, deref);
+
+                  if (caps->glsl_bindless_handles_are_32bit)
+                     load = nir_u2u32(&b, load);
+
                   replace_tex_src(&intr->src[0], nir_tex_src_texture_handle,
                                   load, instr);
                   replace_tex_src(&intr->src[1], nir_tex_src_sampler_handle,
@@ -811,15 +815,15 @@ add_shader_variable(const struct gl_constants *consts,
        *     type, a single entry will be generated, using the variable name
        *     from the shader source."
        */
-      struct gl_shader_variable *sha_v =
+      struct gl_shader_variable *blake3_v =
          create_shader_variable(shProg, var, name, type, interface_type,
                                 use_implicit_location, location,
                                 outermost_struct_type);
-      if (!sha_v)
+      if (!blake3_v)
          return false;
 
       return link_util_add_program_resource(shProg, resource_set,
-                                            programInterface, sha_v, stage_mask);
+                                            programInterface, blake3_v, stage_mask);
    }
    }
 }
@@ -867,7 +871,8 @@ add_vars_with_modes(const struct gl_constants *consts,
          sh_var->name.string = NULL;
          resource_name_updated(&sh_var->name);
          sh_var->type = var->type;
-         sh_var->location = var->data.location - loc_bias;
+         sh_var->location = var->data.explicit_location ?
+                            var->data.location - loc_bias : -1;
          sh_var->explicit_location = var->data.explicit_location;
          sh_var->index = var->data.index;
 
@@ -1192,9 +1197,12 @@ remove_dead_varyings_pre_linking(nir_shader *nir)
 bool
 gl_nir_add_point_size(nir_shader *nir)
 {
-   nir_variable *psiz = nir_create_variable_with_location(nir, nir_var_shader_out,
-                                                          VARYING_SLOT_PSIZ, glsl_float_type());
-   psiz->data.how_declared = nir_var_hidden;
+   nir_variable *psiz = NULL;
+   if (!nir->info.io_lowered) {
+      psiz = nir_create_variable_with_location(nir, nir_var_shader_out,
+                                               VARYING_SLOT_PSIZ, glsl_float_type());
+      psiz->data.how_declared = nir_var_hidden;
+   }
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_create(impl);
@@ -1207,10 +1215,19 @@ gl_nir_add_point_size(nir_shader *nir)
                 intr->intrinsic == nir_intrinsic_copy_deref) {
                nir_variable *var = nir_intrinsic_get_var(intr, 0);
                if (var->data.location == VARYING_SLOT_POS) {
+                  assert(!nir->info.io_lowered);
                   b.cursor = nir_after_instr(instr);
                   nir_deref_instr *deref = nir_build_deref_var(&b, psiz);
                   nir_store_deref(&b, deref, nir_imm_float(&b, 1.0), BITFIELD_BIT(0));
                   found = true;
+               }
+            } else if (intr->intrinsic == nir_intrinsic_store_output) {
+               nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+               if (sem.location == VARYING_SLOT_POS) {
+                  assert(nir->info.io_lowered);
+                  b.cursor = nir_after_instr(instr);
+                  nir_store_output(&b, nir_imm_float(&b, 1.0), nir_imm_int(&b, 0),
+                                   .io_semantics.location = VARYING_SLOT_PSIZ);
                }
             }
          }
@@ -1218,8 +1235,13 @@ gl_nir_add_point_size(nir_shader *nir)
    }
    if (!found) {
       b.cursor = nir_before_impl(impl);
-      nir_deref_instr *deref = nir_build_deref_var(&b, psiz);
-      nir_store_deref(&b, deref, nir_imm_float(&b, 1.0), BITFIELD_BIT(0));
+      if (nir->info.io_lowered) {
+         nir_store_output(&b, nir_imm_float(&b, 1.0), nir_imm_int(&b, 0),
+                          .io_semantics.location = VARYING_SLOT_PSIZ);
+      } else {
+         nir_deref_instr *deref = nir_build_deref_var(&b, psiz);
+         nir_store_deref(&b, deref, nir_imm_float(&b, 1.0), BITFIELD_BIT(0));
+      }
    }
 
    nir->info.outputs_written |= VARYING_BIT_PSIZ;
@@ -1299,8 +1321,11 @@ preprocess_shader(const struct pipe_screen *screen,
    nir_shader_gather_info(prog->nir, nir_shader_get_entrypoint(prog->nir));
 
    if (prog->info.stage == MESA_SHADER_FRAGMENT && consts->HasFBFetch) {
+      unsigned modes = prog->nir->info.fs.advanced_blend_modes &
+                       ~consts->NativeAdvancedBlendModes;
+
       NIR_PASS(_, prog->nir, gl_nir_lower_blend_equation_advanced,
-                 exts->KHR_blend_equation_advanced_coherent);
+                 exts->KHR_blend_equation_advanced_coherent, modes);
    }
 
    /* Set the next shader stage hint for VS and TES. */
@@ -1354,18 +1379,37 @@ preprocess_shader(const struct pipe_screen *screen,
    NIR_PASS(_, nir, nir_opt_barrier_modes);
 
    /* before buffers and vars_to_ssa */
-   NIR_PASS(_, nir, gl_nir_lower_images, true);
+   NIR_PASS(_, nir, gl_nir_lower_images, &screen->caps, true);
 
-   if (prog->nir->info.stage == MESA_SHADER_COMPUTE ||
-       prog->nir->info.stage == MESA_SHADER_TASK ||
-       prog->nir->info.stage == MESA_SHADER_MESH) {
-      nir_variable_mode modes = nir_var_mem_shared | nir_var_mem_task_payload;
-      NIR_PASS(_, prog->nir, nir_lower_vars_to_explicit_types, modes, shared_type_info);
-      NIR_PASS(_, prog->nir, nir_lower_explicit_io, modes, nir_address_format_32bit_offset);
-   }
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+}
+
+/* Lower shared and task_payload memory to explicit offsets.  This is done after
+ * the shader has been through the optimization loop (gl_nir_opts) so that the
+ * deref-based memory optimizations (nir_opt_copy_prop_vars,
+ * nir_opt_dead_write_vars, ...) get a chance to optimize these modes first.
+ */
+static bool
+lower_shared_memory(const struct gl_constants *consts,
+                    struct gl_shader_program *shader_program, nir_shader *nir)
+{
+   if (!mesa_shader_stage_uses_workgroup(nir->info.stage))
+      return true;
+
+   nir_variable_mode modes = nir_var_mem_shared | nir_var_mem_task_payload;
+   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, modes, shared_type_info);
+   NIR_PASS(_, nir, nir_lower_explicit_io, modes, nir_address_format_32bit_offset);
 
    /* Do a round of constant folding to clean up address calculations */
    NIR_PASS(_, nir, nir_opt_constant_folding);
+
+   if (nir->info.shared_size > consts->MaxComputeSharedMemorySize) {
+      linker_error(shader_program, "Too much shared memory used (%u/%u)\n",
+                   nir->info.shared_size, consts->MaxComputeSharedMemorySize);
+      return false;
+   }
+
+   return true;
 }
 
 static bool
@@ -1397,13 +1441,6 @@ prelink_lowering(const struct pipe_screen *screen,
 
       preprocess_shader(screen, consts, exts, prog, shader_program, shader->Stage);
 
-      if (prog->nir->info.shared_size > consts->MaxComputeSharedMemorySize) {
-         linker_error(shader_program, "Too much shared memory used (%u/%u)\n",
-                      prog->nir->info.shared_size,
-                      consts->MaxComputeSharedMemorySize);
-         return false;
-      }
-
       if (options->lower_to_scalar) {
          NIR_PASS(_, shader->Program->nir, nir_lower_load_const_to_scalar);
       }
@@ -1417,6 +1454,24 @@ prelink_lowering(const struct pipe_screen *screen,
     */
    if (num_shaders == 1)
       gl_nir_opts(linked_shader[0]->Program->nir);
+
+   /* Lower shared and task_payload memory to explicit offsets now that
+    * gl_nir_opts() has had a chance to optimize it as derefs.  Compute
+    * shaders are always single-shader programs so were optimized above,
+    * but task/mesh may be linked with other stages and haven't been
+    * optimized yet, so run the loop on them here first.
+    */
+   for (unsigned i = 0; i < num_shaders; i++) {
+      nir_shader *nir = linked_shader[i]->Program->nir;
+
+      if (num_shaders > 1 &&
+          (nir->info.stage == MESA_SHADER_TASK ||
+           nir->info.stage == MESA_SHADER_MESH))
+         gl_nir_opts(nir);
+
+      if (!lower_shared_memory(consts, shader_program, nir))
+         return false;
+   }
 
    /* nir_opt_access() needs to run before linking so that ImageAccess[]
     * and BindlessImage[].access are filled out with the correct modes.
@@ -1441,6 +1496,12 @@ prelink_lowering(const struct pipe_screen *screen,
    }
 
    return true;
+}
+
+static void
+optimize_varyings_opts(nir_shader *nir, void *data)
+{
+   gl_nir_opts(nir);
 }
 
 /**
@@ -1494,7 +1555,7 @@ gl_nir_lower_optimize_varyings(const struct gl_constants *consts,
       return;
 
    nir_opt_varyings_bulk(shaders, num_shaders, spirv, max_uniform_comps,
-                         max_ubos, gl_nir_opts);
+                         max_ubos, optimize_varyings_opts, NULL);
 }
 
 bool
@@ -1684,12 +1745,27 @@ cross_validate_globals(void *mem_ctx, const struct gl_constants *consts,
                      existing->data.mode == nir_var_mem_ssbo &&
                      existing->data.from_ssbo_unsized_array &&
                      glsl_get_gl_type(var->type) == glsl_get_gl_type(existing->type))) {
-                  linker_error(prog, "%s `%s' declared as type "
-                                 "`%s' and type `%s'\n",
-                                 gl_nir_mode_string(var),
-                                 var->name, glsl_get_type_name(var->type),
-                                 glsl_get_type_name(existing->type));
-                  return;
+
+                  /* Relax precision matching on unused uniforms for early ES shaders */
+                  if (prog->IsES && !var->interface_type &&
+                      !(existing->data.used && var->data.used) &&
+                      glsl_base_type_is_integer(glsl_get_gl_type(var->type)) == glsl_base_type_is_integer(glsl_get_gl_type(existing->type)) &&
+                      glsl_base_type_is_float(glsl_get_gl_type(var->type)) == glsl_base_type_is_float(glsl_get_gl_type(existing->type)) &&
+                      prog->GLSL_Version < 300) {
+                     linker_warning(prog, "%s `%s' declared as type "
+                                    "`%s' and type `%s'\n",
+                                    gl_nir_mode_string(var),
+                                    var->name, glsl_get_type_name(var->type),
+                                    glsl_get_type_name(existing->type));
+
+                  } else {
+                     linker_error(prog, "%s `%s' declared as type "
+                                    "`%s' and type `%s'\n",
+                                    gl_nir_mode_string(var),
+                                    var->name, glsl_get_type_name(var->type),
+                                    glsl_get_type_name(existing->type));
+                     return;
+                  }
                }
             }
          }
@@ -2279,36 +2355,38 @@ link_fs_inout_layout_qualifiers(struct gl_shader_program *prog,
    bool origin_upper_left = false;
    bool pixel_center_integer = false;
 
-   if (linked_shader->Stage != MESA_SHADER_FRAGMENT ||
-       (prog->GLSL_Version < 150 && !arb_fragment_coord_conventions_enable))
+   if (linked_shader->Stage != MESA_SHADER_FRAGMENT)
       return;
 
    for (unsigned i = 0; i < num_shaders; i++) {
       struct gl_shader *shader = shader_list[i];
-      /* From the GLSL 1.50 spec, page 39:
-       *
-       *   "If gl_FragCoord is redeclared in any fragment shader in a program,
-       *    it must be redeclared in all the fragment shaders in that program
-       *    that have a static use gl_FragCoord."
-       */
-      if ((redeclares_gl_fragcoord && !shader->redeclares_gl_fragcoord &&
-           shader->uses_gl_fragcoord)
-          || (shader->redeclares_gl_fragcoord && !redeclares_gl_fragcoord &&
-              uses_gl_fragcoord)) {
-             linker_error(prog, "fragment shader defined with conflicting "
-                         "layout qualifiers for gl_FragCoord\n");
-      }
 
-      /* From the GLSL 1.50 spec, page 39:
-       *
-       *   "All redeclarations of gl_FragCoord in all fragment shaders in a
-       *    single program must have the same set of qualifiers."
-       */
-      if (redeclares_gl_fragcoord && shader->redeclares_gl_fragcoord &&
-          (shader->origin_upper_left != origin_upper_left ||
-           shader->pixel_center_integer != pixel_center_integer)) {
-         linker_error(prog, "fragment shader defined with conflicting "
-                      "layout qualifiers for gl_FragCoord\n");
+      if (prog->GLSL_Version >= 150 || arb_fragment_coord_conventions_enable) {
+         /* From the GLSL 1.50 spec, page 39:
+         *
+         *   "If gl_FragCoord is redeclared in any fragment shader in a program,
+         *    it must be redeclared in all the fragment shaders in that program
+         *    that have a static use gl_FragCoord."
+         */
+         if ((redeclares_gl_fragcoord && !shader->redeclares_gl_fragcoord &&
+            shader->uses_gl_fragcoord)
+            || (shader->redeclares_gl_fragcoord && !redeclares_gl_fragcoord &&
+               uses_gl_fragcoord)) {
+               linker_error(prog, "fragment shader defined with conflicting "
+                           "layout qualifiers for gl_FragCoord\n");
+         }
+
+         /* From the GLSL 1.50 spec, page 39:
+          *
+          *   "All redeclarations of gl_FragCoord in all fragment shaders in a
+          *    single program must have the same set of qualifiers."
+          */
+         if (redeclares_gl_fragcoord && shader->redeclares_gl_fragcoord &&
+            (shader->origin_upper_left != origin_upper_left ||
+            shader->pixel_center_integer != pixel_center_integer)) {
+            linker_error(prog, "fragment shader defined with conflicting "
+                        "layout qualifiers for gl_FragCoord\n");
+         }
       }
 
       /* Update the linked shader state.  Note that uses_gl_fragcoord should
@@ -2957,7 +3035,7 @@ reserve_explicit_locations(struct gl_shader_program *prog,
 
    struct range_entry *re =
       util_range_insert_remap(location, max_loc, prog->UniformRemapTable,
-                              NULL);
+                              NULL, false);
    if (!re) {
       /* ARB_explicit_uniform_location specification states:
        *
@@ -3157,6 +3235,7 @@ link_assign_subroutine_types(struct gl_shader_program *prog)
          assert(fn->subroutine_index != -1);
          if (p->sh.NumSubroutineFunctions + 1 > MAX_SUBROUTINES) {
             linker_error(prog, "Too many subroutine functions declared.\n");
+            _mesa_set_destroy(fn_decl_set, NULL);
             return;
          }
          p->sh.SubroutineFunctions = reralloc(p, p->sh.SubroutineFunctions,
@@ -3181,6 +3260,7 @@ link_assign_subroutine_types(struct gl_shader_program *prog)
                 p->sh.SubroutineFunctions[j].index == fn->subroutine_index) {
                linker_error(prog, "each subroutine index qualifier in the "
                             "shader must be unique\n");
+               _mesa_set_destroy(fn_decl_set, NULL);
                return;
             }
          }
@@ -3913,7 +3993,8 @@ gl_nir_link_glsl(struct gl_context *ctx, struct gl_shader_program *prog)
       if (!prog->data->LinkStatus)
          goto done;
 
-      gl_nir_inline_functions(prog->_LinkedShaders[i]->Program->nir);
+      gl_nir_inline_functions(&ctx->screen->caps,
+                              prog->_LinkedShaders[i]->Program->nir);
    }
 
    resize_tes_inputs(consts, prog);

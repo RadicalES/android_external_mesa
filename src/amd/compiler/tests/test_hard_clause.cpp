@@ -3,8 +3,8 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#include "amdgfxregs.h"
 #include "helpers.h"
-#include "sid.h"
 
 using namespace aco;
 

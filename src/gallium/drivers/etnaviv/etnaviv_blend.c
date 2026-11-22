@@ -94,7 +94,8 @@ etna_blend_state_create(struct pipe_context *pctx,
                              rt->rgb_dst_factor == rt->alpha_dst_factor &&
                              rt->rgb_func == rt->alpha_func);
 
-      co->rt[i].fo_allowed = !co->rt[i].alpha_enable && !logicop_enable;
+      co->rt[i].fo_allowed = !co->rt[i].alpha_enable && !logicop_enable &&
+                             !so->advanced_blend_func;
    }
 
    co->PE_LOGIC_OP =
@@ -109,17 +110,23 @@ etna_blend_state_create(struct pipe_context *pctx,
 
    /* XXX alpha_to_one? */
 
+   if (so->advanced_blend_func)
+      co->PE_ADVANCED_ALPHA_CONFIG = VIVS_PE_ADVANCED_ALPHA_CONFIG_ADVANCED_BLEND_MODE(
+         translate_advanced_blend_mode(so->advanced_blend_func));
+
    return co;
 }
 
 bool
 etna_update_blend(struct etna_context *ctx)
 {
-   struct pipe_framebuffer_state *pfb = &ctx->framebuffer_s;
+   const bool widen_32bpc_colormask = !VIV_FEATURE(ctx->screen, ETNA_FEATURE_PE_32BPC_COLORMASK_FIX);
+   struct pipe_framebuffer_state *pfb = &ctx->framebuffer_s.base;
    struct pipe_blend_state *pblend = ctx->blend;
    struct etna_blend_state *blend = etna_blend_state(pblend);
    unsigned current_rt = 0;
    bool dither_allow = true;
+   bool all_overwrite = true;
 
    for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
       if (!pfb->cbufs[i].texture)
@@ -133,15 +140,7 @@ etna_update_blend(struct etna_context *ctx)
       else
          rt = &pblend->rt[0];
 
-      if (translate_pe_format_rb_swap(pfb->cbufs[i].format)) {
-         colormask = rt->colormask & (PIPE_MASK_A | PIPE_MASK_G);
-         if (rt->colormask & PIPE_MASK_R)
-            colormask |= PIPE_MASK_B;
-         if (rt->colormask & PIPE_MASK_B)
-            colormask |= PIPE_MASK_R;
-      } else {
-         colormask = rt->colormask;
-      }
+      colormask = rt->colormask;
 
       /* Dithering a 4bpc format leads to visible artifacts due to the low
        * precision of the color channels.
@@ -158,17 +157,52 @@ etna_update_blend(struct etna_context *ctx)
       bool full_overwrite = (blend->rt[i].fo_allowed &&
                             util_format_colormask_full(desc, colormask));
 
-      if (current_rt == 0) {
-         blend->rt[0].PE_COLOR_FORMAT =
-                  VIVS_PE_COLOR_FORMAT_COMPONENTS(colormask) |
-                  COND(full_overwrite, VIVS_PE_COLOR_FORMAT_OVERWRITE);
-      } else {
-         blend->rt[current_rt].PE_HALTI5_COLORMASK =
-                  VIVS_PE_HALTI5_RT_COLORMASK_COMPONENTS(colormask) |
-                  COND(full_overwrite, VIVS_PE_HALTI5_RT_COLORMASK_OVERWRITE);
+      /* A 128-bit RT's companion holds the user's B,A in its R,G and has no
+       * blend state of its own. Take its mask from the user RT, shifting B,A
+       * down to R,G.
+       */
+      const int src = ctx->framebuffer_s.companion_src[i];
+      if (src >= 0) {
+         const struct pipe_rt_blend_state *user =
+            pblend->independent_blend_enable ? &pblend->rt[src] : &pblend->rt[0];
+
+         colormask = (user->colormask >> 2) & 0x3;
+         full_overwrite = blend->rt[src].fo_allowed && colormask == 0x3;
       }
 
-      if (blend->rt[i].alpha_enable) {
+      if (widen_32bpc_colormask) {
+         const bool is_128bit_plane = src >= 0 ||
+                                      (ctx->framebuffer_s.rt_is_128bit & (1u << i));
+         const bool is_32bpc = desc->channel[0].size == 32 && desc->nr_channels <= 2;
+
+         if (is_128bit_plane || is_32bpc)
+            colormask = (colormask & 1 ? 0x3 : 0) | (colormask & 2 ? 0xc : 0);
+      }
+
+      if (current_rt == 0) {
+         blend->rt[0].PE_COLOR_FORMAT =
+                  VIVS_PE_COLOR_FORMAT_COMPONENTS(colormask);
+      } else {
+         blend->rt[current_rt].PE_HALTI5_COLORMASK =
+                  VIVS_PE_HALTI5_RT_COLORMASK_COMPONENTS(colormask);
+      }
+
+      all_overwrite &= full_overwrite;
+
+      if (pblend->advanced_blend_func) {
+         /* The mode in PE_ADVANCED_ALPHA_CONFIG replaces the blend math, so the
+          * classic blender gets a neutral configuration.
+          */
+         blend->rt[current_rt].PE_ALPHA_CONFIG =
+            VIVS_PE_ALPHA_CONFIG_BLEND_ENABLE_COLOR |
+            VIVS_PE_ALPHA_CONFIG_BLEND_SEPARATE_ALPHA |
+            VIVS_PE_ALPHA_CONFIG_SRC_FUNC_COLOR(BLEND_FUNC_ONE) |
+            VIVS_PE_ALPHA_CONFIG_SRC_FUNC_ALPHA(BLEND_FUNC_ONE) |
+            VIVS_PE_ALPHA_CONFIG_DST_FUNC_COLOR(BLEND_FUNC_ZERO) |
+            VIVS_PE_ALPHA_CONFIG_DST_FUNC_ALPHA(BLEND_FUNC_ZERO) |
+            VIVS_PE_ALPHA_CONFIG_EQ_COLOR(BLEND_EQ_ADD) |
+            VIVS_PE_ALPHA_CONFIG_EQ_ALPHA(BLEND_EQ_ADD);
+      } else if (blend->rt[i].alpha_enable) {
          blend->rt[current_rt].PE_ALPHA_CONFIG =
             VIVS_PE_ALPHA_CONFIG_BLEND_ENABLE_COLOR |
             COND(blend->rt[i].separate_alpha, VIVS_PE_ALPHA_CONFIG_BLEND_SEPARATE_ALPHA) |
@@ -188,6 +222,16 @@ etna_update_blend(struct etna_context *ctx)
    if (current_rt == 0)
       blend->rt[0].PE_COLOR_FORMAT = VIVS_PE_COLOR_FORMAT_OVERWRITE;
 
+   /* On some cores the overwrite bit skips the destination read for every
+    * target, so set it only when all render targets are fully overwritten.
+    */
+   if (all_overwrite) {
+      blend->rt[0].PE_COLOR_FORMAT |= VIVS_PE_COLOR_FORMAT_OVERWRITE;
+
+      for (unsigned i = 1; i < current_rt; i++)
+         blend->rt[i].PE_HALTI5_COLORMASK |= VIVS_PE_HALTI5_RT_COLORMASK_OVERWRITE;
+   }
+
    /* Use same dither pattern as the blob */
    if (blend->base.dither && dither_allow) {
       blend->PE_DITHER[0] = 0x6e4ca280;
@@ -206,43 +250,27 @@ void
 etna_set_blend_color(struct pipe_context *pctx, const struct pipe_blend_color *bc)
 {
    struct etna_context *ctx = etna_context(pctx);
+   struct etna_screen *screen = etna_screen(pctx->screen);
    struct compiled_blend_color *cs = &ctx->blend_color;
+   const unsigned num_rts = screen->specs.num_rts;
 
-   memcpy(cs->color, bc->color, sizeof(float) * 4);
+   cs->PE_ALPHA_BLEND_COLOR =
+      VIVS_PE_ALPHA_BLEND_COLOR_R(float_to_ubyte(bc->color[0])) |
+      VIVS_PE_ALPHA_BLEND_COLOR_G(float_to_ubyte(bc->color[1])) |
+      VIVS_PE_ALPHA_BLEND_COLOR_B(float_to_ubyte(bc->color[2])) |
+      VIVS_PE_ALPHA_BLEND_COLOR_A(float_to_ubyte(bc->color[3]));
 
-   ctx->dirty |= ETNA_DIRTY_BLEND_COLOR;
-}
+   const uint32_t ext0 =
+      VIVS_PE_ALPHA_COLOR_EXT0_B(_mesa_float_to_half(bc->color[0])) |
+      VIVS_PE_ALPHA_COLOR_EXT0_G(_mesa_float_to_half(bc->color[1]));
+   const uint32_t ext1 =
+      VIVS_PE_ALPHA_COLOR_EXT1_R(_mesa_float_to_half(bc->color[2])) |
+      VIVS_PE_ALPHA_COLOR_EXT1_A(_mesa_float_to_half(bc->color[3]));
 
-bool
-etna_update_blend_color(struct etna_context *ctx)
-{
-   struct pipe_framebuffer_state *fb = &ctx->framebuffer_s;
-   struct compiled_blend_color *cs = &ctx->blend_color;
-   unsigned rt = 0;
-
-   for (unsigned i = 0; i < fb->nr_cbufs; i++) {
-      if (!fb->cbufs[i].texture)
-         continue;
-
-      bool rb_swap = translate_pe_format_rb_swap(fb->cbufs[i].format);
-
-      if (rt == 0) {
-         cs->PE_ALPHA_BLEND_COLOR =
-            VIVS_PE_ALPHA_BLEND_COLOR_R(float_to_ubyte(cs->color[rb_swap ? 2 : 0])) |
-            VIVS_PE_ALPHA_BLEND_COLOR_G(float_to_ubyte(cs->color[1])) |
-            VIVS_PE_ALPHA_BLEND_COLOR_B(float_to_ubyte(cs->color[rb_swap ? 0 : 2])) |
-            VIVS_PE_ALPHA_BLEND_COLOR_A(float_to_ubyte(cs->color[3]));
-      }
-
-      cs->rt[rt].PE_ALPHA_COLOR_EXT0 =
-         VIVS_PE_ALPHA_COLOR_EXT0_B(_mesa_float_to_half(cs->color[rb_swap ? 2 : 0])) |
-         VIVS_PE_ALPHA_COLOR_EXT0_G(_mesa_float_to_half(cs->color[1]));
-      cs->rt[rt].PE_ALPHA_COLOR_EXT1 =
-         VIVS_PE_ALPHA_COLOR_EXT1_R(_mesa_float_to_half(cs->color[rb_swap ? 0 : 2])) |
-         VIVS_PE_ALPHA_COLOR_EXT1_A(_mesa_float_to_half(cs->color[3]));
-
-      rt++;
+   for (unsigned i = 0; i < num_rts; i++) {
+      cs->rt[i].PE_ALPHA_COLOR_EXT0 = ext0;
+      cs->rt[i].PE_ALPHA_COLOR_EXT1 = ext1;
    }
 
-   return true;
+   ctx->dirty |= ETNA_DIRTY_BLEND_COLOR;
 }

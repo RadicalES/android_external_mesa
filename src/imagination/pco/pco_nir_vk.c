@@ -41,11 +41,11 @@ set_resource_used(pco_common_data *common, unsigned desc_set, unsigned binding)
  * \param[in] b NIR builder.
  * \param[in] intr NIR intrinsic instruction.
  * \param[in] common Shader common data.
- * \return The replacement/lowered def.
+ * \return True if progress was made.
  */
-static nir_def *lower_load_vulkan_descriptor(nir_builder *b,
-                                             nir_intrinsic_instr *intr,
-                                             pco_common_data *common)
+static bool lower_load_vulkan_descriptor(nir_builder *b,
+                                         nir_intrinsic_instr *intr,
+                                         pco_common_data *common)
 {
    nir_intrinsic_instr *vk_res_idx = nir_src_as_intrinsic(intr->src[0]);
    assert(vk_res_idx->intrinsic == nir_intrinsic_vulkan_resource_index);
@@ -54,27 +54,33 @@ static nir_def *lower_load_vulkan_descriptor(nir_builder *b,
 
    unsigned desc_set = nir_intrinsic_desc_set(vk_res_idx);
    unsigned binding = nir_intrinsic_binding(vk_res_idx);
-   unsigned elem = nir_src_as_uint(vk_res_idx->src[0]);
+   nir_def *elem = vk_res_idx->src[0].ssa;
 
    set_resource_used(common, desc_set, binding);
 
+   b->cursor = nir_before_instr(&intr->instr);
+
    uint32_t desc_set_binding = pco_pack_desc(desc_set, binding);
-   return nir_imm_ivec3(b, desc_set_binding, elem, 0);
+   nir_def *desc_ref =
+      nir_vec3(b, nir_imm_int(b, desc_set_binding), elem, nir_imm_int(b, 0));
+   nir_def_rewrite_uses(&intr->def, desc_ref);
+   nir_instr_remove(&intr->instr);
+   return true;
 }
 
 static nir_def *array_elem_from_deref(nir_builder *b, nir_deref_instr *deref)
 {
-   unsigned array_elem = 0;
+   nir_def *array_elem = nir_imm_int(b, 0);
    if (deref->deref_type != nir_deref_type_var) {
       assert(deref->deref_type == nir_deref_type_array);
 
-      array_elem = nir_src_as_uint(deref->arr.index);
+      array_elem = deref->arr.index.ssa;
 
       deref = nir_deref_instr_parent(deref);
    }
 
    assert(deref->deref_type == nir_deref_type_var);
-   return nir_imm_int(b, array_elem);
+   return array_elem;
 }
 
 static inline bool is_comb_img_smp(unsigned desc_set,
@@ -88,14 +94,13 @@ static inline bool is_comb_img_smp(unsigned desc_set,
    return binding_data->is_img_smp;
 }
 
-static void lower_tex_deref_to_binding(nir_builder *b,
+static bool lower_tex_deref_to_binding(nir_builder *b,
                                        nir_tex_instr *tex,
                                        unsigned deref_index,
                                        pco_common_data *common)
 {
    nir_tex_src *deref_src = &tex->src[deref_index];
-   nir_deref_instr *deref =
-      nir_def_as_deref(deref_src->src.ssa);
+   nir_deref_instr *deref = nir_def_as_deref(deref_src->src.ssa);
 
    b->cursor = nir_before_instr(&tex->instr);
 
@@ -116,10 +121,14 @@ static void lower_tex_deref_to_binding(nir_builder *b,
       deref_src->src_type = nir_tex_src_backend2;
    }
 
+   /* Pass along the access flags via the backend flags */
+   tex->backend_flags = var->data.access;
+
    nir_src_rewrite(&deref_src->src, elem);
+   return true;
 }
 
-static void
+static bool
 add_txf_sampler(nir_builder *b, nir_tex_instr *tex, pco_common_data *common)
 {
    int deref_index = nir_tex_instr_src_index(tex, nir_tex_src_backend1);
@@ -142,25 +151,29 @@ add_txf_sampler(nir_builder *b, nir_tex_instr *tex, pco_common_data *common)
 
    tex->sampler_index = pco_pack_desc(desc_set, binding);
    nir_tex_instr_add_src(tex, nir_tex_src_backend2, elem);
+   return true;
 }
 
-static inline void
+static inline bool
 lower_tex_derefs(nir_builder *b, nir_tex_instr *tex, pco_common_data *common)
 {
    int deref_index;
+   bool progress = false;
 
    deref_index = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
    if (deref_index >= 0)
-      lower_tex_deref_to_binding(b, tex, deref_index, common);
+      progress |= lower_tex_deref_to_binding(b, tex, deref_index, common);
 
    deref_index = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    if (deref_index >= 0)
-      lower_tex_deref_to_binding(b, tex, deref_index, common);
+      progress |= lower_tex_deref_to_binding(b, tex, deref_index, common);
    else if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
-      add_txf_sampler(b, tex, common);
+      progress |= add_txf_sampler(b, tex, common);
+
+   return progress;
 }
 
-static nir_def *
+static bool
 lower_image_derefs(nir_builder *b, nir_intrinsic_instr *intr, pco_data *data)
 {
    nir_src *deref_src = &intr->src[0];
@@ -198,9 +211,11 @@ lower_image_derefs(nir_builder *b, nir_intrinsic_instr *intr, pco_data *data)
                                    elem,
                                    nir_imm_int(b, ia_idx));
 
+         nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) | var->data.access);
+
          nir_src_rewrite(deref_src, index);
 
-         return NIR_LOWER_INSTR_PROGRESS;
+         return true;
       }
 
       /* Sampler not needed for on-chip input attachments. */
@@ -215,20 +230,21 @@ lower_image_derefs(nir_builder *b, nir_intrinsic_instr *intr, pco_data *data)
    nir_def *index =
       nir_vec3(b, nir_imm_int(b, desc_set), nir_imm_int(b, binding), elem);
 
+   nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) | var->data.access);
+
    nir_src_rewrite(deref_src, index);
 
-   return NIR_LOWER_INSTR_PROGRESS;
+   return true;
 }
 
-static nir_def *lower_is_null_descriptor(nir_builder *b,
-                                         nir_intrinsic_instr *intr)
+static bool lower_is_null_descriptor(nir_builder *b, nir_intrinsic_instr *intr)
 {
    nir_src *deref_src = &intr->src[0];
    nir_deref_instr *deref = nir_src_as_deref(*deref_src);
 
    /* Will be taken care of by lower_load_vulkan_descriptor. */
    if (!deref)
-      return NULL;
+      return false;
 
    b->cursor = nir_before_instr(&intr->instr);
 
@@ -242,102 +258,64 @@ static nir_def *lower_is_null_descriptor(nir_builder *b,
    nir_def *index = nir_vec2(b, nir_imm_int(b, desc_set_binding), elem);
 
    nir_src_rewrite(deref_src, index);
-   return NIR_LOWER_INSTR_PROGRESS;
+   return true;
 }
 
 /**
- * \brief Lowers a Vulkan-related instruction.
+ * \brief Lowers a Vulkan-related texture instruction.
  *
  * \param[in] b NIR builder.
- * \param[in] instr NIR instruction.
+ * \param[in] tex NIR texture instruction.
  * \param[in] cb_data User callback data.
- * \return The replacement/lowered def.
+ * \return True if progress was made.
  */
-static nir_def *lower_vk(nir_builder *b, nir_instr *instr, void *cb_data)
+static bool lower_vk_tex(nir_builder *b, nir_tex_instr *tex, void *cb_data)
+{
+   pco_data *data = cb_data;
+   pco_common_data *common = &data->common;
+   if (nir_tex_instr_src_index(tex, nir_tex_src_texture_deref) >= 0 ||
+       nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref) >= 0) {
+      return lower_tex_derefs(b, tex, common);
+   }
+   return false;
+}
+
+/**
+ * \brief Lowers a Vulkan-related intrinsic instruction.
+ *
+ * \param[in] b NIR builder.
+ * \param[in] intr NIR intrinsic instruction.
+ * \param[in] cb_data User callback data.
+ * \return True if progress was made.
+ */
+static bool
+lower_vk_intr(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
 {
    pco_data *data = cb_data;
    pco_common_data *common = &data->common;
 
-   switch (instr->type) {
-   case nir_instr_type_intrinsic: {
-      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-      switch (intr->intrinsic) {
-      case nir_intrinsic_load_vulkan_descriptor:
-         return lower_load_vulkan_descriptor(b, intr, common);
+   b->cursor = nir_before_instr(&intr->instr);
 
-      case nir_intrinsic_image_deref_load:
-      case nir_intrinsic_image_deref_store:
-      case nir_intrinsic_image_deref_atomic:
-      case nir_intrinsic_image_deref_atomic_swap:
-      case nir_intrinsic_image_deref_size:
-         return lower_image_derefs(b, intr, data);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_vulkan_descriptor:
+      return lower_load_vulkan_descriptor(b, intr, common);
 
-      case nir_intrinsic_is_null_descriptor:
-         return lower_is_null_descriptor(b, intr);
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_input_attachment_load:
+   case nir_intrinsic_image_deref_depth_input_attachment_load:
+   case nir_intrinsic_image_deref_stencil_input_attachment_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+      return lower_image_derefs(b, intr, data);
 
-      default:
-         break;
-      }
-
-      break;
-   }
-
-   case nir_instr_type_tex: {
-      nir_tex_instr *tex = nir_instr_as_tex(instr);
-      lower_tex_derefs(b, tex, common);
-      return NIR_LOWER_INSTR_PROGRESS;
-   }
+   case nir_intrinsic_is_null_descriptor:
+      return lower_is_null_descriptor(b, intr);
 
    default:
       break;
    }
-
-   UNREACHABLE("");
-}
-
-/**
- * \brief Filters Vulkan-related instructions.
- *
- * \param[in] instr NIR instruction.
- * \param[in] cb_data User callback data.
- * \return True if the instruction matches the filter.
- */
-static bool is_vk(const nir_instr *instr, UNUSED const void *cb_data)
-{
-   switch (instr->type) {
-   case nir_instr_type_intrinsic: {
-      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-      switch (intr->intrinsic) {
-      case nir_intrinsic_load_vulkan_descriptor:
-      case nir_intrinsic_is_null_descriptor:
-      case nir_intrinsic_image_deref_load:
-      case nir_intrinsic_image_deref_store:
-      case nir_intrinsic_image_deref_atomic:
-      case nir_intrinsic_image_deref_atomic_swap:
-      case nir_intrinsic_image_deref_size:
-         return true;
-
-      default:
-         break;
-      }
-
-      break;
-   }
-
-   case nir_instr_type_tex: {
-      nir_tex_instr *tex = nir_instr_as_tex(instr);
-      if (nir_tex_instr_src_index(tex, nir_tex_src_texture_deref) >= 0 ||
-          nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref) >= 0) {
-         return true;
-      }
-
-      FALLTHROUGH;
-   }
-
-   default:
-      break;
-   }
-
    return false;
 }
 
@@ -352,7 +330,14 @@ bool pco_nir_lower_vk(nir_shader *shader, pco_data *data)
 {
    bool progress = false;
 
-   progress |= nir_shader_lower_instructions(shader, is_vk, lower_vk, data);
+   progress |= nir_shader_intrinsics_pass(shader,
+                                          lower_vk_intr,
+                                          nir_metadata_control_flow,
+                                          data);
+   progress |= nir_shader_tex_pass(shader,
+                                   lower_vk_tex,
+                                   nir_metadata_control_flow,
+                                   data);
 
    return progress;
 }

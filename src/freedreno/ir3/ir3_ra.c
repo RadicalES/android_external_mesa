@@ -615,38 +615,41 @@ ra_interval_dump(struct log_stream *stream, struct ra_interval *interval)
 }
 
 static void
-ra_file_dump(struct log_stream *stream, struct ra_file *file)
+ra_file_dump(struct log_stream *stream, struct ra_file *file, const char *name)
 {
+   mesa_log_stream_printf(stream, "%s:\n", name);
    rb_tree_foreach (struct ra_interval, interval, &file->physreg_intervals,
                     physreg_node) {
       ra_interval_dump(stream, interval);
    }
 
    unsigned start, end;
-   mesa_log_stream_printf(stream, "available:\n");
+   mesa_log_stream_printf(stream, "%s available: ", name);
    BITSET_FOREACH_RANGE (start, end, file->available, file->size) {
       mesa_log_stream_printf(stream, "%u-%u ", start, end);
    }
    mesa_log_stream_printf(stream, "\n");
 
-   mesa_log_stream_printf(stream, "available to evict:\n");
+   mesa_log_stream_printf(stream, "%s available to evict: ", name);
    BITSET_FOREACH_RANGE (start, end, file->available_to_evict, file->size) {
       mesa_log_stream_printf(stream, "%u-%u ", start, end);
    }
    mesa_log_stream_printf(stream, "\n");
-   mesa_log_stream_printf(stream, "start: %u\n", file->start);
+   mesa_log_stream_printf(stream, "%s start: %u\n", name, file->start);
 }
 
 static void
 ra_ctx_dump(struct ra_ctx *ctx)
 {
    struct log_stream *stream = mesa_log_streami();
-   mesa_log_stream_printf(stream, "full:\n");
-   ra_file_dump(stream, &ctx->full);
-   mesa_log_stream_printf(stream, "half:\n");
-   ra_file_dump(stream, &ctx->half);
-   mesa_log_stream_printf(stream, "shared:\n");
-   ra_file_dump(stream, &ctx->shared);
+   ra_file_dump(stream, &ctx->full, "full");
+   if (ctx->half.size != 0) {
+      /* No need to print this file in the mergedregs case when nothing can
+       * allocate to it.
+       */
+      ra_file_dump(stream, &ctx->half, "half");
+   }
+   ra_file_dump(stream, &ctx->shared, "shared");
    mesa_log_stream_destroy(stream);
 }
 
@@ -1585,14 +1588,31 @@ assign_reg(struct ir3_instruction *instr, struct ir3_register *reg,
    }
 }
 
+/* True if src is killed and its register can be used to allocate a dst. A src
+ * is killed iff its SSA value is killed and it isn't part of or contains an
+ * interval that isn't killed yet.
+ */
+bool
+ir3_ra_src_is_killed(struct ir3_register *src,
+                     struct ir3_reg_interval *def_interval)
+{
+   return (src->flags & IR3_REG_FIRST_KILL) && !def_interval->parent &&
+          rb_tree_is_empty(&def_interval->children);
+}
+
+static bool
+is_killed(struct ra_ctx *ctx, struct ir3_register *src)
+{
+   struct ra_interval *interval = ra_interval_get(ctx, src->def);
+   return ir3_ra_src_is_killed(src, &interval->interval);
+}
+
 static void
 mark_src_killed(struct ra_ctx *ctx, struct ir3_register *src)
 {
    struct ra_interval *interval = ra_interval_get(ctx, src->def);
 
-   if (!(src->flags & IR3_REG_FIRST_KILL) || interval->is_killed ||
-       interval->interval.parent ||
-       !rb_tree_is_empty(&interval->interval.children))
+   if (interval->is_killed || !is_killed(ctx, src))
       return;
 
    ra_file_mark_killed(ra_get_file(ctx, src), interval);
@@ -2520,7 +2540,8 @@ handle_block(struct ra_ctx *ctx, struct ir3_block *block)
 }
 
 static unsigned
-calc_target_full_pressure(struct ir3_shader_variant *v, unsigned pressure)
+calc_target_full_pressure(struct ir3_shader_variant *v, unsigned pressure,
+                          unsigned limit)
 {
    /* Registers are allocated in units of vec4, so switch from units of
     * half-regs to vec4.
@@ -2537,7 +2558,7 @@ calc_target_full_pressure(struct ir3_shader_variant *v, unsigned pressure)
    unsigned target_waves =
       MIN2(reg_independent_max_waves, reg_dependent_max_waves);
 
-   while (target <= RA_FULL_SIZE / (2 * 4) &&
+   while (target <= limit / (2 * 4) &&
           ir3_should_double_threadsize(v, target) == double_threadsize &&
           ir3_get_reg_dependent_max_waves(v->compiler, target,
                                           double_threadsize) >= target_waves)
@@ -2639,7 +2660,9 @@ calc_min_limit_pressure(struct ir3_shader_variant *v,
          /* phis and parallel copies can be deleted via spilling */
 
          if (instr->opc == OPC_META_PHI) {
-            ir3_reg_interval_insert(ctx, &intervals[instr->dsts[0]->name]);
+            /* only the GPR phis have an interval; the rest are not RA's */
+            if (ra_reg_is_dst(instr->dsts[0]))
+               ir3_reg_interval_insert(ctx, &intervals[instr->dsts[0]->name]);
             continue;
          }
 
@@ -2649,7 +2672,9 @@ calc_min_limit_pressure(struct ir3_shader_variant *v,
          cur_pressure = (struct ir3_pressure) {0};
 
          ra_foreach_dst (dst, instr) {
-            if ((dst->tied && !(dst->tied->flags & IR3_REG_KILL)) ||
+            if ((dst->tied &&
+                 !ir3_ra_src_is_killed(dst->tied,
+                                       &intervals[dst->tied->def->name])) ||
                 (dst->flags & IR3_REG_EARLY_CLOBBER))
                add_pressure(&cur_pressure, dst, v->mergedregs);
          }
@@ -2696,26 +2721,18 @@ calc_min_limit_pressure(struct ir3_shader_variant *v,
 /*
  * If barriers are used, it must be possible for all waves in the workgroup
  * to execute concurrently. Thus we may have to reduce the registers limit.
+ *
+ * Returns the half-units one thread may use with every wave resident.
+ * pairs_at_threadsize counts the resident wave-pairs at the threadsize the
+ * shader runs rather than at the single one.
  */
-static void
-calc_limit_pressure_for_cs_with_barrier(struct ir3_shader_variant *v,
-                                        struct ir3_pressure *limit_pressure)
+static unsigned
+calc_cs_barrier_reg_budget(struct ir3_shader_variant *v,
+                           bool pairs_at_threadsize)
 {
    const struct ir3_compiler *compiler = v->compiler;
 
    bool double_threadsize = ir3_should_double_threadsize(v, 0);
-   unsigned threads_per_wg;
-
-   if (v->local_size_variable) {
-      if (v->type == MESA_SHADER_KERNEL) {
-         threads_per_wg = compiler->threadsize_base * (double_threadsize ? 2 : 1);
-      } else {
-         /* We have to expect the worst case. */
-         threads_per_wg = compiler->max_variable_workgroup_size;
-      }
-   } else {
-      threads_per_wg = v->local_size[0] * v->local_size[1] * v->local_size[2];
-   }
 
    /* The register file is grouped into reg_size_vec4 number of parts.
     * Each part has enough registers to add a single vec4 register to
@@ -2725,25 +2742,16 @@ calc_limit_pressure_for_cs_with_barrier(struct ir3_shader_variant *v,
     * parts each could get.
     */
 
-   unsigned waves_per_wg = DIV_ROUND_UP(
-      threads_per_wg, compiler->threadsize_base * (double_threadsize ? 2 : 1) *
-                         compiler->wave_granularity);
+   unsigned wave_pairs_per_wg =
+      ir3_get_waves_per_wg(v, pairs_at_threadsize && double_threadsize) /
+      compiler->info->wave_granularity;
 
    uint32_t vec4_regs_per_thread =
-      compiler->reg_size_vec4 / (waves_per_wg * (double_threadsize ? 2 : 1));
+      compiler->reg_size_vec4 /
+      (wave_pairs_per_wg * (double_threadsize ? 2 : 1));
    assert(vec4_regs_per_thread > 0);
 
-   uint32_t half_regs_per_thread = vec4_regs_per_thread * 4 * 2;
-
-   if (limit_pressure->full > half_regs_per_thread) {
-      if (v->mergedregs) {
-         limit_pressure->full = half_regs_per_thread;
-      } else {
-         /* TODO: Handle !mergedregs case, probably we would have to do this
-          * after the first register pressure pass.
-          */
-      }
-   }
+   return vec4_regs_per_thread * 4 * 2;
 }
 
 struct ir3_pressure
@@ -2756,9 +2764,10 @@ ir3_ra_get_reg_file_limits(struct ir3_shader_variant *v)
       .shared_half = RA_SHARED_HALF_SIZE,
    };
 
-   if (mesa_shader_stage_is_compute(v->type) &&
+   if (v->mergedregs && mesa_shader_stage_is_compute(v->type) &&
        v->shader->nir->info.uses_control_barrier) {
-      calc_limit_pressure_for_cs_with_barrier(v, &limit_pressure);
+      limit_pressure.full =
+         MIN2(limit_pressure.full, calc_cs_barrier_reg_budget(v, true));
    }
 
    /* If the user forces a doubled threadsize, we may have to lower the limit
@@ -2767,8 +2776,10 @@ ir3_ra_get_reg_file_limits(struct ir3_shader_variant *v)
     */
    if (v->shader_options.real_wavesize == IR3_DOUBLE_ONLY) {
       limit_pressure.full =
-         MAX2(limit_pressure.full, v->compiler->reg_size_vec4 / 2 * 16);
+         MIN2(limit_pressure.full, v->compiler->reg_size_vec4 / 2 * 16);
    }
+
+   assert(limit_pressure.full <= RA_FULL_SIZE);
 
    return limit_pressure;
 }
@@ -2821,11 +2832,6 @@ ir3_ra(struct ir3_shader_variant *v)
    if (ir3_shader_debug & IR3_DBG_SPILLALL)
       calc_min_limit_pressure(v, live, &limit_pressure);
 
-   d("limit pressure:");
-   d("\tfull: %u", limit_pressure.full);
-   d("\thalf: %u", limit_pressure.half);
-   d("\tshared: %u", limit_pressure.shared);
-
    /* In the worst case, each half register could block one full register, so
     * add shared_half in case of fragmentation. In addition, full registers can
     * block half registers so we have to consider the total pressure against the
@@ -2841,11 +2847,43 @@ ir3_ra(struct ir3_shader_variant *v)
       ir3_debug_print(v->ir, "AFTER: shared register allocation");
    }
 
+   /* Both banks come out of one file, in half-units. */
+   unsigned phys_file_size = v->compiler->reg_size_vec4 * 4 * 2;
+
+   if (!v->mergedregs && mesa_shader_stage_is_compute(v->type) &&
+       v->shader->nir->info.uses_control_barrier)
+      phys_file_size = MIN2(phys_file_size, calc_cs_barrier_reg_budget(v, false));
+
+   if (!v->mergedregs &&
+       limit_pressure.full + limit_pressure.half > phys_file_size) {
+      /* a whole register is reserved even for a single component of it */
+      limit_pressure.half = MIN3(ALIGN_POT(max_pressure.half, 4 * 2),
+                                 limit_pressure.half, phys_file_size);
+      /* the footprint rounds up, so the budget rounds down */
+      limit_pressure.full =
+         MIN2(limit_pressure.full,
+              ROUND_DOWN_TO(phys_file_size - limit_pressure.half, 4 * 2));
+   }
+
+   d("limit pressure:");
+   d("\tfull: %u", limit_pressure.full);
+   d("\thalf: %u", limit_pressure.half);
+   d("\tshared: %u", limit_pressure.shared);
+
    bool spilled = false;
    if (max_pressure.full > limit_pressure.full ||
        max_pressure.half > limit_pressure.half) {
       if (!v->compiler->has_pvtmem) {
          d("max pressure exceeded!");
+         goto fail;
+      }
+      /* the spiller cannot get below one instruction's own footprint */
+      struct ir3_pressure min_pressure;
+      calc_min_limit_pressure(v, live, &min_pressure);
+      if (limit_pressure.full < min_pressure.full ||
+          limit_pressure.half < min_pressure.half) {
+         mesa_loge("Shader (%s) needs more registers than its register "
+                   "limit allows.", v->name);
          goto fail;
       }
       d("max pressure exceeded, spilling!");
@@ -2867,11 +2905,14 @@ ir3_ra(struct ir3_shader_variant *v)
       rzalloc_array(ctx, struct ra_interval, live->definitions_count);
    ctx->blocks = rzalloc_array(ctx, struct ra_block_state, live->block_count);
 
-   ctx->full.size = calc_target_full_pressure(v, max_pressure.full);
+   unsigned full_limit = v->mergedregs ? RA_FULL_SIZE : limit_pressure.full;
+
+   ctx->full.size = calc_target_full_pressure(v, max_pressure.full, full_limit);
+   assert(ctx->full.size <= full_limit);
    d("full size: %u", ctx->full.size);
 
    if (!v->mergedregs)
-      ctx->half.size = RA_HALF_SIZE;
+      ctx->half.size = MIN2(RA_HALF_SIZE, phys_file_size - ctx->full.size);
 
    ctx->shared.size = RA_SHARED_SIZE;
 

@@ -41,6 +41,11 @@ trap cleanup INT TERM EXIT
 # background by this script
 BACKGROUND_PIDS=
 
+# Until we uniformize the install dir to /install, we need to make it
+# available to both possible CI_PROJECT_DIR paths.
+if [ "$GIT_STRATEGY" = empty ]; then
+  ln -s "$CI_PROJECT_DIR" "${CI_PROJECT_DIR%-empty}"
+fi
 
 for path in '/dut-env-vars.sh' '/set-job-env-vars.sh' './set-job-env-vars.sh'; do
     [ -f "$path" ] && source "$path"
@@ -53,6 +58,12 @@ echo
 echo
 
 section_switch init_stage2 "Pre-testing hardware setup"
+
+job_time=$(get_job_seconds)
+uptime=$(cut -d ' ' -f1 /proc/uptime)
+echo "$(get_current_minsec) after job start == $uptime sec after kernel boot time"
+printf -v uptime_rounded "%.0f" "$uptime"
+echo "Kernel boot occurred $((job_time-uptime_rounded)) seconds after job start"
 
 set -ex
 
@@ -89,6 +100,11 @@ if [ -n "$HWCI_ENABLE_X86_KVM" ]; then
       echo "WARNING: Failed to detect CPU virtualization extensions"
     } || \
         modprobe ${KVM_KERNEL_MODULE}
+fi
+
+if ! [ -e /install/ ] && ! [ -e $CI_PROJECT_DIR/install/ ]; then
+  echo "Missing install/ dir"
+  exit 1
 fi
 
 # Fix prefix confusion: the build installs to $CI_PROJECT_DIR, but we expect
@@ -149,6 +165,7 @@ fi
 # Increase freedreno hangcheck timer because it's right at the edge of the
 # spilling tests timing out (and some traces, too)
 if [ -n "$FREEDRENO_HANGCHECK_MS" ]; then
+    findmnt --mountpoint /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
     echo $FREEDRENO_HANGCHECK_MS | tee -a /sys/kernel/debug/dri/128/hangcheck_period_ms
 fi
 
@@ -196,6 +213,12 @@ fi
 set +x
 
 section_end init_stage2
+
+# Store the vulkaninfo output as artifacts.
+if [ -n "${VK_DRIVER:-}" ] && command -v vulkaninfo >/dev/null 2>&1; then
+  RADV_DEBUG="${RADV_DEBUG:+$RADV_DEBUG,}info" \
+    vulkaninfo > "$RESULTS_DIR/vulkaninfo.txt" || true
+fi
 
 echo "Running ${HWCI_TEST_SCRIPT} ${HWCI_TEST_ARGS} ..."
 

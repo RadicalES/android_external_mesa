@@ -248,8 +248,8 @@ scan_cf_list_for_invoc0(struct exec_list *cf_list,
             nir_op op = nir_scalar_alu_op(cond);
 
             if (op == nir_op_ieq) {
-               nir_scalar src[] = { nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 0)),
-                                    nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 1)) };
+               nir_scalar src[] = { nir_scalar_chase_alu_src(cond, 0),
+                                    nir_scalar_chase_alu_src(cond, 1) };
                for (unsigned i = 0; i < 2; i++) {
                   if (nir_scalar_is_const(src[i]) && nir_scalar_is_intrinsic(src[!i]) &&
                       nir_scalar_as_uint(src[i]) == 0 &&
@@ -258,8 +258,8 @@ scan_cf_list_for_invoc0(struct exec_list *cf_list,
                   }
                }
             } else if (op == nir_op_ilt || op == nir_op_ult) {
-               nir_scalar src0 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 0));
-               nir_scalar src1 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 1));
+               nir_scalar src0 = nir_scalar_chase_alu_src(cond, 0);
+               nir_scalar src1 = nir_scalar_chase_alu_src(cond, 1);
                if (nir_scalar_is_const(src1) && nir_scalar_is_intrinsic(src0) &&
                    nir_scalar_as_uint(src1) == 1 &&
                    nir_scalar_intrinsic_op(src0) == nir_intrinsic_load_invocation_id) {
@@ -411,10 +411,10 @@ nir_gather_tcs_info(const nir_shader *nir, nir_tcs_info *info,
    unsigned tess_level_writes_le_two = 0;
    unsigned tess_level_writes_gt_two = 0;
 
-   struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
-
    /* Gather barriers and which values are written to tess level outputs. */
    nir_foreach_function_impl(impl, nir) {
+      nir_fp_analysis_state range_ht = nir_create_fp_analysis_state(impl);
+
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
@@ -458,49 +458,26 @@ nir_gather_tcs_info(const nir_shader *nir, nir_tcs_info *info,
                   continue;
                }
 
-               /* nir_analyze_range only accepts an ALU src, so we have to
-                * create a dummy ALU instruction. It's not inserted into
-                * the shader.
-                */
-               nir_alu_instr *dummy_alu =
-                  nir_alu_instr_create((nir_shader*)nir, nir_op_mov);
-               dummy_alu->def.num_components = 1;
-               dummy_alu->def.bit_size = scalar.def->bit_size;
-               dummy_alu->src[0].src.ssa = scalar.def;
-               dummy_alu->src[0].swizzle[0] = scalar.comp;
+               fp_class_mask fp_class =
+                  nir_analyze_fp_class(&range_ht, scalar.def);
 
-               const struct ssa_result_range r =
-                  nir_analyze_range(range_ht, dummy_alu, 0);
-
-               switch (r.range) {
-               case unknown:
-               case ge_zero:
-               case ne_zero:
-               default:
+               if (fp_class & (FP_CLASS_ANY_NEG | FP_CLASS_ANY_ZERO | FP_CLASS_NAN))
                   tess_level_writes_le_zero |= BITFIELD_BIT(shift);
+
+               if (fp_class & (FP_CLASS_GT_ZERO_LT_POS_ONE | FP_CLASS_POS_ONE))
                   tess_level_writes_le_one |= BITFIELD_BIT(shift);
+
+               if (fp_class & (FP_CLASS_GT_POS_ONE | FP_CLASS_POS_INF)) {
                   tess_level_writes_le_two |= BITFIELD_BIT(shift);
                   tess_level_writes_gt_two |= BITFIELD_BIT(shift);
-                  break;
-               case lt_zero:
-               case le_zero:
-               case eq_zero:
-                  tess_level_writes_le_zero |= BITFIELD_BIT(shift);
-                  break;
-               case gt_zero:
-                  tess_level_writes_le_one |= BITFIELD_BIT(shift);
-                  tess_level_writes_le_two |= BITFIELD_BIT(shift);
-                  tess_level_writes_gt_two |= BITFIELD_BIT(shift);
-                  break;
                }
-
-               nir_instr_free(&dummy_alu->instr);
             }
          }
       }
+
+      nir_free_fp_analysis_state(&range_ht);
    }
 
-   ralloc_free(range_ht);
 
    /* Determine which outer tess level components can discard patches.
     * If the primitive type is unspecified, we have to assume the worst case.

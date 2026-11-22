@@ -374,6 +374,10 @@ typedef enum
    VARYING_SLOT_TASK_COUNT = VARYING_SLOT_BOUNDING_BOX0, /* Only appears in TASK. */
    VARYING_SLOT_CULL_PRIMITIVE = VARYING_SLOT_BOUNDING_BOX0, /* Only appears in MESH. */
 
+   VARYING_SLOT_GS_HEADER_IR3 = VARYING_SLOT_BOUNDING_BOX0, /* VS/TES output and GS input */
+   VARYING_SLOT_GS_VERTEX_FLAGS_IR3 = VARYING_SLOT_BOUNDING_BOX1, /* GS output */
+   VARYING_SLOT_PARAM_GEN_AMD = VARYING_SLOT_BOUNDING_BOX0, /* Only appears as FS input. */
+
    VARYING_SLOT_VAR0 = 32, /* First generic varying slot */
    /* the remaining are simply for the benefit of gl_varying_slot_name()
     * and not to be construed as an upper bound:
@@ -801,8 +805,10 @@ typedef enum
    /*@{*/
    SYSTEM_VALUE_FRAG_COORD,
    SYSTEM_VALUE_PIXEL_COORD,
+   SYSTEM_VALUE_FRAG_COORD_XY,
    SYSTEM_VALUE_FRAG_COORD_Z,
    SYSTEM_VALUE_FRAG_COORD_W,
+   SYSTEM_VALUE_FRAG_COORD_W_RCP,
    SYSTEM_VALUE_POINT_COORD,
    SYSTEM_VALUE_LINE_COORD, /**< Coord along axis perpendicular to line */
    SYSTEM_VALUE_FRONT_FACE,
@@ -965,6 +971,9 @@ typedef enum
    SYSTEM_VALUE_CORE_MAX_ID_ARM,
    SYSTEM_VALUE_WARP_ID_ARM,
    SYSTEM_VALUE_WARP_MAX_ID_ARM,
+
+   SYSTEM_VALUE_COLOR0_AMD,
+   SYSTEM_VALUE_COLOR1_AMD,
 
    SYSTEM_VALUE_MAX             /**< Number of values */
 } gl_system_value;
@@ -1251,29 +1260,36 @@ enum gl_access_qualifier
     * fusion feature.
     */
    ACCESS_FUSED_EU_DISABLE_INTEL = (1 << 19),
-};
 
-/**
- * \brief Blend support qualifiers
- */
-enum gl_advanced_blend_mode
-{
-   BLEND_NONE = 0,
-   BLEND_MULTIPLY,
-   BLEND_SCREEN,
-   BLEND_OVERLAY,
-   BLEND_DARKEN,
-   BLEND_LIGHTEN,
-   BLEND_COLORDODGE,
-   BLEND_COLORBURN,
-   BLEND_HARDLIGHT,
-   BLEND_SOFTLIGHT,
-   BLEND_DIFFERENCE,
-   BLEND_EXCLUSION,
-   BLEND_HSL_HUE,
-   BLEND_HSL_SATURATION,
-   BLEND_HSL_COLOR,
-   BLEND_HSL_LUMINOSITY,
+   /**
+    * Whether the last returned component describes whether the address
+    * is resident, which is an opaque value that can be interpreted by
+    * nir_intrinsic_is_sparse_texels_resident.
+    *
+    * This only applies to nir_intrinsic_load_buffer_amd for now.
+    *
+    * TODO: Consider using this everywhere instead of having separate
+    *       intrinsics for sparse.
+    */
+   ACCESS_SPARSE = (1 << 20),
+
+   /**
+    * Internal streaming access (v9+)
+    *
+    * Whether the memory is accessed in a streaming fashion inside of the GPU.
+    * Since the data is likely to be read inside of the GPU, the hardware will
+    * try to store it in level 2 cache.
+    */
+   ACCESS_ISTREAM_PAN = (1 << 21),
+
+   /**
+    * External streaming access (v9+)
+    *
+    * Whether the memory is accessed in a streaming fashion outside of the GPU.
+    * This hints the hardware to not cache the data, it could be useful for
+    * one-time accesses or if the data is larger than what the memory can store.
+    */
+   ACCESS_ESTREAM_PAN = (1 << 22),
 };
 
 enum gl_tess_spacing
@@ -1649,9 +1665,16 @@ enum glsl_sampler_dim {
    GLSL_SAMPLER_DIM_RECT,
    GLSL_SAMPLER_DIM_BUF,
    GLSL_SAMPLER_DIM_EXTERNAL,
+   GLSL_SAMPLER_DIM_EXTERNAL_2D_Y2Y,
    GLSL_SAMPLER_DIM_MS,
    GLSL_SAMPLER_DIM_SUBPASS, /* for vulkan input attachments */
    GLSL_SAMPLER_DIM_SUBPASS_MS, /* for multisampled vulkan input attachments */
+};
+
+enum yuv_csc_standard {
+   YUV_CSC_STANDARD_601,
+   YUV_CSC_STANDARD_601_FULL_RANGE,
+   YUV_CSC_STANDARD_709,
 };
 
 #ifdef __cplusplus

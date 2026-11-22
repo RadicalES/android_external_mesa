@@ -69,6 +69,7 @@ struct util_queue_fence;
 struct pipe_video_buffer;
 struct nir_shader;
 struct nir_shader_compiler_options;
+struct pipe_clientptr_range;
 
 typedef struct pipe_vertex_state *
    (*pipe_create_vertex_state_func)(struct pipe_screen *screen,
@@ -123,6 +124,11 @@ struct pipe_screen {
    const char *(*get_vendor)(struct pipe_screen *);
 
    /**
+    * Returns the ML device for this screen, or NULL if ML is not supported.
+    */
+   struct pipe_ml_device *(*get_ml_device)(struct pipe_screen *);
+
+   /**
     * Returns the device vendor.
     *
     * The returned value should return the actual device vendor/manufacturer,
@@ -163,6 +169,14 @@ struct pipe_screen {
     * wait for rendering to complete (which cannot be achieved with queries).
     */
    uint64_t (*get_timestamp)(struct pipe_screen *);
+
+   /**
+    * If the driver supports PIPE_QUERY_TIMESTAMP_RAW, this function
+    * must be implemented to convert the drivers raw timestamp to ns.
+    * If the driver does not support PIPE_QUERY_TIMESTAMP_RAW, it should
+    * not implement this function.
+    */
+   uint64_t (*convert_timestamp)(struct pipe_screen *, uint64_t raw_timestamp);
 
    /**
     * Return an equivalent canonical format which has the same component sizes
@@ -422,6 +436,25 @@ struct pipe_screen {
    void* (*fence_get_win32_handle)(struct pipe_screen *screen,
                                    struct pipe_fence_handle *fence,
                                    uint64_t *fence_value);
+
+   /**
+    * Retrieves the Win32 event handle from the fence.
+    */
+   void* (*fence_get_win32_event)(struct pipe_screen *screen,
+                                  struct pipe_fence_handle *fence);
+
+   /**
+    * Wait for multiple fences to be signaled.
+    *
+    * \param fences     array of fence handles to wait on
+    * \param num_fences number of fences in the array
+    * \param wait_all   if true, wait for all fences; if false, wait for any
+    * \return index of the first signaled fence, or -1 on failure
+    */
+   int (*fence_wait_multiple)(struct pipe_screen *screen,
+                              struct pipe_fence_handle **fences,
+                              unsigned num_fences,
+                              bool wait_all);
 
    /**
     * Create a fence from an Win32 handle.
@@ -829,6 +862,33 @@ struct pipe_screen {
     */
    uint64_t (*resource_get_address)(struct pipe_screen *screen,
                                     struct pipe_resource *resource);
+
+   /**
+    * Returns a pipe_clientptr_heap object pipe_resources can be created within.
+    */
+   struct pipe_clientptr_heap *(*clientptr_heap_create)(struct pipe_screen *screen);
+
+   /**
+    * Releases a pipe_clientptr_heap object when refcount is 0
+    */
+   void (*clientptr_heap_destroy)(struct pipe_screen *screen,
+                                  struct pipe_clientptr_heap *clientptr_heap);
+
+   /**
+    * Reclaims a client pointer range consumed by transfer_map_clientptr_range
+    *
+    * \param clientptr_heap The heap in which unused ranges are searched.
+    * \param reclaim_all    Whether ranges to which cached backings are mapped
+    *                       should also be reclaimed.
+    * \param range          If a range could be reclaimed, it's address and size
+    *                       are copied here.
+    *
+    * \return whether a range could be reclaimed and put into \param range.
+    */
+   bool (*clientptr_range_reclaim)(struct pipe_screen *screen,
+                                   struct pipe_clientptr_heap *clientptr_heap,
+                                   bool reclaim_all,
+                                   struct pipe_clientptr_range *range);
 
    /**
     * pipe_screen is inherited by driver's screen but a simple cast to convert

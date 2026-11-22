@@ -1,7 +1,7 @@
 /*
 ************************************************************************************************************************
 *
-*  Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.
+*  Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
 *  SPDX-License-Identifier: MIT
 *
 ***********************************************************************************************************************/
@@ -78,7 +78,7 @@ typedef int            INT;
 
 #ifndef ADDR_FASTCALL
     #if defined(__GNUC__)
-        #if defined(__i386__) || defined(__amd64__) || defined(__x86_64__)
+        #if defined(__i386__)
             #define ADDR_FASTCALL __attribute__((regparm(0)))
         #else
             #define ADDR_FASTCALL

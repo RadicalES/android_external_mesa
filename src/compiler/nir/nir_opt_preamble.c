@@ -140,7 +140,6 @@ can_move_intrinsic(nir_intrinsic_instr *instr, opt_preamble_ctx *ctx)
 {
    switch (instr->intrinsic) {
    /* Intrinsics which can always be moved */
-   case nir_intrinsic_load_push_constant:
    case nir_intrinsic_load_work_dim:
    case nir_intrinsic_load_num_workgroups:
    case nir_intrinsic_load_ray_launch_size:
@@ -171,15 +170,13 @@ can_move_intrinsic(nir_intrinsic_instr *instr, opt_preamble_ctx *ctx)
    case nir_intrinsic_load_prim_gen_query_enabled_amd:
    case nir_intrinsic_load_prim_xfb_query_enabled_amd:
    case nir_intrinsic_load_clamp_vertex_color_amd:
-   case nir_intrinsic_load_cull_front_face_enabled_amd:
-   case nir_intrinsic_load_cull_back_face_enabled_amd:
-   case nir_intrinsic_load_cull_ccw_amd:
+   case nir_intrinsic_load_cull_face_negative_determinant_enabled_amd:
+   case nir_intrinsic_load_cull_face_positive_determinant_enabled_amd:
    case nir_intrinsic_load_cull_small_triangles_enabled_amd:
    case nir_intrinsic_load_cull_small_lines_enabled_amd:
    case nir_intrinsic_load_cull_any_enabled_amd:
    case nir_intrinsic_load_cull_small_triangle_precision_amd:
    case nir_intrinsic_load_vbo_base_agx:
-   case nir_intrinsic_load_push_data_intel:
       return true;
 
    /* Intrinsics which can be moved depending on hardware */
@@ -199,6 +196,8 @@ can_move_intrinsic(nir_intrinsic_instr *instr, opt_preamble_ctx *ctx)
    /* Intrinsics which can be moved if the sources can */
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_ubo_vec4:
+   case nir_intrinsic_load_push_constant:
+   case nir_intrinsic_load_push_data_intel:
    case nir_intrinsic_get_ubo_size:
    case nir_intrinsic_get_ssbo_size:
    case nir_intrinsic_ballot_bitfield_extract:
@@ -216,12 +215,15 @@ can_move_intrinsic(nir_intrinsic_instr *instr, opt_preamble_ctx *ctx)
    case nir_intrinsic_image_levels:
    case nir_intrinsic_image_deref_levels:
    case nir_intrinsic_bindless_image_levels:
+   case nir_intrinsic_image_heap_levels:
    case nir_intrinsic_image_samples:
    case nir_intrinsic_image_deref_samples:
    case nir_intrinsic_bindless_image_samples:
+   case nir_intrinsic_image_heap_samples:
    case nir_intrinsic_image_size:
    case nir_intrinsic_image_deref_size:
    case nir_intrinsic_bindless_image_size:
+   case nir_intrinsic_image_heap_size:
    case nir_intrinsic_vulkan_resource_index:
    case nir_intrinsic_vulkan_resource_reindex:
    case nir_intrinsic_load_vulkan_descriptor:
@@ -241,11 +243,12 @@ can_move_intrinsic(nir_intrinsic_instr *instr, opt_preamble_ctx *ctx)
    case nir_intrinsic_image_load:
    case nir_intrinsic_image_samples_identical:
    case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_image_heap_load:
    case nir_intrinsic_load_global_bounded:
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_load_ssbo_intel:
    case nir_intrinsic_load_ssbo_ir3:
-   case nir_intrinsic_load_global_ir3:
+   case nir_intrinsic_load_global_offset:
    case nir_intrinsic_load_agx:
       return (nir_intrinsic_access(instr) & ACCESS_CAN_REORDER) &&
              can_move_srcs(&instr->instr, ctx);
@@ -790,7 +793,7 @@ nir_opt_preamble(nir_shader *shader, const nir_opt_preamble_options *options,
             if (nir_src_is_if(use)) {
                is_can_move_user = false;
             } else {
-               nir_def *use_def = nir_instr_def(nir_src_parent_instr(use));
+               nir_def *use_def = nir_instr_def(nir_src_use_instr(use));
                is_can_move_user = use_def != NULL &&
                                   ctx.states[use_def->index].can_move &&
                                   !ctx.states[use_def->index].must_stay;

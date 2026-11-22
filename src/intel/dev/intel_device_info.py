@@ -99,6 +99,13 @@ Define("INTEL_DEVICE_MAX_SLICES", 8)
 Define("INTEL_DEVICE_MAX_SUBSLICES", 8, "Maximum on gfx11")
 Define("INTEL_DEVICE_MAX_EUS_PER_SUBSLICE", 16, "Maximum on gfx11")
 Define("INTEL_DEVICE_MAX_PIXEL_PIPES", 16, "Maximum on DG2")
+Define("INTEL_DEVICE_MAX_SUBSLICE_MASKS",
+       "INTEL_DEVICE_MAX_SLICES * DIV_ROUND_UP(INTEL_DEVICE_MAX_SUBSLICES, 8)",
+       "Maximum number of sublice masks")
+Define("INTEL_DEVICE_MAX_EU_MASKS",
+       "INTEL_DEVICE_MAX_SLICES * INTEL_DEVICE_MAX_SUBSLICES * "
+       "DIV_ROUND_UP(INTEL_DEVICE_MAX_EUS_PER_SUBSLICE, 8)",
+       "Maximum number of eu masks")
 
 Enum("intel_platform",
      [EnumValue("INTEL_PLATFORM_GFX3", value=1),
@@ -137,6 +144,7 @@ Enum("intel_platform",
       "INTEL_PLATFORM_PTL",
       "INTEL_PLATFORM_WCL",
       "INTEL_PLATFORM_NVL_U",
+      "INTEL_PLATFORM_NVL_P",
       ])
 
 Struct("intel_memory_class_instance",
@@ -145,13 +153,10 @@ Struct("intel_memory_class_instance",
          Member("int", "instance")])
 
 Enum("intel_device_info_mmap_mode",
-      [EnumValue("INTEL_DEVICE_INFO_MMAP_MODE_UC", value=0),
+      [EnumValue("INTEL_DEVICE_INFO_MMAP_MODE_INVALID",
+                 comment=dedent("""No CPU access allowed.""")),
        EnumValue("INTEL_DEVICE_INFO_MMAP_MODE_WC"),
-       EnumValue("INTEL_DEVICE_INFO_MMAP_MODE_WB"),
-       EnumValue("INTEL_DEVICE_INFO_MMAP_MODE_XD",
-                 comment=dedent("""\
-                 Xe2+ only. Only supported in GPU side and used for displayable
-                 buffers."""))
+       EnumValue("INTEL_DEVICE_INFO_MMAP_MODE_WB")
        ])
 
 Struct("intel_device_info_pat_entry",
@@ -161,19 +166,6 @@ Struct("intel_device_info_pat_entry",
                This tells KMD what caching mode the CPU mapping should use.
                It has nothing to do with any PAT cache modes."""))])
 
-Enum("intel_cmat_scope",
-     [EnumValue("INTEL_CMAT_SCOPE_NONE", value=0),
-     "INTEL_CMAT_SCOPE_SUBGROUP"])
-
-Enum("intel_cooperative_matrix_component_type",
-     ["INTEL_CMAT_FLOAT16",
-      "INTEL_CMAT_FLOAT32",
-      "INTEL_CMAT_SINT32",
-      "INTEL_CMAT_SINT8",
-      "INTEL_CMAT_UINT32",
-      "INTEL_CMAT_UINT8",
-      "INTEL_CMAT_BFLOAT16"])
-
 Enum("intel_engine_class",
      ["INTEL_ENGINE_CLASS_RENDER",
       "INTEL_ENGINE_CLASS_COPY",
@@ -181,22 +173,6 @@ Enum("intel_engine_class",
       "INTEL_ENGINE_CLASS_VIDEO_ENHANCE",
       "INTEL_ENGINE_CLASS_COMPUTE",
       "INTEL_ENGINE_CLASS_INVALID"])
-
-Struct("intel_cooperative_matrix_configuration",
-   [Member("intel_cmat_scope", "scope",
-           comment=dedent("""\
-           Matrix A is MxK.
-           Matrix B is KxN.
-           Matrix C and Matrix Result are MxN.
-
-           Result = A * B + C;""")),
-    Member("uint8_t", "m"),
-    Member("uint8_t", "n"),
-    Member("uint8_t", "k"),
-    Member("intel_cooperative_matrix_component_type", "a"),
-    Member("intel_cooperative_matrix_component_type", "b"),
-    Member("intel_cooperative_matrix_component_type", "c"),
-    Member("intel_cooperative_matrix_component_type", "result")])
 
 Enum("intel_kmd_type",
      ["INTEL_KMD_TYPE_INVALID",
@@ -222,8 +198,8 @@ Struct("intel_device_info_mem_desc",
 
 Struct("intel_device_info_urb_desc",
        [Member("int", "size"),
-        Member("int", "min_entries", array=4),
-        Member("int", "max_entries", array=4)])
+        Member("int", "min_entries", array=8),
+        Member("int", "max_entries", array=8)])
 
 Struct("intel_device_info_pat_desc",
        [Member("intel_device_info_pat_entry", "cached_coherent",
@@ -311,6 +287,9 @@ Struct("intel_device_info",
         Member("bool", "has_indirect_unroll"),
         Member("bool", "supports_low_latency_hint"),
         Member("bool", "xe2_has_no_compression_hint"),
+        Member("bool", "xe_has_state_cache_perf_fix"),
+        Member("bool", "has_madvise_purgeable"),
+        Member("bool", "has_userptr_uapi"),
 
         Member("bool", "has_coarse_pixel_primitive_and_cb", compiler_field=True,
                comment=dedent("""\
@@ -381,7 +360,7 @@ Struct("intel_device_info",
                comment="A bit mask of the slices available."),
 
         Member("uint8_t", "subslice_masks",
-               array="INTEL_DEVICE_MAX_SLICES * DIV_ROUND_UP(INTEL_DEVICE_MAX_SUBSLICES, 8)",
+               array="INTEL_DEVICE_MAX_SUBSLICE_MASKS",
                compiler_field=True,
                ray_tracing_field=True,
                comment=dedent("""\
@@ -394,8 +373,7 @@ Struct("intel_device_info",
                subslices are enabled, see subslice_masks[].""")),
 
         Member("uint8_t", "eu_masks",
-               array=("INTEL_DEVICE_MAX_SLICES * INTEL_DEVICE_MAX_SUBSLICES * "
-                      "DIV_ROUND_UP(INTEL_DEVICE_MAX_EUS_PER_SUBSLICE, 8)"),
+               array=("INTEL_DEVICE_MAX_EU_MASKS"),
                comment=dedent("""\
                An array of bit mask of EUs available, use eu_slice_stride &
                eu_subslice_stride to access this array.""")),
@@ -482,8 +460,9 @@ Struct("intel_device_info",
         Member("char", "name", array="INTEL_DEVICE_MAX_NAME_SIZE"),
         Member("bool", "no_hw"),
         Member("bool", "probe_forced", comment="Device needed INTEL_FORCE_PROBE"),
+        Member("bool", "no_jay", comment="Driver requested brw over Jay (e.g. per-app driconf)"),
         Member("intel_device_info_mem_desc", "mem"),
         Member("intel_device_info_pat_desc", "pat"),
-        Member("intel_cooperative_matrix_configuration",
-               "cooperative_matrix_configurations", array=16)]
+
+        Member("bool", "is_virtio")]
        )

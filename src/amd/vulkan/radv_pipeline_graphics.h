@@ -11,7 +11,7 @@
 #ifndef RADV_PIPELINE_GRAPHICS_H
 #define RADV_PIPELINE_GRAPHICS_H
 
-#include "sid.h"
+#include "amdgfxregs.h"
 
 #include "radv_descriptor_set.h"
 #include "radv_pipeline.h"
@@ -19,7 +19,6 @@
 #include "radv_shader.h"
 
 #include "vk_graphics_state.h"
-#include "vk_meta.h"
 
 #define VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO_RADV (VkStructureType)2000290001
 
@@ -28,10 +27,6 @@
 typedef struct VkGraphicsPipelineCreateInfoRADV {
    VkStructureType sType;
    const void *pNext;
-   VkBool32 db_depth_clear;
-   VkBool32 db_stencil_clear;
-   VkBool32 depth_compress_disable;
-   VkBool32 stencil_compress_disable;
    uint32_t custom_blend_mode;
 } VkGraphicsPipelineCreateInfoRADV;
 
@@ -40,6 +35,13 @@ struct radv_sample_locations_state {
    VkExtent2D grid_size;
    uint32_t count;
    VkSampleLocationEXT locations[MAX_SAMPLE_LOCATIONS];
+
+   /* Derived state. */
+   int8_t hw_locations[4][8][2]; /* [pixel in quad][sample][dim] */
+   bool xmax_right_exclusion;
+   bool ymax_bottom_exclusion;
+   bool allow_small_prim_ngg_culling;
+   uint8_t log2_small_prim_ngg_culling_scaling_factor;
 };
 
 struct radv_viewport_xform_state {
@@ -77,7 +79,6 @@ struct radv_vertex_input_state {
    uint8_t format_align_req_minus_1[MAX_VERTEX_ATTRIBS];
    uint8_t component_align_req_minus_1[MAX_VERTEX_ATTRIBS];
    uint8_t format_sizes[MAX_VERTEX_ATTRIBS];
-   uint32_t attrib_index_offset[MAX_VERTEX_ATTRIBS]; /* Only used with static strides. */
    uint32_t non_trivial_format[MAX_VERTEX_ATTRIBS];
 
    uint32_t vbo_misaligned_mask;
@@ -141,7 +142,6 @@ struct radv_graphics_pipeline {
 
    struct radv_multisample_state ms;
    struct radv_ia_multi_vgt_param_helpers ia_multi_vgt_param;
-   uint32_t db_render_control;
 
    /* Last pre-PS API stage */
    mesa_shader_stage last_vgt_api_stage;
@@ -152,14 +152,11 @@ struct radv_graphics_pipeline {
    /* Whether the pipeline uses out-of-order rasterization. */
    bool uses_out_of_order_rast;
 
-   /* Whether the pipeline uses VRS. */
-   bool uses_vrs;
-
    /* Whether the pipeline uses a VRS attachment. */
    bool uses_vrs_attachment;
 
-   /* Whether the pipeline uses VRS coarse shading internally. */
-   bool uses_vrs_coarse_shading;
+   /* Whether depth/stencil states must be ignored because the pipeline has no depth/stencil attachments. */
+   bool ignore_ds_state;
 
    /* For relocation of shaders with RGP. */
    struct radv_sqtt_shaders_reloc *sqtt_shaders_reloc;
@@ -174,7 +171,7 @@ struct radv_retained_shaders {
    struct {
       void *serialized_nir;
       size_t serialized_nir_size;
-      unsigned char shader_sha1[SHA1_DIGEST_LENGTH];
+      unsigned char shader_blake3[BLAKE3_KEY_LEN];
       struct radv_shader_stage_key key;
    } stages[MESA_VULKAN_SHADER_STAGES];
 };
@@ -209,8 +206,12 @@ radv_pipeline_has_stage(const struct radv_graphics_pipeline *pipeline, mesa_shad
 }
 
 static inline uint32_t
-radv_conv_prim_to_gs_out(uint32_t topology, bool is_ngg)
+radv_conv_prim_to_gs_out(enum amd_gfx_level gfx_level, uint32_t topology, bool is_ngg)
 {
+   static_assert(V_028A6C_POINTLIST == V_030998_POINTLIST && V_028A6C_LINESTRIP == V_030998_LINESTRIP &&
+                    V_028A6C_TRISTRIP == V_030998_TRISTRIP,
+                 "Some VGT_GS_OUTPRIM_TYPE values don't match");
+
    switch (topology) {
    case V_008958_DI_PT_POINTLIST:
    case V_008958_DI_PT_PATCH:
@@ -227,7 +228,7 @@ radv_conv_prim_to_gs_out(uint32_t topology, bool is_ngg)
    case V_008958_DI_PT_TRISTRIP_ADJ:
       return V_028A6C_TRISTRIP;
    case V_008958_DI_PT_RECTLIST:
-      return is_ngg ? V_028A6C_RECTLIST : V_028A6C_TRISTRIP;
+      return is_ngg ? (gfx_level >= GFX11 ? V_030998_RECT_2D : V_028A6C_RECTLIST) : V_028A6C_TRISTRIP;
    default:
       assert(0);
       return 0;
@@ -337,9 +338,9 @@ radv_vgt_outprim_is_line(unsigned vgt_outprim_type)
 }
 
 static inline bool
-radv_vgt_outprim_is_point_or_line(unsigned vgt_outprim_type)
+radv_vgt_outprim_is_triangle(unsigned vgt_outprim_type)
 {
-   return radv_vgt_outprim_is_point(vgt_outprim_type) || radv_vgt_outprim_is_line(vgt_outprim_type);
+   return vgt_outprim_type == V_028A6C_TRISTRIP;
 }
 
 static inline bool
@@ -355,19 +356,13 @@ radv_polygon_mode_is_line(unsigned polygon_mode)
 }
 
 static inline bool
-radv_polygon_mode_is_points_or_lines(unsigned polygon_mode)
-{
-   return radv_polygon_mode_is_point(polygon_mode) || radv_polygon_mode_is_line(polygon_mode);
-}
-
-static inline bool
 radv_primitive_topology_is_line_list(unsigned primitive_topology)
 {
    return primitive_topology == V_008958_DI_PT_LINELIST || primitive_topology == V_008958_DI_PT_LINELIST_ADJ;
 }
 
 static inline unsigned
-radv_get_num_vertices_per_prim(const struct radv_graphics_state_key *gfx_state)
+radv_get_num_vertices_per_prim(enum amd_gfx_level gfx_level, const struct radv_graphics_state_key *gfx_state)
 {
    if (gfx_state->ia.topology == V_008958_DI_PT_NONE) {
       /* When the topology is unknown (with graphics pipeline library), return the maximum number of
@@ -378,7 +373,7 @@ radv_get_num_vertices_per_prim(const struct radv_graphics_state_key *gfx_state)
       return 3;
    } else {
       /* Need to add 1, because: V_028A6C_POINTLIST=0, V_028A6C_LINESTRIP=1, V_028A6C_TRISTRIP=2, etc. */
-      return radv_conv_prim_to_gs_out(gfx_state->ia.topology, false) + 1;
+      return radv_conv_prim_to_gs_out(gfx_level, gfx_state->ia.topology, false) + 1;
    }
 }
 
@@ -627,8 +622,6 @@ radv_normalize_blend_factor(VkBlendOp op, VkBlendFactor *src_factor, VkBlendFact
 void radv_blend_remove_dst(VkBlendOp *func, VkBlendFactor *src_factor, VkBlendFactor *dst_factor,
                            VkBlendFactor expected_dst, VkBlendFactor replacement_src);
 
-unsigned radv_format_meta_fs_key(struct radv_device *device, VkFormat format);
-
 struct radv_ia_multi_vgt_param_helpers radv_compute_ia_multi_vgt_param(const struct radv_device *device,
                                                                        struct radv_shader *const *shaders);
 
@@ -650,32 +643,40 @@ struct radv_ps_epilog_state {
 
    uint32_t colors_written;
    bool mrt0_is_dual_src;
-   bool export_depth;
-   bool export_stencil;
-   bool export_sample_mask;
+   bool has_depth_output;
+   bool has_stencil_output;
+   bool has_sample_mask_output;
+   bool ignore_depth_output;
+   bool ignore_stencil_output;
+   bool lower_1bit_sample_mask_to_discard;
    bool alpha_to_coverage_via_mrtz;
    bool alpha_to_one;
    uint8_t need_src_alpha;
 };
 
-struct radv_ps_epilog_key radv_generate_ps_epilog_key(const struct radv_device *device,
+struct radv_ps_epilog_key radv_generate_ps_epilog_key(const struct radv_compiler_info *compiler_info,
                                                       const struct radv_ps_epilog_state *state);
 
-void radv_graphics_shaders_compile(struct radv_device *device, struct vk_pipeline_cache *cache,
+void radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, struct vk_pipeline_cache *cache,
                                    struct radv_shader_stage *stages, const struct radv_graphics_state_key *gfx_state,
-                                   bool keep_executable_info, bool keep_statistic_info, bool is_internal,
-                                   bool skip_shaders_cache, struct radv_retained_shaders *retained_shaders,
-                                   bool noop_fs, struct radv_shader **shaders, struct radv_shader_binary **binaries,
-                                   struct radv_shader **gs_copy_shader, struct radv_shader_binary **gs_copy_binary);
+                                   bool is_internal, struct radv_retained_shaders *retained_shaders, bool noop_fs,
+                                   struct radv_shader_debug_info *debug, struct radv_shader_binary **binaries,
+                                   struct radv_shader_debug_info *gs_copy_debug,
+                                   struct radv_shader_binary **gs_copy_binary);
+
+void radv_graphics_shaders_create(struct radv_device *device, struct vk_pipeline_cache *cache, bool skip_shaders_cache,
+                                  struct radv_shader **shaders, struct radv_shader_binary **binaries,
+                                  struct radv_shader_debug_info *debug, struct radv_shader **gs_copy_shader,
+                                  struct radv_shader_binary *gs_copy_binary,
+                                  struct radv_shader_debug_info *gs_copy_debug);
 
 struct radv_vgt_shader_key {
    uint8_t tess : 1;
    uint8_t gs : 1;
-   uint8_t mesh_scratch_ring : 1;
    uint8_t mesh : 1;
    uint8_t ngg_passthrough : 1;
    uint8_t ngg : 1; /* gfx10+ */
-   uint8_t ngg_streamout : 1;
+   uint8_t ngg_wave_id_en : 1;
    uint8_t hs_wave32 : 1;
    uint8_t gs_wave32 : 1;
    uint8_t vs_wave32 : 1;

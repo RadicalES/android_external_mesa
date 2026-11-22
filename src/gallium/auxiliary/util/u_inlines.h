@@ -135,8 +135,13 @@ pipe_reference(struct pipe_reference *dst, struct pipe_reference *src)
                                    debug_describe_reference);
 }
 
+/* TODO: delete surface refcounting functions */
+typedef void (*pipe_surface_destroy_func)(struct pipe_context*, struct pipe_surface*);
+
 static inline void
-pipe_surface_reference(struct pipe_surface **dst, struct pipe_surface *src)
+pipe_surface_reference(struct pipe_surface **dst, struct pipe_surface *src,
+                       struct pipe_context *pipe,
+                       pipe_surface_destroy_func surface_destroy)
 {
    struct pipe_surface *old_dst = *dst;
 
@@ -144,7 +149,7 @@ pipe_surface_reference(struct pipe_surface **dst, struct pipe_surface *src)
                                 src ? &src->reference : NULL,
                                 (debug_reference_descriptor)
                                 debug_describe_surface))
-      old_dst->context->surface_destroy(old_dst->context, old_dst);
+      surface_destroy(pipe, old_dst);
    *dst = src;
 }
 
@@ -155,7 +160,8 @@ pipe_surface_reference(struct pipe_surface **dst, struct pipe_surface *src)
  * that's shared by multiple contexts.
  */
 static inline void
-pipe_surface_unref(struct pipe_context *pipe, struct pipe_surface **ptr)
+pipe_surface_unref(struct pipe_context *pipe, struct pipe_surface **ptr,
+                   pipe_surface_destroy_func surface_destroy)
 {
    struct pipe_surface *old = *ptr;
 
@@ -163,7 +169,7 @@ pipe_surface_unref(struct pipe_context *pipe, struct pipe_surface **ptr)
                                 NULL,
                                 (debug_reference_descriptor)
                                 debug_describe_surface))
-      pipe->surface_destroy(pipe, old);
+      surface_destroy(pipe, old);
    *ptr = NULL;
 }
 
@@ -341,7 +347,6 @@ pipe_surface_reset(struct pipe_context *ctx, struct pipe_surface* ps,
    ps->format = pt->format;
    ps->level = level;
    ps->first_layer = ps->last_layer = layer;
-   ps->context = ctx;
 }
 
 static inline void
@@ -475,6 +480,28 @@ pipe_buffer_create_const0(struct pipe_screen *screen,
    return screen->resource_create(screen, &buffer);
 }
 
+static inline struct pipe_resource *
+pipe_buffer_create_clientptr(struct pipe_screen *screen,
+                             unsigned bind,
+                             enum pipe_resource_usage usage,
+                             unsigned size,
+                             struct pipe_clientptr_heap *clientptr_heap)
+{
+   struct pipe_resource buffer;
+   memset(&buffer, 0, sizeof buffer);
+   buffer.target = PIPE_BUFFER;
+   buffer.format = PIPE_FORMAT_R8_UNORM; /* want TYPELESS or similar */
+   buffer.bind = bind;
+   buffer.usage = usage;
+   buffer.flags = clientptr_heap ? PIPE_RESOURCE_FLAG_MAP_CLIENT_POINTER : 0;
+   buffer.width0 = size;
+   buffer.height0 = 1;
+   buffer.depth0 = 1;
+   buffer.array_size = 1;
+   buffer.clientptr_heap = clientptr_heap;
+   return screen->resource_create(screen, &buffer);
+}
+
 
 /**
  * Map a range of a resource.
@@ -503,6 +530,12 @@ pipe_buffer_map_range(struct pipe_context *pipe,
    map = pipe->buffer_map(pipe, buffer, 0, access, &box, transfer);
    if (!map) {
       return NULL;
+   }
+
+   if (access & PIPE_MAP_CLIENT_POINTER) {
+      assert(map == PIPE_TRANSFER_CLIENT_POINTER);
+   } else {
+      assert(map != PIPE_TRANSFER_CLIENT_POINTER);
    }
 
    return map;
@@ -992,6 +1025,20 @@ pipe_create_multimedia_context(struct pipe_screen *screen, bool compute_only)
 static inline unsigned util_res_sample_count(const struct pipe_resource *res)
 {
    return res->nr_samples > 0 ? res->nr_samples : 1;
+}
+
+static inline void
+pipe_clientptr_heap_reference(struct pipe_screen *screen,
+                         struct pipe_clientptr_heap **dst,
+                         struct pipe_clientptr_heap *src)
+{
+   struct pipe_clientptr_heap *old_dst = *dst;
+
+   if (pipe_reference(old_dst ? &old_dst->reference : NULL,
+                      src ? &src->reference : NULL)) {
+      screen->clientptr_heap_destroy(screen, old_dst);
+   }
+   *dst = src;
 }
 
 #ifdef __cplusplus

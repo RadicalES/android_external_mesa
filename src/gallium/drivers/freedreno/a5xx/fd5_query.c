@@ -57,7 +57,7 @@ occlusion_resume(struct fd_acc_query *aq, struct fd_batch *batch)
 
    ASSERT_ALIGNED(struct fd5_query_sample, start, 16);
 
-   OUT_PKT4(ring, REG_A5XX_RB_SAMPLE_COUNT_ADDR_LO, 2);
+   OUT_PKT4(ring, REG_A5XX_RB_SAMPLE_COUNT_ADDR, 2);
    OUT_RELOC(ring, query_sample(aq, start));
 
    fd5_event_write(batch, ring, ZPASS_DONE, false);
@@ -85,7 +85,7 @@ occlusion_pause(struct fd_acc_query *aq, struct fd_batch *batch)
 
    ASSERT_ALIGNED(struct fd5_query_sample, stop, 16);
 
-   OUT_PKT4(ring, REG_A5XX_RB_SAMPLE_COUNT_ADDR_LO, 2);
+   OUT_PKT4(ring, REG_A5XX_RB_SAMPLE_COUNT_ADDR, 2);
    OUT_RELOC(ring, query_sample(aq, stop));
 
    fd5_event_write(batch, ring, ZPASS_DONE, false);
@@ -199,7 +199,7 @@ time_elapsed_accumulate_result(struct fd_acc_query *aq,
                                union pipe_query_result *result)
 {
    struct fd5_query_sample *sp = fd5_query_sample(s);
-   result->u64 = ticks_to_ns(sp->result);
+   result->u64 = fd_ticks_to_ns(sp->result);
 }
 
 static void
@@ -208,7 +208,7 @@ timestamp_accumulate_result(struct fd_acc_query *aq,
                             union pipe_query_result *result)
 {
    struct fd5_query_sample *sp = fd5_query_sample(s);
-   result->u64 = ticks_to_ns(sp->result);
+   result->u64 = fd_ticks_to_ns(sp->result);
 }
 
 static const struct fd_acc_sample_provider time_elapsed = {
@@ -290,7 +290,7 @@ perfcntr_resume(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
       const struct fd_perfcntr_counter *counter = &g->counters[counter_idx];
 
       OUT_PKT7(ring, CP_REG_TO_MEM, 3);
-      OUT_RING(ring, CP_REG_TO_MEM_0_64B |
+      OUT_RING(ring, CP_REG_TO_MEM_0_IS_64B |
                         CP_REG_TO_MEM_0_REG(counter->counter_reg_lo));
       OUT_RELOC(ring, query_sample_idx(aq, i, start));
    }
@@ -318,7 +318,7 @@ perfcntr_pause(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
       const struct fd_perfcntr_counter *counter = &g->counters[counter_idx];
 
       OUT_PKT7(ring, CP_REG_TO_MEM, 3);
-      OUT_RING(ring, CP_REG_TO_MEM_0_64B |
+      OUT_RING(ring, CP_REG_TO_MEM_0_IS_64B |
                         CP_REG_TO_MEM_0_REG(counter->counter_reg_lo));
       OUT_RELOC(ring, query_sample_idx(aq, i, stop));
    }

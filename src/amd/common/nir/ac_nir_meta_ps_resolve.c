@@ -26,7 +26,7 @@ build_tex_load_ms(nir_builder *b, unsigned num_components, unsigned bit_size,
 
 nir_shader *
 ac_create_resolve_ps(const struct ac_ps_resolve_options *options,
-                     const union ac_ps_resolve_key *key)
+                     const ac_ps_resolve_key *key)
 {
    if (options->print_key) {
       fprintf(stderr, "Internal shader: resolve_ps\n");
@@ -87,7 +87,7 @@ ac_create_resolve_ps(const struct ac_ps_resolve_options *options,
    }
 
    /* Use samples_identical if it's supported. */
-   bool uses_samples_identical = options->info->gfx_level < GFX11 && !options->no_fmask;
+   bool uses_samples_identical = options->info->compiler_info.has_fmask && !options->no_fmask;
    nir_def *sample0 = NULL;
    nir_if *if_identical = NULL;
 

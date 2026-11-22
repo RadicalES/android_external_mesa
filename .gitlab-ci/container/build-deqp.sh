@@ -23,10 +23,10 @@ set -x
 # - the GL release produces `glcts`, and
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
 
-DEQP_MAIN_COMMIT=4d3bedc74e2258c483cf968753207cff84d9e4fc
-DEQP_VK_VERSION=1.4.4.2
-DEQP_GL_VERSION=4.6.7.0
-DEQP_GLES_VERSION=3.2.13.0
+DEQP_MAIN_COMMIT=634a3fc62d82c34de68c3b1add25e6b7f5777524
+DEQP_VK_VERSION=1.4.6.2
+DEQP_GL_VERSION=4.6.8.1
+DEQP_GLES_VERSION=3.2.14.1
 
 # Patches to VulkanCTS may come from commits in their repo (listed in
 # cts_commits_to_backport) or patch files stored in our repo (in the patch
@@ -38,6 +38,8 @@ DEQP_GLES_VERSION=3.2.13.0
 main_cts_commits_to_backport=(
   # If you find yourself wanting to add something in here, consider whether
   # bumping DEQP_MAIN_COMMIT is not a better solution :)
+  # Use -frounding-math by default with GCC
+  ded32883bf36e5bdf7ac6b0512d5314adc0849d4
 )
 
 # shellcheck disable=SC2034
@@ -46,8 +48,14 @@ main_cts_patch_files=(
 
 # shellcheck disable=SC2034
 vk_cts_commits_to_backport=(
-  # Add an option to print to logcat in Android executable builds
-  fc51668efdfd0dffa30b3eddee34aa26172969fb
+  # android: Implement headless WSI fallback using AImageReader
+  6368ee8503dd9ca46eabfa2df293075d9034a214
+  # Check requirements in checkSupport, part 11 (binding_model module)
+  541ed0874565d642069c59fe3b31fc42f495a470
+  # Use -frounding-math by default with GCC
+  ded32883bf36e5bdf7ac6b0512d5314adc0849d4
+  # Check requirements in checkSupport, part 12 (conditional_rendering module)
+  b1a2490aaa2cc0429dca4f8efcce7e0d4a9e619f
 )
 
 # shellcheck disable=SC2034
@@ -56,6 +64,20 @@ vk_cts_patch_files=(
 
 # shellcheck disable=SC2034
 gl_cts_commits_to_backport=(
+  # android: Implement headless WSI fallback using AImageReader
+  6368ee8503dd9ca46eabfa2df293075d9034a214
+  # Fix a memory leak with the atomic counter tests
+  e39758bc9262f8593cf0fddf1364179c1fedf756
+  # Fix a memory leak with the direct state access texture tests
+  fe92180156795a641b684722a199bdb64c69bf2a
+  # Fix a memory leak with the sparse buffer storage tests
+  bf307df9e5c6c27499c2c799409d17554d39cafc
+  # Fix a memory leak with the texture image sample tests
+  5d392ccf4fa09d38d06ca66875a2aaac4fde2b11
+  # Update the SHA of gl.xml for GL_map_buffer_client_pointer desktop OpenGL support
+  14906370e647d1a5ad584b800052a46cf4df04ca
+  # Add valid GL_MAP_CLIENT_POINTER_BIT_MESA bit to storageFlags.
+  ae0462f96eb56c295b98372d1780c8608c4970ad
 )
 
 # shellcheck disable=SC2034
@@ -66,17 +88,33 @@ gl_cts_patch_files=(
 # shellcheck disable=SC2034
 # GLES builds also EGL
 gles_cts_commits_to_backport=(
-  # CMake: Include FindPkgConfig before using pkg_check_modules()
-  e09e0a210b041d0bf7b525620d0068eab3ffa66a
-  # Add an option to print to logcat in Android executable builds
-  fc51668efdfd0dffa30b3eddee34aa26172969fb
   # Fix EGL render tests for rgba16 and rgb16 unorm fixed point
   b5ed8718f19492781f8e9be3eb9d3346e961efa9
+  # android: Implement headless WSI fallback using AImageReader
+  6368ee8503dd9ca46eabfa2df293075d9034a214
+  # Fix a memory leak with the atomic counter tests
+  e39758bc9262f8593cf0fddf1364179c1fedf756
+  # Fix a memory leak with the direct state access texture tests
+  fe92180156795a641b684722a199bdb64c69bf2a
+  # Fix a memory leak with the sparse buffer storage tests
+  bf307df9e5c6c27499c2c799409d17554d39cafc
+  # Fix a memory leak with the texture image sample tests
+  5d392ccf4fa09d38d06ca66875a2aaac4fde2b11
+  # Fix GLES2 sized depth sampling
+  758d0f50723d3f1ce1dd8141fb2b5f8698c54bd1
+  # Fix GLES2 limited NPOT completeness tests
+  527f723b666547c34b45522ef25a116107b5c540
+  # Fix GLES2 3D filtering without full NPOT support
+  a3918c1dd4f409c28b3a85cc89e9875ff2ca864c
+  # Allow half float R/RG/RGB to be color-renderable for ES2
+  3e98747abfc47130a9f854ab1130b86d494de260
 )
 
 # shellcheck disable=SC2034
 gles_cts_patch_files=(
   build-deqp-gl_Build-Don-t-build-Vulkan-utilities-for-GL-builds.patch
+  # 7a498100 adjusted for the GLES CTS 3.2.14.1 mustpass lists
+  build-deqp-Fix-gles2-internalformat-texture-float-tests.patch
 )
 
 
@@ -107,7 +145,18 @@ git checkout FETCH_HEAD
 DEQP_COMMIT=$(git rev-parse FETCH_HEAD)
 
 if [ "$DEQP_VERSION" = "$DEQP_MAIN_COMMIT" ]; then
-  merge_base="$(curl-with-retry -s https://api.github.com/repos/KhronosGroup/VK-GL-CTS/compare/main...$DEQP_MAIN_COMMIT | jq -r .merge_base_commit.sha)"
+  for i in {5..1}; do
+    if merge_base=$(curl-with-retry -s https://api.github.com/repos/KhronosGroup/VK-GL-CTS/compare/main...$DEQP_MAIN_COMMIT | jq -e -r .merge_base_commit.sha); then
+      break
+    fi
+
+    if [ "$i" -eq 1 ]; then
+      echo "Final attempt to fetch merge base from GitHub failed. VK-GL-CTS GitHub API might be down or rate-limited."
+      exit 1
+    fi
+    sleep 10
+  done
+
   if [[ "$merge_base" != "$DEQP_MAIN_COMMIT" ]]; then
     echo "VK-GL-CTS commit $DEQP_MAIN_COMMIT is not a commit from the main branch."
     exit 1

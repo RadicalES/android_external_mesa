@@ -604,7 +604,7 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
          break;
       case TGSI_SEMANTIC_POSITION:
          assert(c->cap_position_is_sysval);
-         load = nir_load_frag_coord(b);
+         load = nir_build_frag_coord(b, 4);
          break;
       case TGSI_SEMANTIC_PCOORD:
          assert(c->cap_point_is_sysval);
@@ -876,81 +876,6 @@ ttn_alu(nir_builder *b, nir_op op, unsigned dest_bitsize, nir_def **src)
    return def;
 }
 
-/* EXP - Approximate Exponential Base 2
- *  dst.x = 2^{\lfloor src.x\rfloor}
- *  dst.y = src.x - \lfloor src.x\rfloor
- *  dst.z = 2^{src.x}
- *  dst.w = 1.0
- */
-static nir_def *
-ttn_exp(nir_builder *b, nir_def **src)
-{
-   nir_def *srcx = ttn_channel(b, src[0], X);
-
-   return nir_vec4(b, nir_fexp2(b, nir_ffloor(b, srcx)),
-                      nir_fsub(b, srcx, nir_ffloor(b, srcx)),
-                      nir_fexp2(b, srcx),
-                      nir_imm_float(b, 1.0));
-}
-
-/* LOG - Approximate Logarithm Base 2
- *  dst.x = \lfloor\log_2{|src.x|}\rfloor
- *  dst.y = \frac{|src.x|}{2^{\lfloor\log_2{|src.x|}\rfloor}}
- *  dst.z = \log_2{|src.x|}
- *  dst.w = 1.0
- */
-static nir_def *
-ttn_log(nir_builder *b, nir_def **src)
-{
-   nir_def *abs_srcx = nir_fabs(b, ttn_channel(b, src[0], X));
-   nir_def *log2 = nir_flog2(b, abs_srcx);
-
-   return nir_vec4(b, nir_ffloor(b, log2),
-                      nir_fdiv(b, abs_srcx, nir_fexp2(b, nir_ffloor(b, log2))),
-                      nir_flog2(b, abs_srcx),
-                      nir_imm_float(b, 1.0));
-}
-
-/* DST - Distance Vector
- *   dst.x = 1.0
- *   dst.y = src0.y \times src1.y
- *   dst.z = src0.z
- *   dst.w = src1.w
- */
-static nir_def *
-ttn_dst(nir_builder *b, nir_def **src)
-{
-   return nir_vec4(b, nir_imm_float(b, 1.0),
-                      nir_fmul(b, ttn_channel(b, src[0], Y),
-                                  ttn_channel(b, src[1], Y)),
-                      ttn_channel(b, src[0], Z),
-                      ttn_channel(b, src[1], W));
-}
-
-/* LIT - Light Coefficients
- *  dst.x = 1.0
- *  dst.y = max(src.x, 0.0)
- *  dst.z = (src.x > 0.0) ? max(src.y, 0.0)^{clamp(src.w, -128.0, 128.0))} : 0
- *  dst.w = 1.0
- */
-static nir_def *
-ttn_lit(nir_builder *b, nir_def **src)
-{
-   nir_def *src0_y = ttn_channel(b, src[0], Y);
-   nir_def *wclamp = nir_fmax(b, nir_fmin(b, ttn_channel(b, src[0], W),
-                                              nir_imm_float(b, 128.0)),
-                                  nir_imm_float(b, -128.0));
-   nir_def *pow = nir_fpow(b, nir_fmax(b, src0_y, nir_imm_float(b, 0.0)),
-                               wclamp);
-   nir_def *z = nir_bcsel(b, nir_flt_imm(b, ttn_channel(b, src[0], X), 0.0),
-                                 nir_imm_float(b, 0.0), pow);
-
-   return nir_vec4(b, nir_imm_float(b, 1.0),
-                      nir_fmax(b, ttn_channel(b, src[0], X),
-                                  nir_imm_float(b, 0.0)),
-                      z, nir_imm_float(b, 1.0));
-}
-
 static void
 ttn_barrier(nir_builder *b)
 {
@@ -967,8 +892,8 @@ ttn_kill(nir_builder *b)
 static void
 ttn_kill_if(nir_builder *b, nir_def **src)
 {
-   /* flt must be exact, because NaN shouldn't discard. (apps rely on this) */
-   b->fp_math_ctrl = nir_fp_exact;
+   /* Apps rely on NaN not discarding. */
+   b->fp_math_ctrl = nir_fp_preserve_nan | nir_fp_preserve_inf;
    nir_def *cmp = nir_bany(b, nir_flt_imm(b, src[0], 0.0));
    b->fp_math_ctrl = nir_fp_fast_math;
 
@@ -1195,7 +1120,6 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       samp = 2;
       break;
    case TGSI_OPCODE_TXL:
-   case TGSI_OPCODE_TEX_LZ:
       op = nir_texop_txl;
       num_srcs = 2;
       break;
@@ -1205,7 +1129,6 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       samp = 2;
       break;
    case TGSI_OPCODE_TXF:
-   case TGSI_OPCODE_TXF_LZ:
       if (tgsi_inst->Texture.Texture == TGSI_TEXTURE_2D_MSAA ||
           tgsi_inst->Texture.Texture == TGSI_TEXTURE_2D_ARRAY_MSAA) {
          op = nir_texop_txf_ms;
@@ -1322,12 +1245,8 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       src_number++;
    }
 
-   if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXL ||
-       tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TEX_LZ) {
-      if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TEX_LZ)
-         instr->src[src_number].src = nir_src_for_ssa(nir_imm_int(b, 0));
-      else
-         instr->src[src_number].src = nir_src_for_ssa(ttn_channel(b, src[0], W));
+   if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXL) {
+      instr->src[src_number].src = nir_src_for_ssa(ttn_channel(b, src[0], W));
       instr->src[src_number].src_type = nir_tex_src_lod;
       src_number++;
    }
@@ -1338,16 +1257,12 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       src_number++;
    }
 
-   if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXF ||
-       tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXF_LZ) {
+   if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXF) {
       if (op == nir_texop_txf_ms) {
          instr->src[src_number] = nir_tex_src_for_ssa(nir_tex_src_ms_index,
                                                       ttn_channel(b, src[0], W));
       } else {
-         if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXF_LZ)
-            instr->src[src_number].src = nir_src_for_ssa(nir_imm_int(b, 0));
-         else
-            instr->src[src_number].src = nir_src_for_ssa(ttn_channel(b, src[0], W));
+         instr->src[src_number].src = nir_src_for_ssa(ttn_channel(b, src[0], W));
          instr->src[src_number].src_type = nir_tex_src_lod;
       }
       src_number++;
@@ -1646,26 +1561,20 @@ static const nir_op op_trans[TGSI_OPCODE_LAST] = {
    [TGSI_OPCODE_ARL] = 0,
    [TGSI_OPCODE_MOV] = nir_op_mov,
    [TGSI_OPCODE_FBFETCH] = nir_op_mov,
-   [TGSI_OPCODE_LIT] = 0,
    [TGSI_OPCODE_RCP] = nir_op_frcp,
    [TGSI_OPCODE_RSQ] = nir_op_frsq,
-   [TGSI_OPCODE_EXP] = 0,
-   [TGSI_OPCODE_LOG] = 0,
    [TGSI_OPCODE_MUL] = nir_op_fmul,
    [TGSI_OPCODE_ADD] = nir_op_fadd,
    [TGSI_OPCODE_DP3] = 0,
    [TGSI_OPCODE_DP4] = 0,
-   [TGSI_OPCODE_DST] = 0,
    [TGSI_OPCODE_MIN] = nir_op_fmin,
    [TGSI_OPCODE_MAX] = nir_op_fmax,
    [TGSI_OPCODE_SLT] = nir_op_slt,
    [TGSI_OPCODE_SGE] = nir_op_sge,
-   [TGSI_OPCODE_MAD] = nir_op_ffma,
-   [TGSI_OPCODE_TEX_LZ] = 0,
+   [TGSI_OPCODE_MAD] = nir_op_ffma_weak,
    [TGSI_OPCODE_LRP] = 0,
    [TGSI_OPCODE_SQRT] = nir_op_fsqrt,
    [TGSI_OPCODE_FRC] = nir_op_ffract,
-   [TGSI_OPCODE_TXF_LZ] = 0,
    [TGSI_OPCODE_FLR] = nir_op_ffloor,
    [TGSI_OPCODE_ROUND] = nir_op_fround_even,
    [TGSI_OPCODE_EX2] = nir_op_fexp2,
@@ -1674,9 +1583,6 @@ static const nir_op op_trans[TGSI_OPCODE_LAST] = {
    [TGSI_OPCODE_COS] = nir_op_fcos,
    [TGSI_OPCODE_KILL] = 0,
    [TGSI_OPCODE_PK2H] = 0, /* XXX */
-   [TGSI_OPCODE_PK2US] = 0, /* XXX */
-   [TGSI_OPCODE_PK4B] = 0, /* XXX */
-   [TGSI_OPCODE_PK4UB] = 0, /* XXX */
    [TGSI_OPCODE_SEQ] = nir_op_seq,
    [TGSI_OPCODE_SGT] = 0,
    [TGSI_OPCODE_SIN] = nir_op_fsin,
@@ -1884,22 +1790,6 @@ ttn_emit_instruction(struct ttn_compile *c)
       dst = nir_f2i32(b, nir_ffloor(b, src[0]));
       break;
 
-   case TGSI_OPCODE_EXP:
-      dst = ttn_exp(b, src);
-      break;
-
-   case TGSI_OPCODE_LOG:
-      dst = ttn_log(b, src);
-      break;
-
-   case TGSI_OPCODE_DST:
-      dst = ttn_dst(b, src);
-      break;
-
-   case TGSI_OPCODE_LIT:
-      dst = ttn_lit(b, src);
-      break;
-
    case TGSI_OPCODE_DP2:
       dst = nir_fdot2(b, src[0], src[1]);
       break;
@@ -1951,7 +1841,6 @@ ttn_emit_instruction(struct ttn_compile *c)
       break;
 
    case TGSI_OPCODE_TEX:
-   case TGSI_OPCODE_TEX_LZ:
    case TGSI_OPCODE_TXP:
    case TGSI_OPCODE_TXL:
    case TGSI_OPCODE_TXB:
@@ -1960,7 +1849,6 @@ ttn_emit_instruction(struct ttn_compile *c)
    case TGSI_OPCODE_TXL2:
    case TGSI_OPCODE_TXB2:
    case TGSI_OPCODE_TXF:
-   case TGSI_OPCODE_TXF_LZ:
    case TGSI_OPCODE_TG4:
    case TGSI_OPCODE_LODQ:
       dst = ttn_tex(c, src);
@@ -1995,7 +1883,7 @@ ttn_emit_instruction(struct ttn_compile *c)
       break;
 
    case TGSI_OPCODE_BGNLOOP:
-      nir_push_loop(&c->build);
+      nir_loop_add_continue_construct(nir_push_loop(&c->build));
       break;
 
    case TGSI_OPCODE_BRK:
@@ -2537,6 +2425,7 @@ ttn_finalize_nir(struct ttn_compile *c, struct pipe_screen *screen)
 
    MESA_TRACE_FUNC();
 
+   NIR_PASS(_, nir, nir_lower_continue_constructs);
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_reg_intrinsics_to_ssa);

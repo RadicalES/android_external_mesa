@@ -28,6 +28,7 @@
 #include <xf86drm.h>
 
 #include "util/u_math.h"
+#include "util/stack_array.h"
 
 #include "ir3/ir3_shader.h"
 #include "perfcntrs/freedreno_perfcntr.h"
@@ -134,13 +135,10 @@ setup_counter(const char *name, struct perfcntr *c)
 {
    for (int i = 0; i < num_groups; i++) {
       const struct fd_perfcntr_group *group = &groups[i];
+      const struct fd_perfcntr_countable *countable =
+         fd_perfcntrs_countable(group, name);
 
-      for (int j = 0; j < group->num_countables; j++) {
-         const struct fd_perfcntr_countable *countable = &group->countables[j];
-
-         if (strcmp(name, countable->name) != 0)
-            continue;
-
+      if (countable) {
          /*
           * Allocate a counter to use to monitor the requested countable:
           */
@@ -260,6 +258,9 @@ main(int argc, char **argv)
    case 4:
       backend = a4xx_init(dev, dev_id);
       break;
+   case 5:
+      backend = a5xx_init(dev, dev_id);
+      break;
    case 6:
       backend = a6xx_init<A6XX>(dev, dev_id);
       break;
@@ -327,12 +328,15 @@ main(int argc, char **argv)
    }
 
    if (perfcntrstr) {
-      uint64_t results[num_perfcntrs];
+      STACK_ARRAY(uint64_t, results, num_perfcntrs);
+
       backend->read_perfcntrs(backend, results);
 
       for (unsigned i = 0; i < num_perfcntrs; i++) {
          printf("%s:\t%'" PRIu64 "\n", perfcntrs[i].name, results[i]);
       }
+
+      STACK_ARRAY_FINISH(results);
    }
 
    return 0;

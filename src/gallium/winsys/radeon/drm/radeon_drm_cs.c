@@ -110,7 +110,7 @@ static bool radeon_init_cs_context(struct radeon_cs_context *csc,
 {
    int i;
 
-   csc->fd = ws->fd;
+   csc->fd = ws->ioctl_fd;
 
    csc->chunks[0].chunk_id = RADEON_CHUNK_ID_IB;
    csc->chunks[0].length_dw = 0;
@@ -831,7 +831,8 @@ static struct pipe_fence_handle *radeon_drm_cs_get_next_fence(struct radeon_cmdb
 
 static void
 radeon_drm_cs_add_fence_dependency(struct radeon_cmdbuf *rcs,
-                                   struct pipe_fence_handle *fence)
+                                   struct pipe_fence_handle *fence,
+                                   uint64_t timeline_point)
 {
    /* TODO: Handle the following unlikely multi-threaded scenario:
     *

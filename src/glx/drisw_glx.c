@@ -21,7 +21,7 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#if defined(GLX_DIRECT_RENDERING) && (!defined(GLX_USE_APPLEGL) || defined(GLX_USE_APPLE))
+#if defined(GLX_DIRECT_RENDERING)
 
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
@@ -40,11 +40,13 @@
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_xcb.h>
 #include "util/u_debug.h"
+#include "util/log.h"
 #include "kopper_interface.h"
 #include "loader_dri_helper.h"
 #include "dri_util.h"
 #include "mesa/glapi/glapi/glapi.h"
 #include "dispatch.h"
+#include "x11_display.h"
 
 static int xshm_error = 0;
 static int xshm_opcode = -1;
@@ -158,6 +160,7 @@ get_drawable_geometry(struct dri_drawable * draw,
 
    drawable = pdraw->xDrawable;
 
+   uw = uh = 0;
    XGetGeometry(dpy, drawable, &root, x, y, &uw, &uh, &bw, &depth);
    *w = uw;
    *h = uh;
@@ -361,8 +364,6 @@ swrastGetImageShm(struct dri_drawable * read,
 }
 
 static const __DRIswrastLoaderExtension swrastLoaderExtension_shm = {
-   .base = {__DRI_SWRAST_LOADER, 6 },
-
    .getDrawableInfo     = swrastGetDrawableInfo,
    .putImage            = swrastPutImage,
    .getImage            = swrastGetImage,
@@ -375,8 +376,6 @@ static const __DRIswrastLoaderExtension swrastLoaderExtension_shm = {
 };
 
 static const __DRIswrastLoaderExtension swrastLoaderExtension = {
-   .base = {__DRI_SWRAST_LOADER, 3 },
-
    .getDrawableInfo     = swrastGetDrawableInfo,
    .putImage            = swrastPutImage,
    .getImage            = swrastGetImage,
@@ -409,28 +408,18 @@ kopperGetDrawableInfo(struct dri_drawable * draw,
 }
 
 static const __DRIkopperLoaderExtension kopperLoaderExtension = {
-    .base = { __DRI_KOPPER_LOADER, 1 },
-
     .SetSurfaceCreateInfo   = kopperSetSurfaceCreateInfo,
     .GetDrawableInfo        = kopperGetDrawableInfo,
 };
 
-static const __DRIextension *loader_extensions_shm[] = {
-   &swrastLoaderExtension_shm.base,
-   &kopperLoaderExtension.base,
-   NULL
+static const struct dri_loader_funcs loader_funcs_shm = {
+   .swrast = &swrastLoaderExtension_shm,
+   .kopper = &kopperLoaderExtension,
 };
 
-static const __DRIextension *loader_extensions_noshm[] = {
-   &swrastLoaderExtension.base,
-   &kopperLoaderExtension.base,
-   NULL
-};
-
-static const __DRIextension *kopper_extensions_noshm[] = {
-   &swrastLoaderExtension.base,
-   &kopperLoaderExtension.base,
-   NULL
+static const struct dri_loader_funcs loader_funcs_noshm = {
+   .swrast = &swrastLoaderExtension,
+   .kopper = &kopperLoaderExtension,
 };
 
 /**
@@ -464,6 +453,8 @@ static const struct glx_context_vtable drisw_context_vtable = {
    .unbind              = dri_unbind_context,
    .wait_gl             = drisw_wait_gl,
    .wait_x              = drisw_wait_x,
+   .copy_context        = __glXCopyContext,
+   .swap_buffers        = __glXSwapBuffers,
 };
 
 static void
@@ -559,13 +550,13 @@ driswSwapBuffers(__GLXDRIdrawable * pdraw,
    (void) remainder;
 
    if (psc->kopper)
-       return kopperSwapBuffers(pdraw->dri_drawable, flush ? __DRI2_FLUSH_CONTEXT : 0);
+       return kopperSwapBuffers(pdraw->dri_drawable, flush ? __DRI2_FLUSH_CONTEXT : 0, 0, NULL);
 
    if (flush) {
       CALL_Flush(GET_DISPATCH(), ());
    }
 
-   driSwapBuffers(pdraw->dri_drawable);
+   driSwapBuffers(pdraw->dri_drawable, 0, NULL);
 
    return 0;
 }
@@ -579,44 +570,6 @@ drisw_copy_sub_buffer(__GLXDRIdrawable * pdraw,
    }
 
    driswCopySubBuffer(pdraw->dri_drawable, x, y, width, height);
-}
-
-static int
-check_xshm(Display *dpy)
-{
-   xcb_connection_t *c = XGetXCBConnection(dpy);
-   xcb_void_cookie_t cookie;
-   xcb_generic_error_t *error;
-   int ret = True;
-   xcb_query_extension_cookie_t shm_cookie;
-   xcb_query_extension_reply_t *shm_reply;
-
-   shm_cookie = xcb_query_extension(c, 7, "MIT-SHM");
-   shm_reply = xcb_query_extension_reply(c, shm_cookie, NULL);
-
-   if (shm_reply) {
-      bool has_mit_shm = shm_reply->present;
-
-      if (has_mit_shm)
-         xshm_opcode = shm_reply->major_opcode;
-
-      free(shm_reply);
-
-      if (!has_mit_shm)
-         return False;
-   }
-
-   cookie = xcb_shm_detach_checked(c, 0);
-   if ((error = xcb_request_check(c, cookie))) {
-      /* BadRequest means we're a remote client. If we were local we'd
-       * expect BadValue since 'info' has an invalid segment name.
-       */
-      if (error->error_code == BadRequest)
-         ret = False;
-      free(error);
-   }
-
-   return ret;
 }
 
 static int
@@ -662,7 +615,7 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
 {
    __GLXDRIscreen *psp;
    struct drisw_screen *psc;
-   const __DRIextension **loader_extensions_local;
+   const struct dri_loader_funcs *loader_funcs;
    bool kopper_disable = debug_get_bool_option("LIBGL_KOPPER_DISABLE", false);
 
    /* this is only relevant if zink bits are set */
@@ -676,14 +629,16 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
    psc->base.driverName = strdup(driver);
 
    if (glx_driver)
-      loader_extensions_local = kopper_extensions_noshm;
-   else if (!check_xshm(priv->dpy))
-      loader_extensions_local = loader_extensions_noshm;
+      loader_funcs = &loader_funcs_noshm;
+#ifdef HAVE_SYS_SHM_H
+   else if (!x11_xcb_display_supports_xshm(XGetXCBConnection(priv->dpy), &xshm_opcode))
+      loader_funcs = &loader_funcs_noshm;
+#endif
    else
-      loader_extensions_local = loader_extensions_shm;
+      loader_funcs = &loader_funcs_shm;
    priv->driver = glx_driver ? GLX_DRIVER_ZINK_YES : GLX_DRIVER_SW;
 
-   if (!dri_screen_init(&psc->base, priv, screen, -1, loader_extensions_local, driver_name_is_inferred)) {
+   if (!dri_screen_init(&psc->base, priv, screen, -1, loader_funcs, driver_name_is_inferred)) {
       if (!glx_driver || !driver_name_is_inferred)
          ErrorMessageF("glx: failed to create drisw screen\n");
       goto handle_error;
@@ -699,6 +654,15 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
       psp->copySubBuffer = drisw_copy_sub_buffer;
 
    if (psc->kopper) {
+      /* The NVIDIA X server claims a window for its own GLX as soon as a
+       * GLX window is created for it, after which a Vulkan swapchain can no
+       * longer be created on that window. Its pbuffer XIDs are also not X
+       * drawables. kopper needs neither server object, so keep both
+       * client-side there.
+       */
+      const char *vendor = __glXQueryServerString(priv->dpy, screen, GLX_VENDOR);
+      psc->base.client_side_glx_window = vendor && !strncmp(vendor, "NVIDIA", 6);
+      free((char *)vendor);
       psp->setSwapInterval = driswKopperSetSwapInterval;
       psp->getSwapInterval = kopperGetSwapInterval;
       psp->maxSwapInterval = 1;

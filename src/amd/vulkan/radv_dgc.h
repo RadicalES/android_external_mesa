@@ -43,10 +43,13 @@ struct radv_indirect_execution_set {
    bool uses_grid_base_sgpr;
    bool uses_upload_sgpr;
    bool uses_indirect_descriptors_sgpr;
+   bool uses_cs_state_sgpr;
    uint16_t push_constant_size;
 
    uint32_t compute_scratch_size_per_wave;
    uint32_t compute_scratch_waves;
+
+   bool descriptor_heap;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(radv_indirect_execution_set, base, VkIndirectExecutionSetEXT,

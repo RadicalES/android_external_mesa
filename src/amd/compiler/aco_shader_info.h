@@ -25,6 +25,8 @@ extern "C" {
 #define ACO_MAX_VERTEX_ATTRIBS 32
 #define ACO_MAX_VBS            32
 
+#define ACO_SPI_SHADER_Z_FORMAT_UNKNOWN 0xff
+
 struct aco_vs_prolog_info {
    struct ac_arg inputs;
 
@@ -74,6 +76,8 @@ struct aco_ps_epilog_info {
    bool kill_depth;
    bool kill_stencil;
    bool kill_samplemask;
+   bool lower_1bit_sample_mask_to_discard;
+   uint8_t spi_shader_z_format;
 
    struct ac_arg alpha_reference;
    struct ac_arg depth;
@@ -91,15 +95,15 @@ struct aco_ps_prolog_info {
    bool force_linear_sample_interp;
    bool force_persp_center_interp;
    bool force_linear_center_interp;
+   bool uses_persp_centroid;
+   bool uses_linear_centroid;
 
    unsigned samplemask_log_ps_iter;
-   bool get_frag_coord_from_pixel_coord;
-   bool pixel_center_integer;
    bool force_samplemask_to_helper_invocation;
    unsigned num_interp_inputs;
    unsigned colors_read;
-   int color_interp_vgpr_index[2];
-   int color_attr_index[2];
+   uint8_t color_attr_index[2];
+   enum ac_color_interp color_interp[2];
    bool color_two_side;
    bool needs_wqm;
 
@@ -114,12 +118,14 @@ struct aco_shader_info {
    unsigned workgroup_size;
    unsigned lds_size;
    bool merged_shader_compiled_separately; /* GFX9+ */
+   bool descriptor_heap;
    struct ac_arg next_stage_pc;
    struct ac_arg epilog_pc; /* Vulkan only */
    struct {
       bool tcs_in_out_eq;
       bool any_tcs_inputs_via_lds;
       bool has_prolog;
+      bool preserve_s2;
    } vs;
    struct {
       uint32_t num_inputs;
@@ -141,14 +147,12 @@ enum aco_compiler_debug_level {
 };
 
 struct aco_compiler_options {
-   const struct ac_cu_info* cu_info;
+   const struct ac_compiler_info* compiler_info;
    bool dump_ir;
    bool dump_preoptir;
    bool record_asm;
    bool record_ir;
    bool record_stats;
-   bool has_ls_vgpr_init_bug;
-   bool load_grid_size_from_user_sgpr;
    bool optimisations_disabled;
    uint8_t enable_mrt_output_nan_fixup;
    bool wgp_mode;
@@ -156,10 +160,6 @@ struct aco_compiler_options {
    enum radeon_family family;
    enum amd_gfx_level gfx_level;
    uint32_t address32_hi;
-   struct {
-      void (*func)(void* private_data, enum aco_compiler_debug_level level, const char* message);
-      void* private_data;
-   } debug;
 };
 
 enum aco_statistic {
@@ -193,7 +193,7 @@ struct aco_symbol {
    unsigned offset;
 };
 
-#define MAX_SGPRS 108
+#define MAX_SGPRS       108
 #define MAX_VGPRS       256
 #define MAX_LDS_SIZE    65536 /* 64 KiB */
 #define NUM_SAVED_VGPRS 2

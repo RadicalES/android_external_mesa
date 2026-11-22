@@ -1,26 +1,7 @@
 /*
  * Copyright © 2021 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
-
 
 #include "brw_private.h"
 #include "compiler/shader_info.h"
@@ -270,9 +251,84 @@ TEST_F(SIMDSelectionCS, SpillAtSIMD16)
    ASSERT_EQ(brw_simd_select(simd_state), SIMD8);
 }
 
+TEST_F(SIMDSelectionCS, FailAtSIMD8)
+{
+   ASSERT_TRUE(brw_simd_should_compile(simd_state, SIMD8));
+   brw_simd_mark_failed(simd_state, SIMD8, "fail");
+   ASSERT_FALSE(brw_simd_should_compile(simd_state, SIMD16));
+   ASSERT_FALSE(brw_simd_should_compile(simd_state, SIMD32));
+
+   ASSERT_EQ(brw_simd_select(simd_state), -1);
+}
+
+TEST_F(SIMDSelectionCS, FailAtSIMD8Forced)
+{
+   const uint64_t saved_intel_simd = intel_simd;
+   const uint32_t saved_intel_simd_overridden = intel_simd_overridden;
+   intel_simd |= DEBUG_CS_SIMD;
+   intel_simd_overridden |= BITFIELD_BIT(MESA_SHADER_COMPUTE);
+
+   EXPECT_TRUE(brw_simd_should_compile(simd_state, SIMD8));
+   brw_simd_mark_failed(simd_state, SIMD8, "fail");
+   EXPECT_FALSE(brw_simd_should_compile(simd_state, SIMD16));
+   EXPECT_FALSE(brw_simd_should_compile(simd_state, SIMD32));
+
+   EXPECT_EQ(brw_simd_select(simd_state), -1);
+
+   intel_simd = saved_intel_simd;
+   intel_simd_overridden = saved_intel_simd_overridden;
+}
+
+TEST_F(SIMDSelectionCS, FailAtSIMD16)
+{
+   ASSERT_TRUE(brw_simd_should_compile(simd_state, SIMD8));
+   brw_simd_mark_compiled(simd_state, SIMD8, not_spilled);
+   ASSERT_TRUE(brw_simd_should_compile(simd_state, SIMD16));
+   brw_simd_mark_failed(simd_state, SIMD16, "fail");
+   ASSERT_FALSE(brw_simd_should_compile(simd_state, SIMD32));
+
+   ASSERT_EQ(brw_simd_select(simd_state), SIMD8);
+}
+
+TEST_F(SIMDSelectionCS, FailAtSIMD32Xe3)
+{
+   /* Xe3 attempts the widths in decreasing order, so a failure says
+    * nothing about the narrower ones.
+    */
+   devinfo->ver = 30;
+
+   ASSERT_TRUE(brw_simd_should_compile(simd_state, SIMD32));
+   brw_simd_mark_failed(simd_state, SIMD32, "fail");
+   ASSERT_TRUE(brw_simd_should_compile(simd_state, SIMD16));
+   brw_simd_mark_compiled(simd_state, SIMD16, not_spilled);
+
+   ASSERT_EQ(brw_simd_select(simd_state), SIMD16);
+}
+
+TEST_F(SIMDSelectionCS, EnvironmentVariable16Only)
+{
+   const uint64_t saved_intel_simd = intel_simd;
+   const uint32_t saved_intel_simd_overridden = intel_simd_overridden;
+   intel_simd = (intel_simd & ~DEBUG_CS_SIMD) | DEBUG_CS_SIMD16;
+   intel_simd_overridden |= BITFIELD_BIT(MESA_SHADER_COMPUTE);
+
+   EXPECT_FALSE(brw_simd_should_compile(simd_state, SIMD8));
+   EXPECT_STREQ(simd_state.error[SIMD8],
+                "Disabled by INTEL_SIMD_DEBUG environment variable");
+
+   EXPECT_TRUE(brw_simd_should_compile(simd_state, SIMD16));
+   brw_simd_mark_compiled(simd_state, SIMD16, not_spilled);
+   EXPECT_FALSE(brw_simd_should_compile(simd_state, SIMD32));
+
+   EXPECT_EQ(brw_simd_select(simd_state), SIMD16);
+
+   intel_simd = saved_intel_simd;
+   intel_simd_overridden = saved_intel_simd_overridden;
+}
+
 TEST_F(SIMDSelectionCS, EnvironmentVariable32)
 {
-   BITSET_SET(intel_debug, DEBUG_DO32);
+   intel_simd_overridden |= BITFIELD_BIT(MESA_SHADER_COMPUTE);
 
    ASSERT_TRUE(brw_simd_should_compile(simd_state, SIMD8));
    brw_simd_mark_compiled(simd_state, SIMD8, not_spilled);
@@ -286,7 +342,7 @@ TEST_F(SIMDSelectionCS, EnvironmentVariable32)
 
 TEST_F(SIMDSelectionCS, EnvironmentVariable32ButSpills)
 {
-   BITSET_SET(intel_debug, DEBUG_DO32);
+   intel_simd_overridden |= BITFIELD_BIT(MESA_SHADER_COMPUTE);
 
    ASSERT_TRUE(brw_simd_should_compile(simd_state, SIMD8));
    brw_simd_mark_compiled(simd_state, SIMD8, not_spilled);

@@ -1,26 +1,7 @@
 /*
  * Copyright © 2017 Intel Corporation
+ * SPDX-License-Identifier: MIT
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included
- * in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
- * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
-
-/**
  * @file iris_screen.c
  *
  * Screen related driver hooks and capability lists.
@@ -62,6 +43,9 @@
 
 #define genX_call(devinfo, func, ...)             \
    switch ((devinfo)->verx10) {                   \
+   case 350:                                      \
+      gfx35_##func(__VA_ARGS__);                  \
+      break;                                      \
    case 300:                                      \
       gfx30_##func(__VA_ARGS__);                  \
       break;                                      \
@@ -349,7 +333,6 @@ iris_init_screen_caps(struct iris_screen *screen)
    caps->polygon_offset_clamp = true;
    caps->query_so_overflow = true;
    caps->query_buffer_object = true;
-   caps->tgsi_tex_txf_lz = true;
    caps->texture_query_samples = true;
    caps->shader_clock = true;
    caps->shader_ballot = true;
@@ -382,6 +365,7 @@ iris_init_screen_caps(struct iris_screen *screen)
    caps->alpha_to_coverage_dither_control = true;
    caps->map_unsynchronized_thread_safe = true;
    caps->has_const_bw = true;
+   caps->polygon_stipple = true;
    caps->cl_gl_sharing = true;
    caps->uma = iris_bufmgr_vram_size(screen->bufmgr) == 0;
    caps->query_memory_info = iris_bufmgr_vram_size(screen->bufmgr) != 0;
@@ -411,7 +395,7 @@ iris_init_screen_caps(struct iris_screen *screen)
    caps->constant_buffer_offset_alignment = 32;
    caps->min_map_buffer_alignment = IRIS_MAP_BUFFER_ALIGNMENT;
    caps->shader_buffer_offset_alignment = 4;
-   caps->max_shader_buffer_size = (unsigned)MIN2(screen->isl_dev.max_buffer_size, INT32_MAX); // INT32_MAX is correct.
+   caps->max_shader_buffer_size = ROUND_DOWN_TO((unsigned)MIN2(screen->isl_dev.max_buffer_size, INT32_MAX), 256);
    caps->texture_buffer_offset_alignment = 16; // XXX: u_screen says 256 is the minimum value...
    caps->linear_image_pitch_alignment = 1;
    caps->linear_image_base_address_alignment = 1;
@@ -441,7 +425,7 @@ iris_init_screen_caps(struct iris_screen *screen)
     * extensive checking in the driver for correctness, e.g. to prevent
     * illegal snoop <-> snoop transfers.
     */
-   caps->resource_from_user_memory = devinfo->has_llc;
+   caps->resource_from_user_memory = devinfo->has_llc && devinfo->has_userptr_uapi;
    caps->throttle = !screen->driconf.disable_throttling;
 
    caps->context_priority_mask =
@@ -500,14 +484,26 @@ iris_init_screen_caps(struct iris_screen *screen)
     */
    caps->max_vma = intel_48b_address(UINT64_MAX) >> 1;
 
+   /* We could implement two-sided color via SBE attribute swizzling but
+    * opt to use common NIR lowering instead of maintaining the complexity
+    * for a minor improvement for a long deprecated feature.
+    */
+   caps->two_sided_color = false;
+
+   caps->device_type = devinfo->has_local_mem
+      ? PIPE_DEVICE_TYPE_DISCRETE_GPU
+      : PIPE_DEVICE_TYPE_INTEGRATED_GPU;
+
    if (devinfo->ver >= 9) {
       caps->shader_subgroup_size = 32;
       caps->shader_subgroup_supported_stages = BITFIELD_MASK(MESA_SHADER_STAGES);
       caps->shader_subgroup_supported_features =
-         devinfo->has_64bit_float ? BITFIELD_MASK(PIPE_SHADER_SUBGROUP_NUM_FEATURES)
+         devinfo->has_64bit_float ? PIPE_SHADER_SUBGROUP_FEATURE_MASK
                                   : (PIPE_SHADER_SUBGROUP_FEATURE_BASIC |
                                      PIPE_SHADER_SUBGROUP_FEATURE_VOTE |
                                      PIPE_SHADER_SUBGROUP_FEATURE_BALLOT |
+                                     PIPE_SHADER_SUBGROUP_FEATURE_ROTATE |
+                                     PIPE_SHADER_SUBGROUP_FEATURE_ROTATE_CLUSTERED |
                                      PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE |
                                      PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE_RELATIVE |
                                      PIPE_SHADER_SUBGROUP_FEATURE_QUAD);
@@ -530,6 +526,14 @@ iris_get_timestamp(struct pipe_screen *pscreen)
    return result;
 }
 
+static uint64_t
+iris_convert_timestamp(struct pipe_screen *pscreen, uint64_t raw_timestamp)
+{
+   struct iris_screen *screen = (struct iris_screen *) pscreen;
+
+   return intel_device_info_timebase_scale(screen->devinfo, raw_timestamp);
+}
+
 void
 iris_screen_destroy(struct iris_screen *screen)
 {
@@ -539,9 +543,12 @@ iris_screen_destroy(struct iris_screen *screen)
    glsl_type_singleton_decref();
    iris_bo_unreference(screen->workaround_bo);
    iris_bo_unreference(screen->breakpoint_bo);
+   iris_scratch_buffer_reference(&screen->scratch_buffer, NULL);
+   simple_mtx_destroy(&screen->scratch_buffer_mutex);
    u_transfer_helper_destroy(screen->base.transfer_helper);
    iris_bufmgr_unref(screen->bufmgr);
    disk_cache_destroy(screen->disk_cache);
+   intel_virtio_unref_fd(screen->winsys_fd);
    close(screen->winsys_fd);
    ralloc_free(screen);
 }
@@ -673,8 +680,8 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
    if (!screen)
       return NULL;
 
-   driParseConfigFiles(config->options, config->options_info, 0, "iris",
-                       NULL, NULL, NULL, 0, NULL, 0);
+   driParseConfigFiles(config->options, config->options_info,
+                       &(driConfigFileParseParams) { .driverName = "iris" });
 
    bool bo_reuse = false;
    int bo_reuse_mode = driQueryOptioni(config->options, "bo_reuse");
@@ -686,9 +693,12 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
       break;
    }
 
+   if (intel_virtio_init_fd(fd) < 0)
+      return NULL;
+
    process_intel_debug_variable();
 
-   screen->bufmgr = iris_bufmgr_get_for_fd(fd, bo_reuse);
+   screen->bufmgr = iris_bufmgr_get_for_fd(fd, bo_reuse, config->options);
    if (!screen->bufmgr)
       return NULL;
 
@@ -743,6 +753,12 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
       driQueryOptionf(config->options, "lower_depth_range_rate");
    screen->driconf.intel_enable_wa_14018912822 =
       driQueryOptionb(config->options, "intel_enable_wa_14018912822");
+   screen->driconf.intel_enable_wa_14024015672_msaa =
+      driQueryOptionb(config->options, "intel_enable_wa_14024015672_msaa");
+   screen->driconf.force_sampler_prefetch =
+      driQueryOptionb(config->options, "intel_force_sampler_prefetch");
+   screen->driconf.force_compute_surface_prefetch =
+      driQueryOptionb(config->options, "intel_force_compute_surface_prefetch");
    screen->driconf.enable_tbimr =
       driQueryOptionb(config->options, "intel_tbimr");
    screen->driconf.enable_vf_distribution =
@@ -794,6 +810,7 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
    pscreen->is_format_supported = iris_is_format_supported;
    pscreen->context_create = iris_create_context;
    pscreen->get_timestamp = iris_get_timestamp;
+   pscreen->convert_timestamp = iris_convert_timestamp;
    pscreen->query_memory_info = iris_query_memory_info;
    pscreen->get_driver_query_group_info = iris_get_monitor_group_info;
    pscreen->get_driver_query_info = iris_get_monitor_info;

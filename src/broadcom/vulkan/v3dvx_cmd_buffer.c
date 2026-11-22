@@ -21,7 +21,10 @@
  * IN THE SOFTWARE.
  */
 
-#include "v3dv_private.h"
+#include "v3dv_device.h"
+#include "v3dv_cmd_buffer.h"
+#include "v3dv_image.h"
+#include "v3dv_version_dispatch.h"
 #include "v3dv_format_table.h"
 #include "v3dvx_format_table.h"
 #include "broadcom/common/v3d_util.h"
@@ -56,6 +59,10 @@ v3dX(job_emit_enable_double_buffer)(struct v3dv_job *job)
    };
    config.width_in_pixels = tiling->width;
    config.height_in_pixels = tiling->height;
+   config.tile_allocation_initial_block_size =
+      V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE_ENUM;
+   config.tile_allocation_block_size =
+      V3D_TILE_ALLOC_OVERFLOW_BLOCK_SIZE_ENUM;
 #if V3D_VERSION == 42
    config.number_of_render_targets = MAX2(tiling->render_target_count, 1);
    config.multisample_mode_4x = tiling->msaa;
@@ -88,6 +95,10 @@ v3dX(job_emit_binning_prolog)(struct v3dv_job *job,
    cl_emit(&job->bcl, TILE_BINNING_MODE_CFG, config) {
       config.width_in_pixels = tiling->width;
       config.height_in_pixels = tiling->height;
+      config.tile_allocation_initial_block_size =
+         V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE_ENUM;
+      config.tile_allocation_block_size =
+         V3D_TILE_ALLOC_OVERFLOW_BLOCK_SIZE_ENUM;
 #if V3D_VERSION == 42
       config.number_of_render_targets = MAX2(tiling->render_target_count, 1);
       config.multisample_mode_4x = tiling->msaa;
@@ -97,12 +108,6 @@ v3dX(job_emit_binning_prolog)(struct v3dv_job *job,
 #if V3D_VERSION >= 71
       config.log2_tile_width = log2_tile_size(tiling->tile_width);
       config.log2_tile_height = log2_tile_size(tiling->tile_height);
-      /* FIXME: ideally we would like next assert on the packet header (as is
-       * general, so also applies to GL). We would need to expand
-       * gen_pack_header for that.
-       */
-      assert(config.log2_tile_width == config.log2_tile_height ||
-             config.log2_tile_width == config.log2_tile_height + 1);
 #endif
    }
 
@@ -174,13 +179,16 @@ cmd_buffer_render_pass_emit_load(struct v3dv_cmd_buffer *cmd_buffer,
       load.input_image_format = iview->format->planes[0].rt_type;
 
       /* If we create an image view with only the stencil format, we
-       * re-interpret the format as RGBA8_UINT, as it is want we want in
+       * re-interpret the format as RGBA8_UINT, as it is what we want in
        * general (see CreateImageView).
        *
-       * However, when we are loading/storing tiles from the ZSTENCIL tile
-       * buffer, we need to use the underlying DS format.
+       * However, when we are loading/storing tiles from the depth/stencil
+       * tile buffers, we need to use the underlying DS format. The aspect
+       * mask of a depth/stencil attachment view must be ignored, so a
+       * stencil-only view of a combined depth/stencil image can also be used
+       * here as the depth attachment.
        */
-      if (buffer == ZSTENCIL &&
+      if ((buffer == Z || buffer == STENCIL || buffer == ZSTENCIL) &&
           iview->format->planes[0].rt_type == V3D_OUTPUT_IMAGE_FORMAT_RGBA8UI) {
          assert(image->format->planes[image_plane].rt_type == V3D_OUTPUT_IMAGE_FORMAT_D24S8);
          load.input_image_format = image->format->planes[image_plane].rt_type;
@@ -376,13 +384,16 @@ cmd_buffer_render_pass_emit_store(struct v3dv_cmd_buffer *cmd_buffer,
       store.output_image_format = iview->format->planes[0].rt_type;
 
       /* If we create an image view with only the stencil format, we
-       * re-interpret the format as RGBA8_UINT, as it is want we want in
+       * re-interpret the format as RGBA8_UINT, as it is what we want in
        * general (see CreateImageView).
        *
-       * However, when we are loading/storing tiles from the ZSTENCIL tile
-       * buffer, we need to use the underlying DS format.
+       * However, when we are loading/storing tiles from the depth/stencil
+       * tile buffers, we need to use the underlying DS format. The aspect
+       * mask of a depth/stencil attachment view must be ignored, so a
+       * stencil-only view of a combined depth/stencil image can also be used
+       * here as the depth attachment.
        */
-      if (buffer == ZSTENCIL &&
+      if ((buffer == Z || buffer == STENCIL || buffer == ZSTENCIL) &&
           iview->format->planes[0].rt_type == V3D_OUTPUT_IMAGE_FORMAT_RGBA8UI) {
          assert(image->format->planes[image_plane].rt_type == V3D_OUTPUT_IMAGE_FORMAT_D24S8);
          store.output_image_format = image->format->planes[image_plane].rt_type;
@@ -755,7 +766,8 @@ cmd_buffer_emit_render_pass_layer_rcl(struct v3dv_cmd_buffer *cmd_buffer,
     */
    const struct v3dv_frame_tiling *tiling = &job->frame_tiling;
    const uint32_t tile_alloc_offset =
-      64 * layer * tiling->draw_tiles_x * tiling->draw_tiles_y;
+      V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE *
+      layer * tiling->draw_tiles_x * tiling->draw_tiles_y;
    cl_emit(rcl, MULTICORE_RENDERING_TILE_LIST_SET_BASE, list) {
       list.address = v3dv_cl_address(job->tile_alloc, tile_alloc_offset);
    }
@@ -977,12 +989,6 @@ v3dX(cmd_buffer_emit_render_pass_rcl)(struct v3dv_cmd_buffer *cmd_buffer)
 #if V3D_VERSION >= 71
       config.log2_tile_width = log2_tile_size(tiling->tile_width);
       config.log2_tile_height = log2_tile_size(tiling->tile_height);
-      /* FIXME: ideallly we would like next assert on the packet header (as is
-       * general, so also applies to GL). We would need to expand
-       * gen_pack_header for that.
-       */
-      assert(config.log2_tile_width == config.log2_tile_height ||
-             config.log2_tile_width == config.log2_tile_height + 1);
 #endif
 
       if (ds_attachment_idx != VK_ATTACHMENT_UNUSED) {
@@ -995,7 +1001,15 @@ v3dX(cmd_buffer_emit_render_pass_rcl)(struct v3dv_cmd_buffer *cmd_buffer)
           */
          assert(iview->plane_count == 1);
          assert(iview->format->plane_count == 1);
-         config.internal_depth_type = iview->planes[0].internal_type;
+
+         /* The aspect mask of a depth/stencil attachment view must be
+          * ignored, so this can be a stencil-only view of a D24S8 image,
+          * which we re-interpret as RGBA8UI (see CreateImageView) and so has
+          * a color internal type. Use the view's depth/stencil format
+          * instead.
+          */
+         config.internal_depth_type =
+            v3dX(get_internal_depth_type)(iview->vk.format);
 
          set_rcl_early_z_config(job,
                                 &config.early_z_disable,
@@ -1236,7 +1250,7 @@ v3dX(cmd_buffer_emit_render_pass_rcl)(struct v3dv_cmd_buffer *cmd_buffer)
    cl_emit(rcl, TILE_LIST_INITIAL_BLOCK_SIZE, init) {
       init.use_auto_chained_tile_lists = true;
       init.size_of_first_block_in_chained_tile_lists =
-         TILE_ALLOCATION_BLOCK_SIZE_64B;
+         V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE_ENUM;
    }
 
    cl_emit(rcl, MULTICORE_RENDERING_SUPERTILE_CFG, config) {
@@ -1633,7 +1647,7 @@ v3dX(cmd_buffer_emit_blend)(struct v3dv_cmd_buffer *cmd_buffer)
       return;
 
    const struct v3d_device_info *devinfo = &cmd_buffer->device->devinfo;
-   const uint32_t max_color_rts = V3D_MAX_RENDER_TARGETS(devinfo->ver);
+   const uint32_t max_color_rts = devinfo->max_render_targets;
 
    const uint32_t blend_packets_size =
       cl_packet_length(BLEND_ENABLES) +
@@ -1831,7 +1845,6 @@ v3dX(cmd_buffer_emit_varyings_state)(struct v3dv_cmd_buffer *cmd_buffer)
    }
 }
 
-#if V3D_VERSION == 42
 /* Updates cmd_buffer, and their job, early z state tracking. Returns false if
  * EZ must be disabled for the current draw call.
  */
@@ -1898,6 +1911,19 @@ cmd_buffer_update_ez_state(struct v3dv_cmd_buffer *cmd_buffer,
          return false;
       }
 
+#if V3D_VERSION == 42
+      /* Using early-Z in a render pass split in a suspend/resume chain can
+       * violate the early-Z constraints on V3D 4.2, so disable it for the
+       * whole chain.
+       */
+      if (state->suspending || state->resuming) {
+         perf_debug("Suspending or resuming a render pass disables early-Z tests.\n");
+         job->first_ez_state = V3D_EZ_DISABLED;
+         job->ez_state = V3D_EZ_DISABLED;
+         return false;
+      }
+#endif
+
       /* GFXH-1918: the early-z buffer may load incorrect depth values if the
        * frame has odd width or height, or if the buffer is 16-bit and
        * multisampled.
@@ -1954,7 +1980,7 @@ cmd_buffer_update_ez_state(struct v3dv_cmd_buffer *cmd_buffer,
     * cmd_buffer state if some stencil/depth flags were dynamic.
     */
    bool disable_ez = false;
-   bool incompatible_test = false;
+   UNUSED bool incompatible_test = false;
    switch (cmd_buffer->state.ez_state) {
    case V3D_EZ_UNDECIDED:
       /* If the pipeline didn't pick a direction but didn't disable, then go
@@ -1991,17 +2017,18 @@ cmd_buffer_update_ez_state(struct v3dv_cmd_buffer *cmd_buffer,
     * and the cmd buffer writes depth then we need to disable EZ for the rest
     * of the frame.
     */
+#if V3D_VERSION == 42
    if (incompatible_test && cmd_buffer->state.z_updates_enable) {
       assert(disable_ez);
       job->ez_state = V3D_EZ_DISABLED;
    }
+#endif
 
    if (!disable_ez)
       job->has_ez_draws = true;
 
    return !disable_ez;
 }
-#endif
 
 void
 v3dX(cmd_buffer_emit_configuration_bits)(struct v3dv_cmd_buffer *cmd_buffer)
@@ -2035,8 +2062,9 @@ v3dX(cmd_buffer_emit_configuration_bits)(struct v3dv_cmd_buffer *cmd_buffer)
       config.stencil_enable = dyn->ds.stencil.test_enable && has_stencil;
 
       cmd_buffer->state.z_updates_enable = config.z_updates_enable;
+
+      UNUSED bool enable_ez = cmd_buffer_update_ez_state(cmd_buffer, pipeline);
 #if V3D_VERSION == 42
-      bool enable_ez = cmd_buffer_update_ez_state(cmd_buffer, pipeline);
       config.early_z_enable = enable_ez;
       config.early_z_updates_enable = config.early_z_enable &&
          cmd_buffer->state.z_updates_enable;
@@ -2612,12 +2640,16 @@ v3dX(cmd_buffer_emit_gl_shader_state)(struct v3dv_cmd_buffer *cmd_buffer)
 
       cl_emit_with_prepacked(&job->indirect, GL_SHADER_STATE_ATTRIBUTE_RECORD,
                              &pipeline->vertex_attrs[i * packet_length], attr) {
-
-         assert(c_vb->buffer->mem->bo);
-         attr.address = v3dv_cl_address(c_vb->buffer->mem->bo,
-                                        c_vb->buffer->mem_offset +
-                                        pipeline->va[i].offset +
-                                        c_vb->offset);
+         if (c_vb->buffer) {
+            assert(c_vb->buffer->mem->bo);
+            attr.address = v3dv_cl_address(c_vb->buffer->mem->bo,
+                                           c_vb->buffer->mem_offset +
+                                           pipeline->va[i].offset +
+                                           c_vb->offset);
+         } else {
+            assert(cmd_buffer->device->null_bo);
+            attr.address = v3dv_cl_address(cmd_buffer->device->null_bo, 0);
+         }
 
          attr.number_of_values_read_by_coordinate_shader =
             prog_data_vs_bin->vattr_sizes[location];

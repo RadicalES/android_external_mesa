@@ -1,24 +1,6 @@
 /*
  * Copyright © 2017 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 #ifndef IRIS_SCREEN_H
 #define IRIS_SCREEN_H
@@ -29,6 +11,7 @@
 #include "util/slab.h"
 #include "util/u_screen.h"
 #include "intel/dev/intel_device_info.h"
+#include "intel/dev/virtio/intel_virtio.h"
 #include "intel/isl/isl.h"
 #include "iris_bufmgr.h"
 #include "iris_binder.h"
@@ -132,7 +115,7 @@ struct iris_vtable {
                                      uint32_t offset);
 
    unsigned (*derived_program_state_size)(enum iris_program_cache_id id);
-   void (*store_derived_program_state)(const struct intel_device_info *devinfo,
+   void (*store_derived_program_state)(const struct iris_screen *screen,
                                        enum iris_program_cache_id cache_id,
                                        struct iris_compiled_shader *shader);
    uint32_t *(*create_so_decl_list)(const struct pipe_stream_output_info *sol,
@@ -166,6 +149,30 @@ struct iris_address {
    struct iris_bo *bo;
    uint64_t offset;
    enum iris_domain access;
+};
+
+/**
+ * A shared scratch buffer used when efficient 64-bit addressing mode is
+ * enabled.
+ * All shader stages share a single scratch buffer and its address is baked
+ * directly into each compiled shader's instructions as a relocation
+ * (see BRW_SHADER_RELOC_SCRATCH64_SURFACE_LOW/HIGH in iris_upload_shader()).
+ *
+ * Because the address is fixed at compile time, a given iris_scratch_buffer
+ * must stay alive for as long as any shader compiled against it might still
+ * run.
+ * It is therefore reference counted: iris_screen keeps a reference to
+ * the current (largest allocated so far) buffer, and every compiled shader
+ * that referenced it when it was uploaded holds its own reference too.
+ * When a larger buffer is required, the screen simply points at a new, bigger
+ * allocation and drops its own reference to the old one, any shaders still
+ * using the old buffer keep it alive until they are destroyed.
+ */
+struct iris_scratch_buffer {
+   struct iris_bo *bo;
+   struct iris_bo *surf_bo;
+   struct pipe_reference ref;
+   unsigned per_thread_scratch;
 };
 
 struct iris_screen {
@@ -203,11 +210,14 @@ struct iris_screen {
       bool limit_trig_input_range;
       float lower_depth_range_rate;
       bool intel_enable_wa_14018912822;
+      bool intel_enable_wa_14024015672_msaa;
       bool enable_tbimr;
       bool enable_vf_distribution;
       bool enable_te_distribution;
       unsigned generated_indirect_threshold;
       bool disable_threaded_context;
+      bool force_sampler_prefetch;
+      bool force_compute_surface_prefetch;
    } driconf;
 
    /** Does the kernel support various features (KERNEL_HAS_* bitfield)? */
@@ -257,6 +267,9 @@ struct iris_screen {
    int id;
 
    struct iris_bo *breakpoint_bo;
+
+   struct iris_scratch_buffer *scratch_buffer;
+   simple_mtx_t scratch_buffer_mutex;
 };
 
 struct pipe_screen *

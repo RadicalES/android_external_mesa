@@ -14,6 +14,7 @@
 
 #include "pan_props.h"
 
+#include "util/u_atomic.h"
 #include "vk_debug_utils.h"
 #include "vk_log.h"
 
@@ -23,59 +24,29 @@ panvk_memory_emit_report(struct panvk_device *device,
                          const VkMemoryAllocateInfo *alloc_info,
                          VkResult result)
 {
-   if (likely(!device->vk.memory_reports))
-      return;
+   struct panvk_physical_device *pdev =
+      to_panvk_physical_device(device->vk.physical);
+
+   const bool is_alloc = alloc_info != NULL;
 
    if (result != VK_SUCCESS) {
-      vk_emit_device_memory_report(
-         &device->vk, VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATION_FAILED_EXT,
-         /* mem_obj_id */ 0, alloc_info->allocationSize,
-         VK_OBJECT_TYPE_DEVICE_MEMORY,
-         /* obj_handle */ 0, alloc_info->memoryTypeIndex);
+      const uint32_t heap_index =
+         pdev->memory.types[alloc_info->memoryTypeIndex].heapIndex;
+      vk_device_memory_report_emit(&device->vk, result, is_alloc,
+                                   /* is_import */ false,
+                                   /* mem_obj_id */ 0,
+                                   alloc_info->allocationSize,
+                                   VK_OBJECT_TYPE_DEVICE_MEMORY,
+                                   /* obj_handle */ 0, heap_index);
       return;
    }
 
-   VkDeviceMemoryReportEventTypeEXT type;
-   if (alloc_info) {
-      type = mem->vk.import_handle_type
-                ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_IMPORT_EXT
-                : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATE_EXT;
-   } else {
-      type = mem->vk.import_handle_type
-                ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_UNIMPORT_EXT
-                : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT;
-   }
-
-   vk_emit_device_memory_report(&device->vk, type, mem->bo->handle,
-                                mem->bo->size, VK_OBJECT_TYPE_DEVICE_MEMORY,
-                                (uintptr_t)(mem), mem->vk.memory_type_index);
-}
-
-static void *
-panvk_memory_mmap(struct panvk_device_memory *mem)
-{
-   if (!mem->addr.host) {
-      void *addr = pan_kmod_bo_mmap(mem->bo, 0, pan_kmod_bo_size(mem->bo),
-                                    PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
-      if (addr == MAP_FAILED)
-         return NULL;
-
-      mem->addr.host = addr;
-   }
-
-   return mem->addr.host;
-}
-
-static void
-panvk_memory_munmap(struct panvk_device_memory *mem)
-{
-   if (mem->addr.host) {
-      ASSERTED int ret =
-         os_munmap((void *)mem->addr.host, pan_kmod_bo_size(mem->bo));
-
-      assert(!ret);
-      mem->addr.host = NULL;
-   }
+   const uint32_t heap_index =
+      pdev->memory.types[mem->vk.memory_type_index].heapIndex;
+   vk_device_memory_report_emit(
+      &device->vk, result, is_alloc, mem->vk.import_handle_type != 0,
+      mem->bo->handle, mem->bo->size, VK_OBJECT_TYPE_DEVICE_MEMORY,
+      (uintptr_t)(mem), heap_index);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -129,7 +100,7 @@ panvk_AllocateMemory(VkDevice _device,
          fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
          fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
 
-      mem->bo = pan_kmod_bo_import(device->kmod.dev, fd_info->fd, 0);
+      mem->bo = pan_kmod_bo_import(device->kmod.dev, fd_info->fd);
       if (!mem->bo) {
          result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
          goto err_destroy_mem;
@@ -168,8 +139,32 @@ panvk_AllocateMemory(VkDevice _device,
    };
 
    if (!(device->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA)) {
-      op.va.start = panvk_as_alloc(device, op.va.size,
-         pan_choose_gpu_va_alignment(device->kmod.vm, op.va.size));
+      uint64_t alignment =
+         pan_choose_gpu_va_alignment(device->kmod.vm, op.va.size);
+      unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
+      /* For sizes larger than or equal to 64k, align the VA on 64k to meet the
+       * requirement for interleaved_64k images (added in v10). */
+      if (arch >= 10 && op.va.size >= 64 * 1024)
+         alignment = MAX2(alignment, 64 * 1024);
+
+      if (unlikely(mem->vk.alloc_flags &
+                   VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT)) {
+         const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_alloc_info =
+            vk_find_struct_const(pAllocateInfo->pNext,
+                                 MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
+         if (capture_alloc_info == NULL ||
+             capture_alloc_info->opaqueCaptureAddress == 0) {
+            op.va.start = panvk_as_alloc(device, PANVK_FIXED_VA_HEAP,
+                                         op.va.size, alignment);
+         } else {
+            op.va.start = panvk_as_alloc_fixed_address(
+               device, capture_alloc_info->opaqueCaptureAddress, op.va.size);
+         }
+      } else {
+         op.va.start = panvk_as_alloc(device, PANVK_NO_EXEC_VA_HEAP, op.va.size,
+                                      alignment);
+      }
+
       if (!op.va.start) {
          result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto err_put_bo;
@@ -184,6 +179,10 @@ panvk_AllocateMemory(VkDevice _device,
    }
 
    mem->addr.dev = op.va.start;
+
+   panvk_address_binding_report(device, &mem->vk.base, mem->addr.dev,
+                                pan_kmod_bo_size(mem->bo),
+                                VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
 
    if (fd_info) {
       /* From the Vulkan spec:
@@ -200,8 +199,8 @@ panvk_AllocateMemory(VkDevice _device,
 
    if (device->debug.decode_ctx) {
       if (PANVK_DEBUG(DUMP) || PANVK_DEBUG(TRACE)) {
-         void *cpu = pan_kmod_bo_mmap(mem->bo, 0, pan_kmod_bo_size(mem->bo),
-                                      PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+         void *cpu =
+            pan_kmod_bo_mmap(mem->bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
          if (cpu != MAP_FAILED)
             mem->debug.host_mapping = cpu;
          else
@@ -215,6 +214,9 @@ panvk_AllocateMemory(VkDevice _device,
    }
 
    panvk_memory_emit_report(device, mem, pAllocateInfo, VK_SUCCESS);
+
+   p_atomic_add(&physical_device->memory.budget->heap_used,
+                (uint64_t)pan_kmod_bo_size(mem->bo));
 
    *pMem = panvk_device_memory_to_handle(mem);
 
@@ -245,6 +247,12 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    if (mem == NULL)
       return;
 
+   struct panvk_physical_device *physical_device =
+      to_panvk_physical_device(device->vk.physical);
+
+   p_atomic_add(&physical_device->memory.budget->heap_used,
+                -((int64_t)pan_kmod_bo_size(mem->bo)));
+
    if (device->debug.decode_ctx) {
       pandecode_inject_free(device->debug.decode_ctx, mem->addr.dev,
                             pan_kmod_bo_size(mem->bo));
@@ -253,7 +261,14 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
          os_munmap(mem->debug.host_mapping, pan_kmod_bo_size(mem->bo));
    }
 
-   panvk_memory_munmap(mem);
+   if (mem->addr.host) {
+      ASSERTED int ret = os_munmap(mem->addr.host, pan_kmod_bo_size(mem->bo));
+      assert(!ret);
+   }
+
+   panvk_address_binding_report(device, &mem->vk.base, mem->addr.dev,
+                                pan_kmod_bo_size(mem->bo),
+                                VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
 
    struct pan_kmod_vm_op op = {
       .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
@@ -267,9 +282,8 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
       pan_kmod_vm_bind(device->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1);
    assert(!ret);
 
-   if (!(device->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA)) {
+   if (!(device->kmod.vm->flags & PAN_KMOD_VM_FLAG_AUTO_VA))
       panvk_as_free(device, op.va.start, op.va.size);
-   }
 
    panvk_memory_emit_report(device, mem, /* alloc_info */ NULL, VK_SUCCESS);
 
@@ -318,12 +332,28 @@ panvk_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
       return panvk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
                           "Memory object already mapped.");
 
-   void *addr = panvk_memory_mmap(mem);
-   if (!addr)
+   void *host_addr = NULL;
+   int map_flags = MAP_SHARED;
+
+   if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) {
+      const VkMemoryMapPlacedInfoEXT *placed_info = vk_find_struct_const(
+         pMemoryMapInfo->pNext, MEMORY_MAP_PLACED_INFO_EXT);
+      assert(placed_info != NULL);
+      assert(offset == 0 && size == mem->bo->size);
+      host_addr = placed_info->pPlacedAddress;
+      map_flags |= MAP_FIXED;
+   }
+
+   void *addr =
+      pan_kmod_bo_mmap(mem->bo, PROT_READ | PROT_WRITE, map_flags, host_addr);
+   if (addr == MAP_FAILED)
       return panvk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
                           "Memory object couldn't be mapped.");
 
-   *ppData = addr + offset;
+   assert(!host_addr || addr == host_addr);
+   mem->addr.host = addr;
+   *ppData = (char *)addr + offset;
+
    return VK_SUCCESS;
 }
 
@@ -331,9 +361,22 @@ VKAPI_ATTR VkResult VKAPI_CALL
 panvk_UnmapMemory2KHR(VkDevice _device,
                       const VkMemoryUnmapInfoKHR *pMemoryUnmapInfo)
 {
+   VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_device_memory, mem, pMemoryUnmapInfo->memory);
 
-   panvk_memory_munmap(mem);
+   if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
+      void *reserved =
+         os_mmap(mem->addr.host, pan_kmod_bo_size(mem->bo), PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      if (reserved == MAP_FAILED)
+         return panvk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
+                             "Failed to reserve VA on unmap.");
+   } else {
+      ASSERTED int ret = os_munmap(mem->addr.host, pan_kmod_bo_size(mem->bo));
+      assert(!ret);
+   }
+
+   mem->addr.host = NULL;
 
    return VK_SUCCESS;
 }
@@ -417,7 +460,7 @@ panvk_GetMemoryFdPropertiesKHR(VkDevice _device,
 
    assert(handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
 
-   struct pan_kmod_bo *bo = pan_kmod_bo_import(device->kmod.dev, fd, 0);
+   struct pan_kmod_bo *bo = pan_kmod_bo_import(device->kmod.dev, fd);
    if (!bo)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 

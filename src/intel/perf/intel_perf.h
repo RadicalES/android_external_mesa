@@ -99,6 +99,10 @@ enum ENUM_PACKED intel_perf_counter_units {
    INTEL_PERF_COUNTER_UNITS_MAX
 };
 
+const char *intel_perf_counter_type_name(enum intel_perf_counter_type type);
+const char *intel_perf_counter_data_type_name( enum intel_perf_counter_data_type type);
+const char *intel_perf_counter_units_name(enum intel_perf_counter_units units);
+
 struct intel_pipeline_stat {
    uint32_t reg;
    uint32_t numerator;
@@ -430,11 +434,35 @@ enum intel_perf_features {
    INTEL_PERF_FEATURE_HOLD_PREEMPTION = (1 << 0),
    INTEL_PERF_FEATURE_GLOBAL_SSEU = (1 << 1),
    INTEL_PERF_FEATURE_METRIC_SYNC = (1 << 2),
+   /* OA metrics are supported by the kernel but access is blocked by system
+    * policy (observation_paranoid on xe, perf_stream_paranoid on i915).
+    * Set when the sysctl exists but the process lacks the required privilege.
+    */
+   INTEL_PERF_FEATURE_OA_BLOCKED_BY_POLICY = (1 << 3),
 };
 
 struct intel_perf_config {
    /* Have extended metrics been enabled */
    bool enable_all_metrics;
+
+   /* Whether to use the metrics library to handle performance queries. */
+   bool use_metrics_library;
+   struct {
+      void *lib;
+      void *context;
+      void *api;
+      void *callbacks;
+      void *destroy_context_func;
+      uint32_t gpu_report_size;
+      uint32_t api_report_size;
+   } metrics_library;
+
+   /* Use the global OAG unit for KHR performance queries instead of the
+    * context-scoped OAR sub-unit, so that GT-wide counters read back non-zero.
+    * Boundaries are delimited by OAG_MMIOTRIGGER writes and resolved out of
+    * the mapped OA buffer. Only the xe KMD on Xe2+ supports this.
+    */
+   bool oag_global_enable;
 
    enum intel_perf_features features_supported;
 
@@ -622,6 +650,33 @@ uint64_t intel_perf_report_timestamp(const struct intel_perf_query_info *query,
                                      const struct intel_device_info *devinfo,
                                      const uint32_t *report);
 
+#define INTEL_PERF_OA_REPORT_REASON_SHIFT        19
+#define INTEL_PERF_OA_REPORT_REASON_MASK         0x7f
+
+/* Reason bit set by the OA unit on a report emitted because OAG_MMIOTRIGGER
+ * was written.
+ */
+#define INTEL_PERF_OA_REPORT_REASON_MMIO_TRIGGER (1u << 6)
+
+/** Read the reason field of a report header.
+ */
+static inline uint32_t
+intel_perf_report_reason(const uint32_t *report)
+{
+   return (report[0] >> INTEL_PERF_OA_REPORT_REASON_SHIFT) &
+          INTEL_PERF_OA_REPORT_REASON_MASK;
+}
+
+/** Read the context-id field of a Xe2+ report, which carries the marker on an
+ * MMIO triggered report. The Xe2+ report header is four 64bit fields: report
+ * id, timestamp, context id, gpu ticks.
+ */
+static inline uint32_t
+intel_perf_report_marker(const void *report)
+{
+   return ((const uint32_t *)report)[4];
+}
+
 /** Accumulate the delta between 2 snapshots of OA perf registers (layout
  * should match description specified through intel_perf_query_register_layout).
  */
@@ -637,7 +692,8 @@ void intel_perf_query_result_accumulate_fields(struct intel_perf_query_result *r
 void intel_perf_eustall_accumulate_results(struct intel_perf_query_eustall_result *result,
                                            const void *start,
                                            const void *end,
-                                           size_t record_size);
+                                           size_t record_size,
+                                           int ver);
 
 void intel_perf_query_result_clear(struct intel_perf_query_result *result);
 void intel_perf_query_eustall_result_clear(struct intel_perf_query_eustall_result *result);
@@ -726,6 +782,15 @@ int intel_perf_stream_set_metrics_id(struct intel_perf_config *perf_config,
                                      uint32_t exec_queue,
                                      uint64_t metrics_set_id,
                                      struct intel_bind_timeline *timeline);
+
+/* Map the kernel side OA circular buffer of an opened stream read-only, giving
+ * random access to the reports the OA unit writes. Returns NULL if the KMD
+ * cannot map it. A mapped stream must not also be drained with
+ * intel_perf_stream_read_samples(), which clears the records it consumes.
+ */
+void *intel_perf_stream_map_oa_buffer(struct intel_perf_config *perf_config,
+                                      int perf_stream_fd, uint64_t *size);
+void intel_perf_stream_unmap_oa_buffer(void *map, uint64_t size);
 
 int intel_perf_eustall_stream_open(struct intel_device_info *devinfo, int drm_fd,
                                    uint32_t sample_rate, uint32_t min_event_count);

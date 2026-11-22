@@ -55,6 +55,7 @@ radv_pipeline_layout_hash(struct radv_pipeline_layout *layout)
 
       _mesa_blake3_update(&ctx, set_layout->hash, sizeof(set_layout->hash));
    }
+   _mesa_blake3_update(&ctx, &layout->independent_sets, sizeof(layout->independent_sets));
    _mesa_blake3_final(&ctx, layout->hash);
 }
 
@@ -80,7 +81,7 @@ radv_CreatePipelineLayout(VkDevice _device, const VkPipelineLayoutCreateInfo *pC
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
 
-   layout = vk_alloc2(&device->vk.alloc, pAllocator, sizeof(*layout), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   layout = vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*layout), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (layout == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 

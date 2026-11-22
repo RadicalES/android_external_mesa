@@ -82,6 +82,9 @@ util_framebuffer_state_equal(const struct pipe_framebuffer_state *dst,
    if (dst->pls_enabled != src->pls_enabled)
       return false;
 
+   if (dst->downscale_cbufs != src->downscale_cbufs)
+      return false;
+
    return true;
 }
 
@@ -115,6 +118,7 @@ util_copy_framebuffer_state(struct pipe_framebuffer_state *dst,
 
       dst->nr_cbufs = src->nr_cbufs;
       dst->pls_enabled = src->pls_enabled;
+      dst->downscale_cbufs = src->downscale_cbufs;
 
       dst->viewmask = src->viewmask;
       pipe_resource_reference(&dst->zsbuf.texture, src->zsbuf.texture);
@@ -281,42 +285,4 @@ util_sample_locations_flip_y(struct pipe_screen *screen, unsigned fb_height,
    }
 
    memcpy(locations, new_locations, grid_width * grid_height * samples);
-}
-
-void
-util_framebuffer_init(struct pipe_context *pctx, const struct pipe_framebuffer_state *fb, struct pipe_surface **cbufs, struct pipe_surface **zsbuf)
-{
-   if (fb) {
-      for (unsigned i = 0; i < fb->nr_cbufs; i++) {
-         if (cbufs[i] && pipe_surface_equal(&fb->cbufs[i], cbufs[i]))
-            continue;
-
-         struct pipe_surface *psurf = fb->cbufs[i].texture ? pctx->create_surface(pctx, fb->cbufs[i].texture, &fb->cbufs[i]) : NULL;
-         if (cbufs[i])
-            pipe_surface_unref(pctx, &cbufs[i]);
-         cbufs[i] = psurf;
-      }
-
-      for (unsigned i = fb->nr_cbufs; i < PIPE_MAX_COLOR_BUFS; i++) {
-         if (cbufs[i])
-            pipe_surface_unref(pctx, &cbufs[i]);
-         cbufs[i] = NULL;
-      }
-
-      if (*zsbuf && pipe_surface_equal(&fb->zsbuf, *zsbuf))
-         return;
-      struct pipe_surface *zsurf = fb->zsbuf.texture ? pctx->create_surface(pctx, fb->zsbuf.texture, &fb->zsbuf) : NULL;
-      if (*zsbuf)
-         pipe_surface_unref(pctx, zsbuf);
-      *zsbuf = zsurf;
-   } else {
-      for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
-         if (cbufs[i])
-            pipe_surface_unref(pctx, &cbufs[i]);
-         cbufs[i] = NULL;
-      }
-      if (*zsbuf)
-         pipe_surface_unref(pctx, zsbuf);
-      *zsbuf = NULL;
-   }
 }

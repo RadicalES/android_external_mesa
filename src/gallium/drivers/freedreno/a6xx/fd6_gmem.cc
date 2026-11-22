@@ -10,6 +10,7 @@
 #include <stdio.h>
 
 #include "pipe/p_state.h"
+#include "util/format/format_utils.h"
 #include "util/format/u_format.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
@@ -67,6 +68,14 @@ emit_mrt(fd_crb &crb, struct pipe_framebuffer_state *pfb,
       enum a6xx_tile_mode tile_mode = (enum a6xx_tile_mode)
             fd_resource_tile_mode(psurf->texture, psurf->level);
       enum a6xx_format format = fd6_color_format(pformat, tile_mode);
+
+      /* NV12 renders the chroma plane as a second MRT; YUYV doesn't need
+       * this.
+       */
+      bool planar_yuv = fd_format_is_planar_yuv(pformat);
+      if (fd_resource_ubwc_enabled(rsc, psurf->level) && planar_yuv)
+         format = FMT6_R8_G8B8_2PLANE_420_UNORM;
+
       sint = util_format_is_pure_sint(pformat);
       uint = util_format_is_pure_uint(pformat);
 
@@ -78,7 +87,36 @@ emit_mrt(fd_crb &crb, struct pipe_framebuffer_state *pfb,
 
       stride = fd_resource_pitch(rsc, psurf->level);
       array_stride = fd_resource_layer_stride(rsc, psurf->level);
+      uint32_t ubwc_offset = fd_resource_ubwc_offset(rsc, psurf->level, psurf->first_layer);
+      uint32_t flag_array_stride = rsc->layout.ubwc_layer_size;
       swap = fd6_color_swap(pformat, (enum a6xx_tile_mode)rsc->layout.tile_mode, false);
+
+      /* Handle Multiplanar YUV (Linear and UBWC NV12) */
+      struct fd_resource *uv_rsc =
+         planar_yuv ? fd_resource_plane(psurf->texture, 1) : NULL;
+      uint32_t uv_offset = 0;
+      uint32_t uv_stride = 0;
+      uint32_t uv_array_stride = 0;
+      uint32_t uv_ubwc_offset = 0;
+      uint32_t uv_flag_array_stride = 0;
+      bool uv_ubwc = false;
+
+      if (planar_yuv) {
+         uv_offset = fd_resource_offset(uv_rsc, psurf->level, psurf->first_layer);
+         uv_stride = fd_resource_pitch(uv_rsc, psurf->level);
+         uv_array_stride = fd_resource_layer_stride(uv_rsc, psurf->level);
+         uv_ubwc = fd_resource_ubwc_enabled(uv_rsc, psurf->level);
+         if (uv_ubwc) {
+            uv_ubwc_offset = fd_resource_ubwc_offset(uv_rsc, psurf->level, psurf->first_layer);
+            array_stride = uv_offset - offset;
+            flag_array_stride = uv_ubwc_offset - ubwc_offset;
+
+            /* The UV plane array pitch must match the Y plane array pitch */
+            uv_array_stride = array_stride;
+            /* UV flag stride is flag buffer size only, not mixed with pixel data */
+            uv_flag_array_stride = uv_rsc->layout.ubwc_layer_size;
+         }
+      }
 
       max_layer_index = psurf->last_layer - psurf->first_layer;
 
@@ -107,12 +145,48 @@ emit_mrt(fd_crb &crb, struct pipe_framebuffer_state *pfb,
 
       crb.add(A6XX_RB_COLOR_FLAG_BUFFER_ADDR(i,
          .bo = rsc->bo,
-         .bo_offset = fd_resource_ubwc_offset(rsc, psurf->level, psurf->first_layer),
+         .bo_offset = ubwc_offset,
       ));
       crb.add(A6XX_RB_COLOR_FLAG_BUFFER_PITCH(i,
          .pitch = fdl_ubwc_pitch(&rsc->layout, psurf->level),
-         .array_pitch = rsc->layout.ubwc_layer_size >> 2,
+         .array_pitch = flag_array_stride >> 2,
       ));
+
+      if (planar_yuv) {
+         int idx = i + 1; /* MRT1 for UV plane */
+         uint32_t uv_base_gmem = gmem ? gmem->cbuf_base[idx] : 0;
+
+         crb.attach_bo(uv_rsc->bo);
+
+         crb.add(RB_MRT_BUF_INFO(CHIP, idx,
+            .color_format = format,
+            .color_tile_mode = tile_mode,
+            .color_swap = WZYX,
+            .losslesscompen = uv_ubwc,
+         ));
+
+         crb.add(A6XX_RB_MRT_PITCH(idx, uv_stride));
+         crb.add(A6XX_RB_MRT_ARRAY_PITCH(idx, uv_array_stride));
+         crb.add(A6XX_RB_MRT_BASE(idx, .bo = uv_rsc->bo, .bo_offset = uv_offset));
+         crb.add(A6XX_RB_MRT_BASE_GMEM(idx, uv_base_gmem));
+
+         crb.add(A6XX_SP_PS_MRT_REG(idx,
+            .color_format = (enum a6xx_format)0,
+            .color_sint = false,
+            .color_uint = false
+         ));
+
+         /* For UBWC, set the UV plane's UBWC flag buffer address and pitch.
+          */
+         crb.add(A6XX_RB_COLOR_FLAG_BUFFER_ADDR(idx,
+            .bo = uv_ubwc ? uv_rsc->bo : NULL,
+            .bo_offset = uv_ubwc ? uv_ubwc_offset : 0,
+         ));
+         crb.add(A6XX_RB_COLOR_FLAG_BUFFER_PITCH(idx,
+            .pitch = uv_ubwc ? fdl_ubwc_pitch(&uv_rsc->layout, psurf->level) : 0,
+            .array_pitch = uv_ubwc ? uv_flag_array_stride >> 2 : 0,
+         ));
+      }
 
       if (i == 0)
          mrt0_format = format;
@@ -225,7 +299,7 @@ lrzfc_enabled(struct fd_resource *zsbuf)
 {
    if ((CHIP < A7XX) || FD_DBG(NOLRZFC) || !zsbuf)
       return false;
-   return zsbuf->lrz_layout.lrz_fc_size > 0;
+   return fdl6_lrz_fc_fully_covered(&zsbuf->lrz_layout);
 }
 
 template <chip CHIP>
@@ -409,28 +483,28 @@ patch_fb_read_gmem(struct fd_batch *batch)
       if (CHIP <= A7XX) {
          uint64_t base = screen->gmem_base + gmem->cbuf_base[buf];
          uint32_t descriptor[FDL6_TEX_CONST_DWORDS] = {
-               A6XX_TEX_CONST_0_FMT(fd6_texture_format(
+               A6XX_TEX_MEMOBJ_0_FMT(fd6_texture_format(
                      format, (enum a6xx_tile_mode)rsc->layout.tile_mode, false)) |
-               A6XX_TEX_CONST_0_SAMPLES(fd_msaa_samples(prsc->nr_samples)) |
-               A6XX_TEX_CONST_0_SWAP(WZYX) |
-               A6XX_TEX_CONST_0_TILE_MODE(TILE6_2) |
-               COND(util_format_is_srgb(format), A6XX_TEX_CONST_0_SRGB) |
-               A6XX_TEX_CONST_0_SWIZ_X(fdl6_swiz(swiz[0])) |
-               A6XX_TEX_CONST_0_SWIZ_Y(fdl6_swiz(swiz[1])) |
-               A6XX_TEX_CONST_0_SWIZ_Z(fdl6_swiz(swiz[2])) |
-               A6XX_TEX_CONST_0_SWIZ_W(fdl6_swiz(swiz[3])),
+               A6XX_TEX_MEMOBJ_0_SAMPLES(fd_msaa_samples(pfb->samples)) |
+               A6XX_TEX_MEMOBJ_0_SWAP(WZYX) |
+               A6XX_TEX_MEMOBJ_0_TILE_MODE(TILE6_2) |
+               COND(util_format_is_srgb(format), A6XX_TEX_MEMOBJ_0_SRGB) |
+               A6XX_TEX_MEMOBJ_0_SWIZ_X(fdl6_swiz(swiz[0])) |
+               A6XX_TEX_MEMOBJ_0_SWIZ_Y(fdl6_swiz(swiz[1])) |
+               A6XX_TEX_MEMOBJ_0_SWIZ_Z(fdl6_swiz(swiz[2])) |
+               A6XX_TEX_MEMOBJ_0_SWIZ_W(fdl6_swiz(swiz[3])),
 
-            A6XX_TEX_CONST_1_WIDTH(pfb->width) |
-               A6XX_TEX_CONST_1_HEIGHT(pfb->height),
+            A6XX_TEX_MEMOBJ_1_WIDTH(pfb->width) |
+               A6XX_TEX_MEMOBJ_1_HEIGHT(pfb->height),
 
-            A6XX_TEX_CONST_2_PITCH(gmem->bin_w * gmem->cbuf_cpp[buf]) |
-               A6XX_TEX_CONST_2_TYPE(A6XX_TEX_2D),
+            A6XX_TEX_MEMOBJ_2_PITCH(gmem->bin_w * gmem->cbuf_cpp[buf]) |
+               A6XX_TEX_MEMOBJ_2_TYPE(A6XX_TEX_2D),
 
-            A6XX_TEX_CONST_3_ARRAY_PITCH(rsc->layout.layer_size),
-            A6XX_TEX_CONST_4_BASE_LO(base),
+            A6XX_TEX_MEMOBJ_3_ARRAY_PITCH(rsc->layout.layer_size),
+            A6XX_TEX_MEMOBJ_4_BASE_LO(base),
 
-            A6XX_TEX_CONST_5_BASE_HI(base >> 32) |
-               A6XX_TEX_CONST_5_DEPTH(prsc->array_size)
+            A6XX_TEX_MEMOBJ_5_BASE_HI(base >> 32) |
+               A6XX_TEX_MEMOBJ_5_DEPTH(prsc->array_size)
          };
 
          memcpy(patch->cs, descriptor, FDL6_TEX_CONST_DWORDS * 4);
@@ -446,7 +520,7 @@ patch_fb_read_gmem(struct fd_batch *batch)
 
             A8XX_TEX_MEMOBJ_2_WIDTH(pfb->width) |
             A8XX_TEX_MEMOBJ_2_HEIGHT(pfb->height) |
-            A8XX_TEX_MEMOBJ_2_SAMPLES(fd_msaa_samples(prsc->nr_samples)),
+            A8XX_TEX_MEMOBJ_2_SAMPLES(fd_msaa_samples(pfb->samples)),
 
             A8XX_TEX_MEMOBJ_3_FMT(fd6_texture_format(
                      format, (enum a6xx_tile_mode)rsc->layout.tile_mode, false)) |
@@ -513,7 +587,16 @@ patch_fb_read_sysmem(struct fd_batch *batch)
          .chroma_offsets = {FDL_CHROMA_LOCATION_COSITED_EVEN,
                             FDL_CHROMA_LOCATION_COSITED_EVEN},
       };
-      const struct fdl_layout *layouts[3] = {&rsc->layout, NULL, NULL};
+      struct fd_resource *plane1 =
+         fd_resource(util_resource_at_index(prsc, 1));
+      struct fd_resource *plane2 =
+         fd_resource(util_resource_at_index(prsc, 2));
+      static const struct fdl_layout dummy_layout = {};
+      const struct fdl_layout *layouts[3] = {
+         &rsc->layout,
+         plane1 ? &plane1->layout : &dummy_layout,
+         plane2 ? &plane2->layout : &dummy_layout,
+      };
       struct fdl6_view view;
       fdl6_view_init<CHIP>(&view, layouts, &args,
                            batch->ctx->screen->info->props.has_z24uint_s8uint);
@@ -562,6 +645,13 @@ update_render_cntl(fd_cs &cs, struct fd_screen *screen,
 
       if (fd_resource_ubwc_enabled(rsc, psurf->level))
          mrts_ubwc_enable |= 1 << i;
+
+      /* Chroma plane is MRT(i+1); flag it too if it's UBWC. */
+      if (fd_format_is_planar_yuv(psurf->format)) {
+         struct fd_resource *uv_rsc = fd_resource_plane(psurf->texture, 1);
+         if (fd_resource_ubwc_enabled(uv_rsc, psurf->level))
+            mrts_ubwc_enable |= 1 << (i + 1);
+      }
    }
 
    struct fd_reg_pair rb_render_cntl = RB_RENDER_CNTL(
@@ -1162,7 +1252,7 @@ fd6_build_preemption_preamble(struct fd_context *ctx, bool gmem)
       fd7_emit_static_binning_regs<CHIP>(cs, gmem);
    }
 
-   /* TODO use CP_MEM_TO_SCRATCH_MEM on a7xx. The VSC scratch mem should be
+   /* TODO use CP_MEM_TO_OC_MEM on a7xx. The VSC scratch mem should be
     * automatically saved, unlike GPU registers, so we wouldn't have to
     * manually restore this state.
     */
@@ -1328,7 +1418,7 @@ set_window_offset(fd_crb &crb, uint32_t x1, uint32_t y1)
    crb.add(A6XX_RB_RESOLVE_WINDOW_OFFSET(.x = x1, .y = y1));
    crb.add(SP_WINDOW_OFFSET(CHIP, .x = x1, .y = y1));
    crb.add(A6XX_TPL1_WINDOW_OFFSET(.x = x1, .y = y1));
-   if (CHIP >= A8XX)
+   if (CHIP >= A7XX)
       crb.add(TPL1_A2D_WINDOW_OFFSET(CHIP, .x = x1, .y = y1));
 }
 
@@ -1483,6 +1573,14 @@ emit_blit(struct fd_batch *batch, fd_crb &crb, uint32_t base,
    enum a6xx_tile_mode tile_mode = (enum a6xx_tile_mode)
          fd_resource_tile_mode(&rsc->b.b, psurf->level);
    enum a6xx_format format = fd6_color_format(pfmt, tile_mode);
+
+   /* UBWC NV12 uses FMT6_R8_G8B8_2PLANE_420_UNORM.  Keyed off the format
+    * since this is also reached per-plane from emit_resolve_blit().
+    */
+   if (ubwc_enabled && fd_format_is_planar_yuv(pfmt)) {
+      format = FMT6_R8_G8B8_2PLANE_420_UNORM;
+   }
+
    uint32_t stride = fd_resource_pitch(rsc, psurf->level);
    uint32_t array_stride = fd_resource_layer_stride(rsc, psurf->level);
    enum a3xx_color_swap swap =
@@ -1521,21 +1619,31 @@ emit_blit(struct fd_batch *batch, fd_crb &crb, uint32_t base,
 template <chip CHIP>
 static void
 emit_restore_blit(struct fd_batch *batch, fd_cs &cs, uint32_t base,
-                  struct pipe_surface *psurf, unsigned buffer)
+                  struct pipe_surface *psurf, unsigned buffer, bool is_uv_plane = false)
 {
    bool stencil = (buffer == FD_BUFFER_STENCIL);
 
-   with_crb (cs, 11) {
+   with_crb (cs, 12) {
       crb.add(A6XX_RB_RESOLVE_OPERATION(
          .type = BLIT_EVENT_LOAD,
          .sample_0 = util_format_is_pure_integer(psurf->format),
          .depth = (buffer == FD_BUFFER_DEPTH),
       ));
 
+      crb.add(A6XX_RB_RESOLVE_CNTL_0(.yuv_plane_id = (uint32_t)(is_uv_plane ? 1 : 0)));
       emit_blit<CHIP>(batch, crb, base, psurf, stencil);
    }
 
    fd6_event_write<CHIP>(batch->ctx, cs, FD_CCU_RESOLVE);
+}
+
+/* Pack YUVA clear color bytes in WZYX hardware order: A=byte3, V=byte2,
+ * U=byte1, Y=byte0.
+ */
+static inline uint32_t
+pack_yuva_wzyx(uint8_t y, uint8_t u, uint8_t v, uint8_t a)
+{
+   return ((uint32_t)a << 24) | ((uint32_t)v << 16) | ((uint32_t)u << 8) | (uint32_t)y;
 }
 
 template <chip CHIP>
@@ -1561,37 +1669,121 @@ emit_subpass_clears(struct fd_batch *batch, fd_cs &cs, struct fd_batch_subpass *
             continue;
 
          enum pipe_format pfmt = pfb->cbufs[i].format;
+         struct fd_resource *rsc = fd_resource(pfb->cbufs[i].texture);
 
          // XXX I think RB_CLEAR_COLOR_DWn wants to take into account SWAP??
          union pipe_color_union swapped;
-         switch (fd6_color_swap(pfmt, TILE6_LINEAR, false)) {
-         case WZYX:
-            swapped.ui[0] = color->ui[0];
-            swapped.ui[1] = color->ui[1];
-            swapped.ui[2] = color->ui[2];
-            swapped.ui[3] = color->ui[3];
-            break;
-         case WXYZ:
-            swapped.ui[2] = color->ui[0];
-            swapped.ui[1] = color->ui[1];
-            swapped.ui[0] = color->ui[2];
-            swapped.ui[3] = color->ui[3];
-            break;
-         case ZYXW:
-            swapped.ui[3] = color->ui[0];
-            swapped.ui[0] = color->ui[1];
-            swapped.ui[1] = color->ui[2];
-            swapped.ui[2] = color->ui[3];
-            break;
-         case XYZW:
-            swapped.ui[3] = color->ui[0];
-            swapped.ui[2] = color->ui[1];
-            swapped.ui[1] = color->ui[2];
-            swapped.ui[0] = color->ui[3];
-            break;
-         }
+         enum a3xx_color_swap swap = fd6_color_swap(pfmt, TILE6_LINEAR, false);
 
-         util_pack_color_union(pfmt, &uc, &swapped);
+         if (util_format_is_yuv(pfmt)) {
+            /* Per GL_EXT_YUV_target spec: "When clearing YUV Color Buffers,
+             * clear color should be defined in yuv color space and so floating
+             * point r, g, and b value will be mapped to corresponding y, u and v
+             * value and alpha channel will be ignored."
+             *
+             * Application passes YUV values directly via glClearColor(y, u, v, a):
+             *   color->f[0] = Y
+             *   color->f[1] = U
+             *   color->f[2] = V
+             *   color->f[3] = A (ignored)
+             */
+            uint8_t y = _mesa_float_to_unorm(color->f[0], 8);
+            uint8_t u = _mesa_float_to_unorm(color->f[1], 8);
+            uint8_t v = _mesa_float_to_unorm(color->f[2], 8);
+            uint8_t a = _mesa_float_to_unorm(color->f[3], 8);
+
+            bool ubwc = fd_resource_ubwc_enabled(rsc, pfb->cbufs[i].level);
+
+            /* Y and UV are separate GMEM buffers sharing one clear color:
+             * clear each in turn via RB_RESOLVE_CNTL_0.yuv_plane_id.  YUYV
+             * falls through below.
+             */
+            if (fd_format_is_planar_yuv(pfmt)) {
+               /* UBWC needs the 2-plane format; linear uses whatever the
+                * format table maps this YUV format to.
+                */
+               enum a6xx_format clear_format =
+                  ubwc ? FMT6_R8_G8B8_2PLANE_420_UNORM
+                       : fd6_color_format(pfmt, TILE6_LINEAR);
+
+               /* Plane 0: Y */
+               with_crb (cs, 10) {
+                  crb.add(A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO(
+                     .tile_mode = TILE6_LINEAR,
+                     .flags = ubwc,
+                     .samples = samples,
+                     .color_swap = WZYX,
+                     .color_format = clear_format,
+                  ));
+
+                  crb.add(A6XX_RB_RESOLVE_OPERATION(
+                     .type = BLIT_EVENT_CLEAR,
+                     .clear_mask = 0xf,
+                  ));
+
+                  crb.add(A6XX_RB_RESOLVE_GMEM_BUFFER_INFO(.samples = samples));
+                  crb.add(A6XX_RB_RESOLVE_GMEM_BUFFER_BASE(gmem->cbuf_base[i]));
+                  crb.add(A6XX_RB_RESOLVE_CNTL_0());
+
+                  crb.add(A6XX_RB_RESOLVE_CLEAR_COLOR_DW0(pack_yuva_wzyx(y, u, v, a)));
+                  crb.add(A6XX_RB_RESOLVE_CLEAR_COLOR_DW1(0));
+                  crb.add(A6XX_RB_RESOLVE_CLEAR_COLOR_DW2(0));
+                  crb.add(A6XX_RB_RESOLVE_CLEAR_COLOR_DW3(0));
+
+                  if (CHIP >= A7XX)
+                     crb.add(RB_CLEAR_TARGET(CHIP, .clear_mode = CLEAR_MODE_GMEM));
+               }
+
+               fd6_event_write<CHIP>(batch->ctx, cs, FD_CCU_RESOLVE);
+
+               with_crb (cs, 4) {
+                  crb.add(A6XX_RB_RESOLVE_GMEM_BUFFER_INFO(.samples = samples));
+                  crb.add(A6XX_RB_RESOLVE_GMEM_BUFFER_BASE(gmem->cbuf_base[i + 1]));
+                  crb.add(A6XX_RB_RESOLVE_CNTL_0(.yuv_plane_id = 1));
+
+                  if (CHIP >= A7XX)
+                     crb.add(RB_CLEAR_TARGET(CHIP, .clear_mode = CLEAR_MODE_GMEM));
+               }
+
+               fd6_event_write<CHIP>(batch->ctx, cs, FD_CCU_RESOLVE);
+
+               continue;
+            }
+
+            if (swap == WZYX)
+               uc.ui[0] = pack_yuva_wzyx(y, u, v, a);
+            else
+               uc.ui[0] = pack_yuva_wzyx(a, v, u, y);
+         } else {
+            switch (swap) {
+            case WZYX:
+               swapped.ui[0] = color->ui[0];
+               swapped.ui[1] = color->ui[1];
+               swapped.ui[2] = color->ui[2];
+               swapped.ui[3] = color->ui[3];
+               break;
+            case WXYZ:
+               swapped.ui[2] = color->ui[0];
+               swapped.ui[1] = color->ui[1];
+               swapped.ui[0] = color->ui[2];
+               swapped.ui[3] = color->ui[3];
+               break;
+            case ZYXW:
+               swapped.ui[3] = color->ui[0];
+               swapped.ui[0] = color->ui[1];
+               swapped.ui[1] = color->ui[2];
+               swapped.ui[2] = color->ui[3];
+               break;
+            case XYZW:
+               swapped.ui[3] = color->ui[0];
+               swapped.ui[2] = color->ui[1];
+               swapped.ui[1] = color->ui[2];
+               swapped.ui[0] = color->ui[3];
+               break;
+            }
+
+            util_pack_color_union(pfmt, &uc, &swapped);
+         }
 
          with_crb (cs, 9) {
             crb.add(A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO(
@@ -1718,8 +1910,18 @@ emit_restore_blits(struct fd_batch *batch, fd_cs &cs)
             continue;
          if (!(batch->restore & (PIPE_CLEAR_COLOR0 << i)))
             continue;
-         emit_restore_blit<CHIP>(batch, cs, gmem->cbuf_base[i], &pfb->cbufs[i],
+
+         struct pipe_surface *psurf = &pfb->cbufs[i];
+
+         emit_restore_blit<CHIP>(batch, cs, gmem->cbuf_base[i], psurf,
                                  FD_BUFFER_COLOR);
+
+         if (fd_format_is_planar_yuv(psurf->format)) {
+            struct pipe_surface uv_surf = *psurf;
+            uv_surf.texture = &fd_resource_plane(psurf->texture, 1)->b.b;
+            emit_restore_blit<CHIP>(batch, cs, gmem->cbuf_base[i + 1], &uv_surf,
+                                    FD_BUFFER_COLOR, true);
+         }
       }
    }
 
@@ -1797,6 +1999,9 @@ blit_can_resolve(enum pipe_format format)
    if (util_format_is_snorm(format) || util_format_is_srgb(format))
       return false;
 
+   if (util_format_is_yuv(format))
+      return false;
+
    /* can't do formats with larger channel sizes
     * note: this includes all float formats
     * note2: single channel integer formats seem OK
@@ -1830,23 +2035,6 @@ needs_resolve(struct pipe_surface *psurf)
           (psurf->nr_samples != psurf->texture->nr_samples);
 }
 
-/**
- * Returns the UNKNOWN_8C01 value for handling partial depth/stencil
- * clear/stores to Z24S8.
- */
-static uint32_t
-fd6_unknown_8c01(enum pipe_format format, unsigned buffers)
-{
-   buffers &= FD_BUFFER_DEPTH | FD_BUFFER_STENCIL;
-   if (format == PIPE_FORMAT_Z24_UNORM_S8_UINT) {
-      if (buffers == FD_BUFFER_DEPTH)
-         return 0x08000041;
-      else if (buffers == FD_BUFFER_STENCIL)
-         return 0x00084001;
-   }
-   return 0;
-}
-
 template <chip CHIP>
 static void
 emit_resolve_blit(struct fd_batch *batch, fd_cs &cs,
@@ -1859,6 +2047,19 @@ emit_resolve_blit(struct fd_batch *batch, fd_cs &cs,
    if (!fd_resource(psurf->texture)->valid)
       return;
 
+   uint32_t uv_base = 0;
+   if (buffer == FD_BUFFER_COLOR) {
+      struct pipe_framebuffer_state *pfb = &batch->framebuffer;
+      const struct fd_gmem_stateobj *gmem = batch->gmem_state;
+      for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
+         if (pfb->cbufs[i].texture == psurf->texture) {
+            if (fd_format_is_planar_yuv(psurf->format))
+               uv_base = gmem->cbuf_base[i + 1];
+            break;
+         }
+      }
+   }
+
    /* if we need to resolve, but cannot with BLIT event, we instead need
     * to generate per-tile CP_BLIT (r2d) commands:
     *
@@ -1867,12 +2068,12 @@ emit_resolve_blit(struct fd_batch *batch, fd_cs &cs,
     */
    if (needs_resolve(psurf) && !blit_can_resolve(psurf->format) &&
        (buffer != FD_BUFFER_STENCIL)) {
-      /* We could potentially use fd6_unknown_8c01() to handle partial z/s
+      /* We could potentially use RB_A2D_PIXEL_CNTL to handle partial z/s
        * resolve to packed z/s, but we would need a corresponding ability in the
        * !resolve case below, so batch_draw_tracking_for_dirty_bits() has us
        * just do a restore of the other channel for partial packed z/s writes.
        */
-      fd6_resolve_tile<CHIP>(batch, cs, base, psurf, 0);
+      fd6_resolve_tile<CHIP>(batch, cs, base, uv_base, psurf, FD_BUFFER_ALL);
       return;
    }
 
@@ -1893,12 +2094,27 @@ emit_resolve_blit(struct fd_batch *batch, fd_cs &cs,
        util_format_is_depth_or_stencil(psurf->format))
       info |= A6XX_RB_RESOLVE_OPERATION_SAMPLE_0;
 
-   with_crb (cs, 11) {
+   with_crb (cs, 12) {
       crb.add(A6XX_RB_RESOLVE_OPERATION(.dword = info));
+      crb.add(A6XX_RB_RESOLVE_CNTL_0(.yuv_plane_id = 0));
       emit_blit<CHIP>(batch, crb, base, psurf, stencil);
    }
 
    fd6_event_write<CHIP>(batch->ctx, cs, FD_CCU_RESOLVE);
+
+   if (uv_base) {
+      /* Second BLIT_EVENT_STORE for the chroma plane. */
+      struct pipe_surface uv_psurf = *psurf;
+      uv_psurf.texture = &fd_resource_plane(psurf->texture, 1)->b.b;
+
+      with_crb (cs, 12) {
+         crb.add(A6XX_RB_RESOLVE_OPERATION(.dword = info));
+         crb.add(A6XX_RB_RESOLVE_CNTL_0(.yuv_plane_id = 1));
+         emit_blit<CHIP>(batch, crb, uv_base, &uv_psurf, stencil);
+      }
+
+      fd6_event_write<CHIP>(batch->ctx, cs, FD_CCU_RESOLVE);
+   }
 }
 
 /*
@@ -1940,6 +2156,7 @@ prepare_tile_fini(struct fd_batch *batch)
             continue;
          if (!(batch->resolve & (PIPE_CLEAR_COLOR0 << i)))
             continue;
+
          emit_resolve_blit<CHIP>(batch, cs, gmem->cbuf_base[i],
                                  &pfb->cbufs[i], FD_BUFFER_COLOR);
       }
@@ -1974,9 +2191,6 @@ fd6_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
 {
    fd_cs cs(batch->gmem);
 
-   if (batch->epilogue)
-      fd6_emit_ib<CHIP>(cs, batch->epilogue);
-
    if (use_hw_binning(batch)) {
       fd6_set_render_mode<CHIP>(cs, {.mode = RM6_BIN_END_OF_DRAWS, .uses_gmem = true});
    }
@@ -2006,6 +2220,9 @@ fd6_emit_tile_fini(struct fd_batch *batch)
    fd_cs cs(batch->gmem);
 
    emit_common_fini<CHIP>(cs, batch);
+
+   if (batch->epilogue)
+      fd6_emit_ib<CHIP>(cs, batch->epilogue);
 
    fd_pkt4(cs, 1)
       .add(GRAS_LRZ_CNTL(CHIP, .enable = true));
@@ -2047,7 +2264,42 @@ emit_sysmem_clears(fd_cs &cs, struct fd_batch *batch, struct fd_batch_subpass *s
          if (!(buffers & (PIPE_CLEAR_COLOR0 << i)))
             continue;
 
-         fd6_clear_surface<CHIP>(ctx, cs, &pfb->cbufs[i], &box2d, &color, 0);
+         struct pipe_surface *psurf = &pfb->cbufs[i];
+         struct fd_resource *rsc = fd_resource(psurf->texture);
+
+         /* Linear NV12 has no single blitter format, so clear each plane as
+          * its non-YUV equivalent.  (UBWC uses the native path in
+          * fd6_clear_surface() below.)
+          */
+         bool clear_planes_separately =
+            !fd_resource_ubwc_enabled(rsc, psurf->level) &&
+            fd_format_is_planar_yuv(psurf->format);
+
+         if (clear_planes_separately) {
+            /* Plane 0: Y plane cleared as R8_UNORM */
+            struct pipe_surface y_surf = *psurf;
+            y_surf.format = PIPE_FORMAT_R8_UNORM;
+            union pipe_color_union y_color = color; /* color.f[0] = Y value */
+            fd6_clear_surface<CHIP>(ctx, cs, &y_surf, &box2d, &y_color, 0);
+
+            /* Plane 1: UV plane cleared as R8G8_UNORM */
+            struct pipe_surface uv_surf = *psurf;
+            uv_surf.format = PIPE_FORMAT_R8G8_UNORM;
+            uv_surf.texture = &fd_resource_plane(psurf->texture, 1)->b.b;
+
+            struct pipe_box uv_box = box2d;
+            uv_box.height /= 2; /* UV plane is half height */
+            uv_box.width /= 2;  /* UV plane is half width in pairs */
+
+            union pipe_color_union uv_color;
+            memset(&uv_color, 0, sizeof(uv_color));
+            uv_color.f[0] = color.f[1];
+            uv_color.f[1] = color.f[2];
+
+            fd6_clear_surface<CHIP>(ctx, cs, &uv_surf, &uv_box, &uv_color, 0);
+         } else {
+            fd6_clear_surface<CHIP>(ctx, cs, psurf, &box2d, &color, 0);
+         }
       }
    }
 
@@ -2064,7 +2316,7 @@ emit_sysmem_clears(fd_cs &cs, struct fd_batch *batch, struct fd_batch_subpass *s
          value.f[0] = subpass->clear_depth;
          value.ui[1] = subpass->clear_stencil;
          fd6_clear_surface<CHIP>(ctx, cs, &pfb->zsbuf, &box2d,
-                                 &value, fd6_unknown_8c01(pfb->zsbuf.format, buffers));
+                                 &value, buffers);
       }
 
       if (separate_stencil && (buffers & PIPE_CLEAR_STENCIL)) {
@@ -2074,7 +2326,7 @@ emit_sysmem_clears(fd_cs &cs, struct fd_batch *batch, struct fd_batch_subpass *s
          stencil_surf.format = PIPE_FORMAT_S8_UINT;
          stencil_surf.texture = separate_stencil;
 
-         fd6_clear_surface<CHIP>(ctx, cs, &stencil_surf, &box2d, &value, 0);
+         fd6_clear_surface<CHIP>(ctx, cs, &stencil_surf, &box2d, &value, buffers);
       }
    }
 
@@ -2224,6 +2476,15 @@ fd6_emit_sysmem_fini(struct fd_batch *batch) assert_dt
 {
    fd_cs cs(batch->gmem);
 
+   batch->barrier |= FD6_FLUSH_CCU_COLOR |
+                     FD6_INVALIDATE_CCU_COLOR |
+                     FD6_INVALIDATE_CCHE |
+                     FD6_FLUSH_CACHE |
+                     FD6_WAIT_FOR_IDLE;
+
+   if (!batch->nondraw)
+      batch->barrier |= FD6_FLUSH_CCU_DEPTH | FD6_INVALIDATE_CCU_DEPTH;
+
    emit_common_fini<CHIP>(cs, batch);
 
    if (batch->tile_epilogue)
@@ -2235,15 +2496,8 @@ fd6_emit_sysmem_fini(struct fd_batch *batch) assert_dt
    fd_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1)
       .add(0x0);
 
-   fd6_event_write<CHIP>(batch->ctx, cs, FD_LRZ_FLUSH);
-
-   fd6_emit_flushes<CHIP>(batch->ctx, cs,
-                          FD6_FLUSH_CCU_COLOR |
-                          FD6_INVALIDATE_CCU_COLOR |
-                          FD6_FLUSH_CCU_DEPTH |
-                          FD6_INVALIDATE_CCU_DEPTH |
-                          FD6_INVALIDATE_CCHE |
-                          FD6_WAIT_FOR_IDLE);
+   if (!batch->nondraw)
+      fd6_event_write<CHIP>(batch->ctx, cs, FD_LRZ_FLUSH);
 }
 
 template <chip CHIP>

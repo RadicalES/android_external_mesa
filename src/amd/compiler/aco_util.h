@@ -12,6 +12,7 @@
 #include "util/macros.h"
 #include "util/u_math.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstddef>
@@ -22,7 +23,6 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 namespace aco {
 

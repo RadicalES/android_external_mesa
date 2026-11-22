@@ -31,7 +31,7 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include "device_select.h"
-#include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "linux-dmabuf-v1-client-protocol.h"
 
 struct device_select_wayland_info {
 #ifdef HAVE_BIND_WL_DISPLAY
@@ -41,6 +41,7 @@ struct device_select_wayland_info {
 
    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
    struct zwp_linux_dmabuf_feedback_v1 *wl_dmabuf_feedback;
+   struct wl_fixes *wl_fixes;
    drmDevicePtr dmabuf_dev_info;
 };
 
@@ -157,6 +158,12 @@ static const struct zwp_linux_dmabuf_feedback_v1_listener dmabuf_feedback_listen
    .done = default_dmabuf_feedback_done,
 };
 
+#if defined(WL_FIXES_ACK_GLOBAL_REMOVE)
+#define MESA_WL_FIXES_VERSION 2
+#elif defined(WL_FIXES_INTERFACE)
+#define MESA_WL_FIXES_VERSION 1
+#endif
+
 static void
 device_select_registry_global(void *data, struct wl_registry *registry, uint32_t name,
                               const char *interface, uint32_t version)
@@ -168,19 +175,30 @@ device_select_registry_global(void *data, struct wl_registry *registry, uint32_t
       wl_drm_add_listener(info->wl_drm, &ds_drm_listener, data);
    } else
 #endif
-      if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0 &&
-          version >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION) {
+   if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0 &&
+       version >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION) {
       info->wl_dmabuf = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
                                          ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION);
       info->wl_dmabuf_feedback = zwp_linux_dmabuf_v1_get_default_feedback(info->wl_dmabuf);
       zwp_linux_dmabuf_feedback_v1_add_listener(info->wl_dmabuf_feedback, &dmabuf_feedback_listener,
                                                 data);
+#ifdef MESA_WL_FIXES_VERSION
+   } else if (strcmp(interface, wl_fixes_interface.name) == 0) {
+      info->wl_fixes = wl_registry_bind(registry, name, &wl_fixes_interface, MIN2(version, MESA_WL_FIXES_VERSION));
+#endif
    }
 }
 
 static void
 device_select_registry_global_remove_cb(void *data, struct wl_registry *registry, uint32_t name)
 {
+#ifdef WL_FIXES_ACK_GLOBAL_REMOVE
+   struct device_select_wayland_info *info = data;
+
+   if (info->wl_fixes && wl_fixes_get_version(info->wl_fixes) >= WL_FIXES_ACK_GLOBAL_REMOVE_SINCE_VERSION) {
+      wl_fixes_ack_global_remove(info->wl_fixes, registry, name);
+   }
+#endif
 }
 
 int
@@ -254,6 +272,12 @@ done:
 #ifdef HAVE_BIND_WL_DISPLAY
    if (info.wl_drm)
       wl_drm_destroy(info.wl_drm);
+#endif
+#ifdef WL_FIXES_INTERFACE
+   if (info.wl_fixes) {
+      wl_fixes_destroy_registry(info.wl_fixes, registry);
+      wl_fixes_destroy(info.wl_fixes);
+   }
 #endif
 
    wl_registry_destroy(registry);

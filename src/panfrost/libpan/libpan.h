@@ -12,11 +12,7 @@
 #endif
 
 /* We now include binding definition */
-#if (PAN_ARCH == 4)
-#include "libpan_v4.h"
-#elif (PAN_ARCH == 5)
-#include "libpan_v5.h"
-#elif (PAN_ARCH == 6)
+#if (PAN_ARCH == 6)
 #include "libpan_v6.h"
 #elif (PAN_ARCH == 7)
 #include "libpan_v7.h"
@@ -24,10 +20,14 @@
 #include "libpan_v9.h"
 #elif (PAN_ARCH == 10)
 #include "libpan_v10.h"
+#elif (PAN_ARCH == 11)
+#include "libpan_v11.h"
 #elif (PAN_ARCH == 12)
 #include "libpan_v12.h"
 #elif (PAN_ARCH == 13)
 #include "libpan_v13.h"
+#elif (PAN_ARCH == 14)
+#include "libpan_v14.h"
 #else
 #error "Unsupported architecture for libpan"
 #endif

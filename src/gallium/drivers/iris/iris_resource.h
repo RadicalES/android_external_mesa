@@ -1,24 +1,6 @@
 /*
- * Copyright 2017 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * on the rights to use, copy, modify, merge, publish, distribute, sub
- * license, and/or sell copies of the Software, and to permit persons to whom
- * the Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
- * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
- * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * Copyright © 2017 Intel Corporation
+ * SPDX-License-Identifier: MIT
  */
 #ifndef IRIS_RESOURCE_H
 #define IRIS_RESOURCE_H
@@ -179,7 +161,7 @@ struct iris_resource {
  */
 struct iris_state_ref {
    struct pipe_resource *res;
-   uint32_t offset;
+   uint64_t offset;
 };
 
 /**
@@ -342,7 +324,7 @@ void iris_replace_buffer_storage(struct pipe_context *ctx,
                                  struct pipe_resource *dst,
                                  struct pipe_resource *src,
                                  unsigned num_rebinds,
-                                 uint32_t rebind_mask,
+                                 uint64_t rebind_mask,
                                  uint32_t delete_buffer_id);
 
 
@@ -493,8 +475,9 @@ bool iris_has_invalid_primary(const struct iris_resource *res,
 void iris_resource_check_level_layer(const struct iris_resource *res,
                                      uint32_t level, uint32_t layer);
 
-bool iris_sample_with_depth_aux(const struct intel_device_info *devinfo,
-                                const struct iris_resource *res);
+enum isl_aux_usage
+iris_depth_texture_aux_usage(const struct intel_device_info *devinfo,
+                             const struct iris_resource *res);
 
 bool iris_has_color_unresolved(const struct iris_resource *res,
                                unsigned start_level, unsigned num_levels,
@@ -522,4 +505,35 @@ void iris_resource_finish_render(struct iris_context *ice,
                                  enum isl_aux_usage aux_usage);
 
 void iris_surface_destroy(struct iris_surface *surf);
+
+static inline void
+iris_u_upload_alloc_ref_to_iris_state_ref(struct u_upload_mgr *upload,
+                                          unsigned min_out_offset,
+                                          unsigned size,
+                                          unsigned alignment,
+                                          struct iris_state_ref *state_ref,
+                                          void **ptr)
+{
+   uint32_t offset;
+
+   u_upload_alloc_ref(upload, min_out_offset, size, alignment, &offset,
+                      &state_ref->res, ptr);
+   state_ref->offset = offset;
+}
+
+static inline void
+iris_u_upload_data_ref_to_iris_state_ref(struct u_upload_mgr *upload,
+                                         unsigned min_out_offset,
+                                         unsigned size,
+                                         unsigned alignment,
+                                         const void *data,
+                                         struct iris_state_ref *state_ref)
+{
+   uint32_t offset;
+
+   u_upload_data_ref(upload, min_out_offset, size, alignment, data, &offset,
+                     &state_ref->res);
+   state_ref->offset = offset;
+}
+
 #endif

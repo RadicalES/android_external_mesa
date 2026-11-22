@@ -21,7 +21,12 @@
  * IN THE SOFTWARE.
  */
 
-#include "v3dv_private.h"
+#include "v3dv_device.h"
+#include "v3dv_cmd_buffer.h"
+#include "v3dv_image.h"
+#include "v3dv_entrypoints.h"
+#include "common/v3d_util.h"
+#include "perfcntrs/v3d_perfcntrs.h"
 
 #include "util/timespec.h"
 #include "compiler/nir/nir_builder.h"
@@ -286,7 +291,9 @@ v3dv_CreateQueryPool(VkDevice _device,
       /* After the counters we store avalability data, 1 byte/query */
       pool->occlusion.avail_offset = bo_size;
       bo_size += pool->query_count;
-      pool->occlusion.bo = v3dv_bo_alloc(device, bo_size, "query:o", true);
+      pool->occlusion.bo = v3dv_bo_alloc(device, bo_size, "query:o", true,
+                                         VK_OBJECT_TYPE_QUERY_POOL,
+                                         vk_object_to_u64_handle(&pool->base));
       if (!pool->occlusion.bo) {
          result = vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto fail;
@@ -319,7 +326,9 @@ v3dv_CreateQueryPool(VkDevice _device,
        * timestamps tightly packed first in the buffer.
        */
       const uint32_t bo_size = pool->query_count * 8;
-      pool->timestamp.bo = v3dv_bo_alloc(device, bo_size, "query:t", true);
+      pool->timestamp.bo = v3dv_bo_alloc(device, bo_size, "query:t", true,
+                                         VK_OBJECT_TYPE_QUERY_POOL,
+                                         vk_object_to_u64_handle(&pool->base));
       if (!pool->timestamp.bo) {
          result = vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto fail;
@@ -388,9 +397,9 @@ fail:
    }
 
    if (pool->occlusion.bo)
-      v3dv_bo_free(device, pool->occlusion.bo);
+      v3dv_bo_free(device, pool->occlusion.bo, 0);
    if (pool->timestamp.bo)
-      v3dv_bo_free(device, pool->timestamp.bo);
+      v3dv_bo_free(device, pool->timestamp.bo, 0);
    if (pool->queries)
       vk_free2(&device->vk.alloc, pAllocator, pool->queries);
    pool_destroy_meta_resources(device, pool);
@@ -411,10 +420,10 @@ v3dv_DestroyQueryPool(VkDevice _device,
       return;
 
    if (pool->occlusion.bo)
-      v3dv_bo_free(device, pool->occlusion.bo);
+      v3dv_bo_free(device, pool->occlusion.bo, 0);
 
    if (pool->timestamp.bo)
-      v3dv_bo_free(device, pool->timestamp.bo);
+      v3dv_bo_free(device, pool->timestamp.bo, 0);
 
    if (pool->query_type == VK_QUERY_TYPE_TIMESTAMP) {
       for (uint32_t i = 0; i < pool->query_count; i++)
@@ -1376,10 +1385,10 @@ v3dv_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
          counter->scope = VK_PERFORMANCE_COUNTER_SCOPE_COMMAND_KHR;
          counter->storage = VK_PERFORMANCE_COUNTER_STORAGE_UINT64_KHR;
 
-         unsigned char sha1_result[SHA1_DIGEST_LENGTH];
-         _mesa_sha1_compute(perfcntr_desc->name, strlen(perfcntr_desc->name), sha1_result);
+         unsigned char blake3_result[BLAKE3_KEY_LEN];
+         _mesa_blake3_compute(perfcntr_desc->name, strlen(perfcntr_desc->name), blake3_result);
 
-         memcpy(counter->uuid, sha1_result, sizeof(counter->uuid));
+         memcpy(counter->uuid, blake3_result, sizeof(counter->uuid));
       }
 
       vk_outarray_append_typed(VkPerformanceCounterDescriptionKHR,
@@ -1449,7 +1458,7 @@ get_set_query_availability_cs(const nir_shader_compiler_options *options)
       nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
                                 .desc_set = 0,
                                 .binding = 0,
-                                .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+                                .desc_type = nir_descriptor_type_storage_buffer);
 
    /* This assumes a local size of 1 and a horizontal-only dispatch. If we
     * ever change any of these parameters we need to update how we compute the
@@ -1512,7 +1521,7 @@ get_reset_occlusion_query_cs(const nir_shader_compiler_options *options)
       nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
                                 .desc_set = 0,
                                 .binding = 0,
-                                .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+                                .desc_type = nir_descriptor_type_storage_buffer);
 
    /* This assumes a local size of 1 and a horizontal-only dispatch. If we
     * ever change any of these parameters we need to update how we compute the
@@ -1568,13 +1577,13 @@ get_copy_query_results_cs(const nir_shader_compiler_options *options,
       nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
                                 .desc_set = 0,
                                 .binding = 0,
-                                .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+                                .desc_type = nir_descriptor_type_storage_buffer);
 
    nir_def *buf_out =
       nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
                                 .desc_set = 1,
                                 .binding = 0,
-                                .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+                                .desc_type = nir_descriptor_type_storage_buffer);
 
    /* Read push constants */
    nir_def *avail_offset =

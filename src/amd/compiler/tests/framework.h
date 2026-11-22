@@ -5,12 +5,11 @@
  */
 #ifndef ACO_TEST_COMMON_H
 #define ACO_TEST_COMMON_H
+
 #include "aco_builder.h"
-#include "aco_ir.h"
 
 #include "util/macros.h"
 
-#include "ac_shader_util.h"
 #include "amd_family.h"
 #include <map>
 #include <stdio.h>
@@ -22,7 +21,7 @@ struct TestDef {
    void (*func)();
 };
 
-extern std::map<std::string, TestDef> *tests;
+extern std::map<std::string, TestDef>* tests;
 extern FILE* output;
 
 bool set_variant(const char* name);
@@ -35,9 +34,11 @@ set_variant(amd_gfx_level cls, const char* rest = "")
       snprintf(buf, sizeof(buf), "gfx10_3%s", rest);
    } else if (cls == GFX11_5) {
       snprintf(buf, sizeof(buf), "gfx11_5%s", rest);
+   } else if (cls == GFX11_7) {
+      snprintf(buf, sizeof(buf), "gfx11_7%s", rest);
    } else {
       unsigned num = cls - GFX6 + 6;
-      num -= (cls > GFX10_3) + (cls > GFX11_5);
+      num -= (cls > GFX10_3) + ((cls > GFX11_7) ? 2 : 0);
       snprintf(buf, sizeof(buf), "gfx%d%s", num, rest);
    }
    return set_variant(buf);

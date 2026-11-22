@@ -127,6 +127,44 @@ trace_context_draw_vbo(struct pipe_context *_pipe,
 }
 
 static void
+trace_context_draw_vbo_buffers(struct pipe_context *_pipe,
+                               const struct pipe_draw_info *info,
+                               const struct pipe_vertex_buffer *buffers,
+                               unsigned buffer_count,
+                               const struct pipe_draw_start_count_bias *draws,
+                               unsigned num_draws)
+{
+   struct trace_context *tr_ctx = trace_context(_pipe);
+   struct pipe_context *pipe = tr_ctx->pipe;
+
+   if (!tr_ctx->seen_fb_state && trace_dump_is_triggered())
+      dump_fb_state(tr_ctx, "current_framebuffer_state", true);
+
+   trace_dump_call_begin("pipe_context", "draw_vbo_buffers");
+
+   trace_dump_arg(ptr,  pipe);
+   trace_dump_arg(draw_info, info);
+   trace_dump_arg(uint, buffer_count);
+
+   trace_dump_arg_begin("buffers");
+   trace_dump_struct_array(vertex_buffer, buffers, buffer_count);
+   trace_dump_arg_end();
+   trace_dump_arg_begin("draws");
+   if (info->index.resource)
+      trace_dump_struct_array(draw_start_count_indexed, draws, num_draws);
+   else
+      trace_dump_struct_array(draw_start_count, draws, num_draws);
+   trace_dump_arg_end();
+   trace_dump_arg(uint, num_draws);
+
+   trace_dump_trace_flush();
+
+   trace_dump_call_end();
+
+   pipe->draw_vbo_buffers(pipe, info, buffers, buffer_count, draws, num_draws);
+}
+
+static void
 trace_context_draw_mesh_tasks(struct pipe_context *_pipe,
                               const struct pipe_grid_info *info)
 {
@@ -1013,6 +1051,25 @@ trace_context_set_polygon_stipple(struct pipe_context *_pipe,
 }
 
 static void
+trace_context_set_sample_coverage(struct pipe_context *_pipe,
+                                  float value, bool invert)
+{
+   struct trace_context *tr_ctx = trace_context(_pipe);
+   struct pipe_context *pipe = tr_ctx->pipe;
+
+   trace_dump_call_begin("pipe_context", "set_sample_coverage");
+
+   trace_dump_arg(ptr, pipe);
+   trace_dump_arg(float, value);
+   trace_dump_arg(bool, invert);
+
+   pipe->set_sample_coverage(pipe, value, invert);
+
+   trace_dump_call_end();
+}
+
+
+static void
 trace_context_set_min_samples(struct pipe_context *_pipe,
                               unsigned min_samples)
 {
@@ -1069,6 +1126,27 @@ trace_context_set_viewport_states(struct pipe_context *_pipe,
    trace_dump_arg(viewport_state, states);
 
    pipe->set_viewport_states(pipe, start_slot, num_viewports, states);
+
+   trace_dump_call_end();
+}
+
+
+static void
+trace_context_set_sample_locations(struct pipe_context *_pipe,
+                                   size_t size, const uint8_t *locations)
+{
+   struct trace_context *tr_ctx = trace_context(_pipe);
+   struct pipe_context *pipe = tr_ctx->pipe;
+
+   trace_dump_call_begin("pipe_context", "set_sample_locations");
+
+   trace_dump_arg(ptr, pipe);
+   trace_dump_arg(uint, size);
+   trace_dump_arg_begin("locations");
+   trace_dump_bytes(locations, size);
+   trace_dump_arg_end();
+
+   pipe->set_sample_locations(pipe, size, locations);
 
    trace_dump_call_end();
 }
@@ -1411,6 +1489,8 @@ trace_context_flush_resource(struct pipe_context *_pipe,
 static void
 trace_context_clear(struct pipe_context *_pipe,
                     unsigned buffers,
+                    uint32_t color_clear_mask,
+                    uint8_t stencil_clear_mask,
                     const struct pipe_scissor_state *scissor_state,
                     const union pipe_color_union *color,
                     double depth,
@@ -1423,6 +1503,8 @@ trace_context_clear(struct pipe_context *_pipe,
 
    trace_dump_arg(ptr, pipe);
    trace_dump_arg(uint, buffers);
+   trace_dump_arg(uint, color_clear_mask);
+   trace_dump_arg(uint, stencil_clear_mask);
    trace_dump_arg_begin("scissor_state");
    trace_dump_scissor_state(scissor_state);
    trace_dump_arg_end();
@@ -1433,7 +1515,7 @@ trace_context_clear(struct pipe_context *_pipe,
    trace_dump_arg(float, depth);
    trace_dump_arg(uint, stencil);
 
-   pipe->clear(pipe, buffers, scissor_state, color, depth, stencil);
+   pipe->clear(pipe, buffers, color_clear_mask, stencil_clear_mask, scissor_state, color, depth, stencil);
 
    trace_dump_call_end();
 }
@@ -2508,6 +2590,7 @@ trace_context_create(struct trace_screen *tr_scr,
    tr_ctx->base . _member = pipe -> _member ? trace_context_ ## _member : NULL
 
    TR_CTX_INIT(draw_vbo);
+   TR_CTX_INIT(draw_vbo_buffers);
    TR_CTX_INIT(draw_mesh_tasks);
    TR_CTX_INIT(draw_vertex_state);
    TR_CTX_INIT(render_condition);
@@ -2563,6 +2646,7 @@ trace_context_create(struct trace_screen *tr_scr,
    TR_CTX_INIT(set_stencil_ref);
    TR_CTX_INIT(set_clip_state);
    TR_CTX_INIT(set_sample_mask);
+   TR_CTX_INIT(set_sample_coverage);
    TR_CTX_INIT(set_constant_buffer);
    TR_CTX_INIT(set_framebuffer_state);
    TR_CTX_INIT(set_inlinable_constants);
@@ -2571,6 +2655,7 @@ trace_context_create(struct trace_screen *tr_scr,
    TR_CTX_INIT(set_scissor_states);
    TR_CTX_INIT(set_viewport_states);
    TR_CTX_INIT(set_sampler_views);
+   TR_CTX_INIT(set_sample_locations);
    TR_CTX_INIT(create_sampler_view);
    TR_CTX_INIT(sampler_view_destroy);
    TR_CTX_INIT(sampler_view_release);

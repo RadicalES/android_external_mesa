@@ -79,6 +79,7 @@
 #include "loader_dri_helper.h"
 #include "util/u_debug.h"
 #include "dri_util.h"
+#include "dri_screen.h"
 
 static struct dri3_drawable *
 loader_drawable_to_dri3_drawable(struct loader_dri3_drawable *draw) {
@@ -342,16 +343,13 @@ dri3_flush_swap_buffers(struct dri_drawable *driDrawable, void *loaderPrivate)
 /* The image loader extension record for DRI3
  */
 static const __DRIimageLoaderExtension imageLoaderExtension = {
-   .base = { __DRI_IMAGE_LOADER, 3 },
-
    .getBuffers          = loader_dri3_get_buffers,
    .flushFrontBuffer    = dri3_flush_front_buffer,
    .flushSwapBuffers    = dri3_flush_swap_buffers,
 };
 
-static const __DRIextension *loader_extensions[] = {
-   &imageLoaderExtension.base,
-   NULL
+static const struct dri_loader_funcs loader_funcs = {
+   .image = &imageLoaderExtension,
 };
 
 /** dri3_swap_buffers
@@ -441,6 +439,8 @@ static const struct glx_context_vtable dri3_context_vtable = {
    .unbind              = dri_unbind_context,
    .wait_gl             = dri3_wait_gl,
    .wait_x              = dri3_wait_x,
+   .copy_context        = __glXCopyContext,
+   .swap_buffers        = __glXSwapBuffers,
 };
 
 /** dri3_create_screen
@@ -459,7 +459,7 @@ struct glx_screen *
 dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_inferred, bool *return_zink)
 {
    xcb_connection_t *c = XGetXCBConnection(priv->dpy);
-   const struct dri_config **driver_configs;
+   const struct dri_config **driver_configs = NULL;
    struct dri3_screen *psc;
    __GLXDRIscreen *psp;
    char *driverName, *driverNameDisplayGPU;
@@ -510,10 +510,11 @@ dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_in
           */
          if (strcmp(driverName, driverNameDisplayGPU) == 0) {
             psc->driScreenDisplayGPU = driCreateNewScreen3(screen, psc->fd_display_gpu,
-                                                           loader_extensions,
+                                                           &loader_funcs,
                                                            DRI_SCREEN_DRI3,
                                                            &driver_configs, driver_name_is_inferred,
                                                            priv->has_multibuffer, psc);
+            driDestroyConfigs(driver_configs);
          }
 
          free(driverNameDisplayGPU);
@@ -521,7 +522,7 @@ dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_in
    }
    priv->driver = GLX_DRIVER_DRI3;
 
-   if (!dri_screen_init(&psc->base, priv, screen, psc->fd_render_gpu, loader_extensions, driver_name_is_inferred)) {
+   if (!dri_screen_init(&psc->base, priv, screen, psc->fd_render_gpu, &loader_funcs, driver_name_is_inferred)) {
       ErrorMessageF("glx: failed to create dri3 screen\n");
       goto handle_error;
    }

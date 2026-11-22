@@ -50,7 +50,7 @@ ir3_parser = custom_target(
   input: 'ir3_parser.y',
   output: ['ir3_parser.c', 'ir3_parser.h'],
   command: [
-    prog_bison, '@INPUT@', '--name-prefix=ir3_yy', '--defines=@OUTPUT1@', '--output=@OUTPUT0@'
+    prog_bison, '@INPUT@', '--name-prefix=ir3_yy', '--defines=@OUTPUT1@', '--output=@OUTPUT0@', '-Werror', '-Wcounterexamples'
   ]
 )
 
@@ -84,13 +84,14 @@ libfreedreno_ir3_files = files(
   'ir3_dce.c',
   'ir3_delay.c',
   'ir3_dominance.c',
-  'ir3_disk_cache.c',
+  'ir3_disk_cache.cpp',
   'ir3_image.c',
   'ir3_image.h',
   'ir3.h',
   'ir3_legalize.c',
   'ir3_legalize_relative.c',
   'ir3_liveness.c',
+  'ir3_lower_copies_validate.c',
   'ir3_lower_parallelcopy.c',
   'ir3_lower_shared_phi.c',
   'ir3_lower_spill.c',
@@ -108,7 +109,6 @@ libfreedreno_ir3_files = files(
   'ir3_nir_lower_io_offsets.c',
   'ir3_nir_lower_tess.c',
   'ir3_nir_lower_tex_prefetch.c',
-  'ir3_nir_move_varying_inputs.c',
   'ir3_nir_lower_layer_id.c',
   'ir3_nir_opt_preamble.c',
   'ir3_opt_predicates.c',
@@ -134,9 +134,17 @@ libfreedreno_ir3_files = files(
 
 libfreedreno_ir3 = static_library(
   'freedreno_ir3',
-  [libfreedreno_ir3_files, ir3_nir_trig_c, ir3_nir_imul_c, ir3_nir_branch_and_or_not_c, ir3_nir_triop_bitwise_c, ir3_parser[0], ir3_parser[1], ir3_lexer],
+  [libfreedreno_ir3_files,
+    ir3_nir_trig_c,
+    ir3_nir_imul_c,
+    ir3_nir_branch_and_or_not_c,
+    ir3_nir_triop_bitwise_c,
+    ir3_parser[0], ir3_parser[1],
+    ir3_lexer,
+  ],
   include_directories : [inc_freedreno, inc_include, inc_src],
-  c_args : [no_override_init_args],
+  c_args : [no_override_init_args, soong_compat_c_args],
+  cpp_args : [soong_compat_cpp_args],
   gnu_symbol_visibility : 'hidden',
   link_with: [libir3encode, libfreedreno_common],
   dependencies : [idep_libir3decode, idep_nir_headers, dep_dl, idep_mesautil],

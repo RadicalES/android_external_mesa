@@ -286,16 +286,16 @@ nvc0_resource_copy_region(struct pipe_context *pipe,
 }
 
 static void
-nvc0_clear_render_target(struct pipe_context *pipe,
-                         struct pipe_surface *dst,
-                         const union pipe_color_union *color,
-                         unsigned dstx, unsigned dsty,
-                         unsigned width, unsigned height,
-                         bool render_condition_enabled)
+nvc0_clear_render_target_internal(struct pipe_context *pipe,
+                                  struct nv50_surface *sf,
+                                  const union pipe_color_union *color,
+                                  unsigned dstx, unsigned dsty,
+                                  unsigned width, unsigned height,
+                                  bool render_condition_enabled)
 {
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nouveau_pushbuf *push = nvc0->base.pushbuf;
-   struct nv50_surface *sf = nv50_surface(dst);
+   struct pipe_surface *dst = &sf->base;
    struct nv04_resource *res = nv04_resource(sf->base.texture);
    unsigned z;
 
@@ -367,6 +367,30 @@ nvc0_clear_render_target(struct pipe_context *pipe,
       IMMED_NVC0(push, NVC0_3D(COND_MODE), nvc0->cond_condmode);
 
    nvc0->dirty_3d |= NVC0_NEW_3D_FRAMEBUFFER;
+}
+
+/* Callers may pass a plain pipe_surface template, such as a plane returned
+ * by pipe_video_buffer::get_surfaces, rather than a surface made by
+ * nvc0_miptree_surface_new. Reading nv50_surface fields from a template
+ * reads past its end, so build the driver surface here.
+ */
+static void
+nvc0_clear_render_target(struct pipe_context *pipe,
+                         struct pipe_surface *dst,
+                         const union pipe_color_union *color,
+                         unsigned dstx, unsigned dsty,
+                         unsigned width, unsigned height,
+                         bool render_condition_enabled)
+{
+   struct pipe_surface *ps = nvc0_miptree_surface_new(pipe, dst->texture, dst);
+
+   if (!ps)
+      return;
+
+   nvc0_clear_render_target_internal(pipe, nv50_surface(ps), color,
+                                     dstx, dsty, width, height,
+                                     render_condition_enabled);
+   nv50_surface_destroy(pipe, ps);
 }
 
 static void
@@ -620,19 +644,19 @@ nvc0_clear_buffer(struct pipe_context *pipe,
 }
 
 static void
-nvc0_clear_depth_stencil(struct pipe_context *pipe,
-                         struct pipe_surface *dst,
-                         unsigned clear_flags,
-                         double depth,
-                         unsigned stencil,
-                         unsigned dstx, unsigned dsty,
-                         unsigned width, unsigned height,
-                         bool render_condition_enabled)
+nvc0_clear_depth_stencil_internal(struct pipe_context *pipe,
+                                  struct nv50_surface *sf,
+                                  unsigned clear_flags,
+                                  double depth,
+                                  unsigned stencil,
+                                  unsigned dstx, unsigned dsty,
+                                  unsigned width, unsigned height,
+                                  bool render_condition_enabled)
 {
    struct nvc0_context *nvc0 = nvc0_context(pipe);
    struct nouveau_pushbuf *push = nvc0->base.pushbuf;
+   struct pipe_surface *dst = &sf->base;
    struct nv50_miptree *mt = nv50_miptree(dst->texture);
-   struct nv50_surface *sf = nv50_surface(dst);
    uint32_t mode = 0;
    int unk = mt->base.base.target == PIPE_TEXTURE_2D;
    unsigned z;
@@ -691,8 +715,30 @@ nvc0_clear_depth_stencil(struct pipe_context *pipe,
    nvc0->dirty_3d |= NVC0_NEW_3D_FRAMEBUFFER;
 }
 
+static void
+nvc0_clear_depth_stencil(struct pipe_context *pipe,
+                         struct pipe_surface *dst,
+                         unsigned clear_flags,
+                         double depth,
+                         unsigned stencil,
+                         unsigned dstx, unsigned dsty,
+                         unsigned width, unsigned height,
+                         bool render_condition_enabled)
+{
+   struct pipe_surface *ps = nvc0_miptree_surface_new(pipe, dst->texture, dst);
+
+   if (!ps)
+      return;
+
+   nvc0_clear_depth_stencil_internal(pipe, nv50_surface(ps), clear_flags,
+                                     depth, stencil, dstx, dsty, width, height,
+                                     render_condition_enabled);
+   nv50_surface_destroy(pipe, ps);
+}
+
 void
 nvc0_clear(struct pipe_context *pipe, unsigned buffers,
+           uint32_t color_clear_mask, uint8_t stencil_clear_mask,
            const struct pipe_scissor_state *scissor_state,
            const union pipe_color_union *color,
            double depth, unsigned stencil)
@@ -962,26 +1008,26 @@ nvc0_blit_set_dst(struct nvc0_blitctx *ctx,
 {
    struct nvc0_context *nvc0 = ctx->nvc0;
    struct pipe_context *pipe = &nvc0->base.pipe;
-   struct pipe_surface templ;
 
-   /* We are going to reset this, so no point in refcounting */
-   templ.texture = res;
    if (util_format_is_depth_or_stencil(format))
-      templ.format = nv50_blit_zeta_to_colour_format(format);
-   else
-      templ.format = format;
+      format = nv50_blit_zeta_to_colour_format(format);
 
-   templ.level = level;
-   templ.first_layer = templ.last_layer = layer;
+   /* this will be overwritten (not released) at the end of the blit */
+   nvc0->framebuffer.cbufs[0] = (struct pipe_surface) {
+      .texture = res,
+      .format = format,
+      .level = level,
+      .first_layer = layer,
+      .last_layer = layer,
+   };
 
    if (layer == -1) {
-      templ.first_layer = 0;
-      templ.last_layer =
+      nvc0->framebuffer.cbufs[0].first_layer = 0;
+      nvc0->framebuffer.cbufs[0].last_layer =
          (res->target == PIPE_TEXTURE_3D ? res->depth0 : res->array_size) - 1;
    }
 
-   nvc0->framebuffer.cbufs[0] = templ;
-   nvc0->fb_cbufs[0] = nvc0_miptree_surface_new(pipe, res, &templ);
+   nvc0->fb_cbufs[0] = nvc0_miptree_surface_new(pipe, res, &nvc0->framebuffer.cbufs[0]);
    nvc0->framebuffer.nr_cbufs = 1;
    memset(&nvc0->framebuffer.zsbuf, 0, sizeof(nvc0->framebuffer.zsbuf));
    pipe_surface_size(&nvc0->framebuffer.cbufs[0], &nvc0->framebuffer.width, &nvc0->framebuffer.height);

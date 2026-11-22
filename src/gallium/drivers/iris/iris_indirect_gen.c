@@ -1,4 +1,5 @@
-/* Copyright © 2023 Intel Corporation
+/*
+ * Copyright © 2023 Intel Corporation
  * SPDX-License-Identifier: MIT
  */
 
@@ -57,6 +58,8 @@
 # include "intel_gfx200_shaders_binding.h"
 #elif GFX_VERx10 == 300
 # include "intel_gfx300_shaders_binding.h"
+#elif GFX_VERx10 == 350
+# include "intel_gfx350_shaders_binding.h"
 #else
 # error "Unsupported generation"
 #endif
@@ -76,7 +79,7 @@
 static nir_def *
 load_fragment_index(nir_builder *b)
 {
-   nir_def *pos_in = nir_f2i32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   nir_def *pos_in = nir_f2i32(b, nir_build_frag_coord(b, 2));
    return nir_iadd(b,
                    nir_imul_imm(b, nir_channel(b, pos_in, 1), 8192),
                    nir_channel(b, pos_in, 0));
@@ -123,7 +126,7 @@ upload_state(struct iris_batch *batch,
              unsigned alignment)
 {
    void *p = NULL;
-   u_upload_alloc_ref(uploader, 0, size, alignment, &ref->offset, &ref->res, &p);
+   iris_u_upload_alloc_ref_to_iris_state_ref(uploader, 0, size, alignment, ref, &p);
    iris_use_pinned_bo(batch, iris_resource_bo(ref->res), false, IRIS_DOMAIN_NONE);
    return p;
 }
@@ -134,19 +137,21 @@ stream_state(struct iris_batch *batch,
              struct pipe_resource **out_res,
              unsigned size,
              unsigned alignment,
-             uint32_t *out_offset)
+             uint64_t *out_offset)
 {
    void *ptr = NULL;
+   uint32_t res_offset;
 
-   u_upload_alloc_ref(uploader, 0, size, alignment, out_offset, out_res, &ptr);
+   u_upload_alloc_ref(uploader, 0, size, alignment, &res_offset, out_res, &ptr);
 
    struct iris_bo *bo = iris_resource_bo(*out_res);
    iris_use_pinned_bo(batch, bo, false, IRIS_DOMAIN_NONE);
 
-   iris_record_state_size(batch->state_sizes,
+   *out_offset = res_offset;
+   iris_record_state_size(bo->bufmgr, batch->state_sizes,
                           bo->address + *out_offset, size);
-
-   *out_offset += iris_bo_offset_from_base_address(bo);
+   *out_offset += iris_bufmgr_is_eff_64bit_enabled(bo->bufmgr) ?
+                     bo->address : iris_bo_offset_from_base_address(bo);
 
    return ptr;
 }
@@ -158,6 +163,7 @@ emit_indirect_generate_draw(struct iris_batch *batch,
                             unsigned ring_count)
 {
    struct iris_screen *screen = batch->screen;
+   struct iris_bufmgr *bufmgr = screen->bufmgr;
    struct iris_context *ice = batch->ice;
    struct isl_device *isl_dev = &screen->isl_dev;
    const struct intel_device_info *devinfo = screen->devinfo;
@@ -286,13 +292,13 @@ emit_indirect_generate_draw(struct iris_batch *batch,
 
    iris_emit_cmd(batch, GENX(3DSTATE_PS), ps) {
 #if GFX_VER >= 9
-      struct brw_wm_prog_data *wm_prog_data = brw_wm_prog_data(shader->brw_prog_data);
+      struct brw_fs_prog_data *fs_prog_data = brw_fs_prog_data(shader->brw_prog_data);
 #else
-      struct elk_wm_prog_data *wm_prog_data = elk_wm_prog_data(shader->elk_prog_data);
+      struct elk_fs_prog_data *fs_prog_data = elk_fs_prog_data(shader->elk_prog_data);
 #endif
-      intel_set_ps_dispatch_state(&ps, devinfo, wm_prog_data,
+      intel_set_ps_dispatch_state(&ps, devinfo, fs_prog_data,
                                   1 /* rasterization_samples */,
-                                  0 /* msaa_flags */);
+                                  0 /* fs_config */);
 
       ps.VectorMaskEnable       = fs_data->uses_vmask;
 
@@ -303,41 +309,42 @@ emit_indirect_generate_draw(struct iris_batch *batch,
 
 #if GFX_VER >= 9
       ps.DispatchGRFStartRegisterForConstantSetupData0 =
-         brw_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 0);
+         brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 0);
       ps.DispatchGRFStartRegisterForConstantSetupData1 =
-         brw_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 1);
+         brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 1);
 #if GFX_VER < 20
       ps.DispatchGRFStartRegisterForConstantSetupData2 =
-         brw_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 2);
+         brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 2);
 #endif
 
       ps.KernelStartPointer0 = KSP(ice->draw.generation.shader) +
-         brw_wm_prog_data_prog_offset(wm_prog_data, ps, 0);
+         brw_fs_prog_data_prog_offset(fs_prog_data, ps, 0);
       ps.KernelStartPointer1 = KSP(ice->draw.generation.shader) +
-         brw_wm_prog_data_prog_offset(wm_prog_data, ps, 1);
+         brw_fs_prog_data_prog_offset(fs_prog_data, ps, 1);
 #if GFX_VER < 20
       ps.KernelStartPointer2 = KSP(ice->draw.generation.shader) +
-         brw_wm_prog_data_prog_offset(wm_prog_data, ps, 2);
+         brw_fs_prog_data_prog_offset(fs_prog_data, ps, 2);
 #endif
 
 #if GFX_VER >= 30
-      ps.RegistersPerThread = ptl_register_blocks(wm_prog_data->base.grf_used);
+      ps.RegistersPerThread =
+         intel_register_blocks(devinfo, fs_prog_data->base.grf_used);
 #endif
 
 #else
       ps.DispatchGRFStartRegisterForConstantSetupData0 =
-         elk_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 0);
+         elk_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 0);
       ps.DispatchGRFStartRegisterForConstantSetupData1 =
-         elk_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 1);
+         elk_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 1);
       ps.DispatchGRFStartRegisterForConstantSetupData2 =
-         elk_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 2);
+         elk_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 2);
 
       ps.KernelStartPointer0 = KSP(ice->draw.generation.shader) +
-         elk_wm_prog_data_prog_offset(wm_prog_data, ps, 0);
+         elk_fs_prog_data_prog_offset(fs_prog_data, ps, 0);
       ps.KernelStartPointer1 = KSP(ice->draw.generation.shader) +
-         elk_wm_prog_data_prog_offset(wm_prog_data, ps, 1);
+         elk_fs_prog_data_prog_offset(fs_prog_data, ps, 1);
       ps.KernelStartPointer2 = KSP(ice->draw.generation.shader) +
-         elk_wm_prog_data_prog_offset(wm_prog_data, ps, 2);
+         elk_fs_prog_data_prog_offset(fs_prog_data, ps, 2);
 #endif
 
       ps.MaximumNumberofThreadsPerPSD = devinfo->max_threads_per_psd - 1;
@@ -359,20 +366,31 @@ emit_indirect_generate_draw(struct iris_batch *batch,
       psx.PixelShaderComputesStencil = fs_data->computed_stencil;
 #endif
       psx.PixelShaderHasUAV = GFX_VER == 8;
+
+#if INTEL_WA_16030144090_GFX_VER
+      assert(!fs_data->is_per_sample);
+#endif
    }
 
-   iris_emit_cmd(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC), cc) {
-      uint32_t cc_vp_address;
-      uint32_t *cc_vp_map =
-         stream_state(batch, ice->state.dynamic_uploader,
-                      &ice->state.last_res.cc_vp,
-                      4 * GENX(CC_VIEWPORT_length), 32, &cc_vp_address);
+   uint64_t cc_vp_address;
+   uint32_t *cc_vp_map = stream_state(batch, ice->state.dynamic_uploader,
+                                      &ice->state.last_res.cc_vp,
+                                      4 * GENX(CC_VIEWPORT_length), 32, &cc_vp_address);
 
-      iris_pack_state(GENX(CC_VIEWPORT), cc_vp_map, ccv) {
-         ccv.MinimumDepth = 0.0f;
-         ccv.MaximumDepth = 1.0f;
+   iris_pack_state(GENX(CC_VIEWPORT), cc_vp_map, ccv) {
+      ccv.MinimumDepth = 0.0f;
+      ccv.MaximumDepth = 1.0f;
+   }
+   if (GFX_VERx10 >= 350 && iris_bufmgr_is_eff_64bit_enabled(bufmgr)) {
+#if GFX_VERx10 >= 350
+      iris_emit_cmd(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC_2), cc) {
+         cc.CCViewportPointer = ro_bo(NULL, cc_vp_address);
       }
-      cc.CCViewportPointer = cc_vp_address;
+#endif
+   } else {
+      iris_emit_cmd(batch, GENX(3DSTATE_VIEWPORT_STATE_POINTERS_CC), cc) {
+         cc.CCViewportPointer = cc_vp_address;
+      }
    }
 
 #if GFX_VER >= 12

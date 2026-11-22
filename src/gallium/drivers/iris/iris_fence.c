@@ -1,26 +1,7 @@
 /*
  * Copyright © 2018 Intel Corporation
+ * SPDX-License-Identifier: MIT
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included
- * in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
- * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
-
-/**
  * @file iris_fence.c
  *
  * Fences for driver and IPC serialisation, scheduling and synchronisation.
@@ -186,6 +167,18 @@ struct pipe_fence_handle {
    struct iris_fine_fence *fine[IRIS_BATCH_COUNT];
 };
 
+static struct pipe_fence_handle*
+iris_fence_create(void)
+{
+   struct pipe_fence_handle *fence = calloc(1, sizeof(*fence));
+   if (!fence)
+      return NULL;
+
+   pipe_reference_init(&fence->ref, 1);
+
+   return fence;
+}
+
 static void
 iris_fence_destroy(struct pipe_screen *p_screen,
                    struct pipe_fence_handle *fence)
@@ -208,6 +201,34 @@ iris_fence_reference(struct pipe_screen *p_screen,
       iris_fence_destroy(p_screen, *dst);
 
    *dst = src;
+}
+
+static struct pipe_fence_handle*
+iris_fence_from_syncobj(struct iris_syncobj *syncobj)
+{
+   struct iris_fine_fence *fine = calloc(1, sizeof(*fine));
+   if (!fine)
+      return NULL;
+
+   struct pipe_fence_handle *fence = iris_fence_create();
+   if (!fence) {
+      free(fine);
+      return NULL;
+   }
+
+   static const uint32_t zero = 0;
+
+   /* Fences work in terms of iris_fine_fence, but we don't actually have a
+    * seqno for an imported fence.  So, create a fake one which always
+    * returns as 'not signaled' so we fall back to using the sync object.
+    */
+   fine->seqno = UINT32_MAX;
+   fine->map = &zero;
+   fine->syncobj = syncobj;
+   pipe_reference_init(&fine->reference, 1);
+   fence->fine[0] = fine;
+
+   return fence;
 }
 
 bool
@@ -275,11 +296,9 @@ iris_fence_flush(struct pipe_context *ctx,
    if (!out_fence)
       return;
 
-   struct pipe_fence_handle *fence = calloc(1, sizeof(*fence));
+   struct pipe_fence_handle *fence = iris_fence_create();
    if (!fence)
       return;
-
-   pipe_reference_init(&fence->ref, 1);
 
    if (deferred)
       fence->unflushed_ctx = ctx;
@@ -543,6 +562,23 @@ iris_fence_get_fd(struct pipe_screen *p_screen,
    return fd;
 }
 
+static struct pipe_fence_handle *
+iris_semaphore_create(struct pipe_screen *p_screen)
+{
+   struct iris_screen *screen = (struct iris_screen *)p_screen;
+   struct iris_syncobj *syncobj = iris_create_syncobj(screen->bufmgr);
+   if (!syncobj)
+      return NULL;
+
+   struct pipe_fence_handle *fence = iris_fence_from_syncobj(syncobj);
+   if (!fence) {
+      iris_syncobj_destroy(screen->bufmgr, syncobj);
+      return NULL;
+   }
+
+   return fence;
+}
+
 static void
 iris_fence_create_fd(struct pipe_context *ctx,
                      struct pipe_fence_handle **out,
@@ -578,33 +614,12 @@ iris_fence_create_fd(struct pipe_context *ctx,
    syncobj->handle = args.handle;
    pipe_reference_init(&syncobj->ref, 1);
 
-   struct iris_fine_fence *fine = calloc(1, sizeof(*fine));
-   if (!fine) {
-      free(syncobj);
-      *out = NULL;
-      return;
-   }
-
-   static const uint32_t zero = 0;
-
-   /* Fences work in terms of iris_fine_fence, but we don't actually have a
-    * seqno for an imported fence.  So, create a fake one which always
-    * returns as 'not signaled' so we fall back to using the sync object.
-    */
-   fine->seqno = UINT32_MAX;
-   fine->map = &zero;
-   fine->syncobj = syncobj;
-   pipe_reference_init(&fine->reference, 1);
-
-   struct pipe_fence_handle *fence = calloc(1, sizeof(*fence));
+   struct pipe_fence_handle *fence = iris_fence_from_syncobj(syncobj);
    if (!fence) {
-      free(fine);
       free(syncobj);
       *out = NULL;
       return;
    }
-   pipe_reference_init(&fence->ref, 1);
-   fence->fine[0] = fine;
 
    *out = fence;
 }
@@ -642,6 +657,7 @@ iris_init_screen_fence_functions(struct pipe_screen *screen)
    screen->fence_reference = iris_fence_reference;
    screen->fence_finish = iris_fence_finish;
    screen->fence_get_fd = iris_fence_get_fd;
+   screen->semaphore_create = iris_semaphore_create;
 }
 
 void

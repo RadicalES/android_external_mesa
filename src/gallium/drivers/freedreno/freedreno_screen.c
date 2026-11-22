@@ -12,6 +12,7 @@
 
 #include "util/format/u_format.h"
 #include "util/format/u_format_s3tc.h"
+#include "util/os_misc.h"
 #include "util/u_debug.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
@@ -25,7 +26,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "drm-uapi/drm_fourcc.h"
-#include <sys/sysinfo.h>
 
 #include "freedreno_fence.h"
 #include "freedreno_perfetto.h"
@@ -125,11 +125,17 @@ fd_screen_get_timestamp(struct pipe_screen *pscreen)
    if (screen->has_timestamp) {
       uint64_t n;
       fd_pipe_get_param(screen->pipe, FD_TIMESTAMP, &n);
-      return ticks_to_ns(n);
+      return fd_ticks_to_ns(n);
    } else {
       int64_t cpu_time = os_time_get_nano();
       return cpu_time + screen->cpu_gpu_time_delta;
    }
+}
+
+static uint64_t
+fd_screen_convert_timestamp(struct pipe_screen *pscreen, uint64_t raw_timestamp)
+{
+   return fd_ticks_to_ns(raw_timestamp);
 }
 
 static void
@@ -143,6 +149,11 @@ fd_screen_destroy(struct pipe_screen *pscreen)
    if (screen->tess_bo)
       fd_bo_del(screen->tess_bo);
 
+   for (int i = 0; i < ARRAY_SIZE(screen->pvtmem); i++) {
+      if (screen->pvtmem[i].bo)
+         fd_bo_del(screen->pvtmem[i].bo);
+   }
+
    if (screen->pipe)
       fd_pipe_del(screen->pipe);
 
@@ -153,6 +164,8 @@ fd_screen_destroy(struct pipe_screen *pscreen)
 
    if (screen->ro)
       screen->ro->destroy(screen->ro);
+
+   fd_perfcntr_state_free(screen->perfcntrs);
 
    fd_bc_fini(&screen->batch_cache);
    fd_gmem_screen_fini(pscreen);
@@ -175,18 +188,21 @@ fd_screen_destroy(struct pipe_screen *pscreen)
 static uint64_t
 get_memory_size(struct fd_screen *screen)
 {
-   uint64_t system_memory;
+   float percent = screen->driconf.heap_memory_percent;
+   uint64_t va_size = 0;
 
-   if (!os_get_total_physical_memory(&system_memory))
-      return 0;
-   if (fd_device_version(screen->dev) >= FD_VERSION_VA_SIZE) {
-      uint64_t va_size;
-      if (!fd_pipe_get_param(screen->pipe, FD_VA_SIZE, &va_size)) {
-         system_memory = MIN2(system_memory, va_size);
-      }
-   }
+   if (fd_device_version(screen->dev) >= FD_VERSION_VA_SIZE)
+      fd_pipe_get_param(screen->pipe, FD_VA_SIZE, &va_size);
 
-   return system_memory;
+   if (percent == OS_GPU_HEAP_SIZE_HEURISTIC)
+      percent = va_size ? 0.5f : 1.0f;
+
+   uint64_t memory = os_get_gpu_heap_size(percent, NULL);
+
+   if (va_size)
+      memory = MIN2(memory, va_size);
+
+   return memory;
 }
 
 static void
@@ -264,6 +280,7 @@ fd_init_shader_caps(struct fd_screen *screen)
          (is_a5xx(screen) || is_a6xx(screen)) &&
          (i == MESA_SHADER_COMPUTE || i == MESA_SHADER_FRAGMENT) &&
          !FD_DBG(NOFP16);
+      caps->fp16_no_denorms = caps->fp16 && screen->gen < 8;
       caps->glsl_16bit_load_dst = true;
 
       caps->max_texture_samplers =
@@ -314,43 +331,47 @@ fd_init_shader_caps(struct fd_screen *screen)
 static void
 fd_init_compute_caps(struct fd_screen *screen)
 {
-   const struct fd_dev_info *info = screen->info;
    struct pipe_compute_caps *caps =
       (struct pipe_compute_caps *)&screen->base.compute_caps;
 
    if (!has_compute(screen))
       return;
 
+   /* all things that support compute are ir3 (no a2xx compute): */
+
    struct ir3_compiler *compiler = screen->compiler;
+   const nir_shader_compiler_options *options =
+      ir3_get_compiler_options(compiler);
 
    caps->address_bits = screen->gen >= 5 ? 64 : 32;
 
    caps->grid_dimension = 3;
 
-   caps->max_grid_size[0] =
-   caps->max_grid_size[1] =
-   caps->max_grid_size[2] = 65535;
+   caps->max_grid_size[0] = options->max_workgroup_count[0];
+   caps->max_grid_size[1] = options->max_workgroup_count[1];
+   caps->max_grid_size[2] = options->max_workgroup_count[2];
 
-   caps->max_block_size[0] = 1024;
-   caps->max_block_size[1] = 1024;
-   caps->max_block_size[2] = 64;
+   caps->max_threads_per_block = options->max_workgroup_invocations;
 
-   caps->max_threads_per_block = info->threadsize_base * info->max_waves;
+   caps->max_block_size[0] =
+   caps->max_block_size[1] =
+   caps->max_block_size[2] = MIN2(1024, caps->max_threads_per_block);
 
-   if (is_a6xx(screen) && info->props.supports_double_threadsize)
-      caps->max_threads_per_block *= 2;
-
-   caps->max_global_size = screen->ram_size;
+   caps->max_global_size = os_get_gpu_heap_size(1.0f, NULL);
 
    caps->max_local_size = screen->info->cs_shared_mem_size;
 
-   caps->max_mem_alloc_size = screen->ram_size;
+   caps->max_mem_alloc_size = caps->max_global_size;
 
    caps->max_clock_frequency = screen->max_freq / 1000000;
 
    caps->max_compute_units = screen->info->num_sp_cores;
 
-   caps->subgroup_sizes = screen->info->max_waves;
+   caps->subgroup_sizes = screen->info->threadsize_base;
+   if (screen->info->props.supports_double_threadsize)
+      caps->subgroup_sizes |= 2 * screen->info->threadsize_base;
+
+   caps->max_subgroups = screen->info->max_waves;
 
    caps->max_variable_threads_per_block = compiler->max_variable_workgroup_size;
 }
@@ -387,10 +408,13 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->glsl_tess_levels_as_inputs = true;
    caps->texture_mirror_clamp_to_edge = true;
    caps->gl_spirv = true;
+   caps->cl_gl_sharing = true;
    caps->fbfetch_coherent = true;
    caps->has_const_bw = true;
 
    caps->copy_between_compressed_and_plain_formats =
+      is_a5xx(screen) || is_a6xx(screen);
+
    caps->multi_draw_indirect =
    caps->draw_parameters =
    caps->multi_draw_indirect_params =
@@ -435,6 +459,9 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->clip_halfz =
       is_a3xx(screen) || is_a4xx(screen) || is_a5xx(screen) || is_a6xx(screen);
 
+   /* a2xx has no depth export from the pixel shader */
+   caps->fragment_shader_depth = !is_a2xx(screen);
+
    caps->texture_multisample =
    caps->image_store_formatted =
    caps->image_load_formatted = is_a5xx(screen) || is_a6xx(screen);
@@ -443,7 +470,7 @@ fd_init_screen_caps(struct fd_screen *screen)
 
    caps->surface_sample_count = is_a6xx(screen);
 
-   caps->depth_clip_disable = is_a3xx(screen) || is_a4xx(screen) || is_a6xx(screen);
+   caps->depth_clip_disable = !is_a2xx(screen);
 
    caps->post_depth_coverage =
    caps->depth_clip_disable_separate =
@@ -534,7 +561,7 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->fbfetch =
       fd_device_version(screen->dev) >= FD_VERSION_GMEM_BASE && is_a6xx(screen) ?
       screen->max_rts : 0;
-   caps->sample_shading = is_a6xx(screen);
+   caps->sample_shading = is_a5xx(screen) || is_a6xx(screen);
 
    caps->context_priority_mask = screen->priority_mask;
 
@@ -575,6 +602,8 @@ fd_init_screen_caps(struct fd_screen *screen)
     */
    caps->gl_clamp = is_a2xx(screen);
 
+   caps->needs_split_planar_samplers = true;
+
    caps->clip_planes =
       /* Gens that support GS, have GS lowered into a quasi-VS which confuses
        * the frontend clip-plane lowering.  So we handle this in the backend
@@ -600,9 +629,7 @@ fd_init_screen_caps(struct fd_screen *screen)
       (is_a5xx(screen) ? 0 : 1);
 
    /* Stream output. */
-   caps->max_vertex_streams =
-      (is_a6xx(screen) && !screen->info->props.is_a702) ?  /* has SO + GS */
-         PIPE_MAX_SO_BUFFERS : 0;
+   caps->max_vertex_streams = screen->info->props.num_xfb_streams;
    caps->max_stream_output_buffers = is_ir3(screen) ? PIPE_MAX_SO_BUFFERS : 0;
    caps->stream_output_pause_resume =
    caps->stream_output_interleave_buffers =
@@ -632,7 +659,8 @@ fd_init_screen_caps(struct fd_screen *screen)
 
    /* Render targets. */
    caps->max_render_targets = screen->max_rts;
-   caps->max_dual_source_render_targets = (is_a3xx(screen) || is_a6xx(screen)) ? 1 : 0;
+   caps->max_dual_source_render_targets =
+      (is_a3xx(screen) || is_a5xx(screen) || is_a6xx(screen)) ? 1 : 0;
 
    /* Queries. */
    caps->occlusion_query =
@@ -641,11 +669,12 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->query_time_elapsed =
       /* only a4xx, requires new enough kernel so we know max_freq: */
       (screen->max_freq > 0) && (is_a4xx(screen) || is_a5xx(screen) || is_a6xx(screen));
-   caps->timer_resolution = ticks_to_ns(1);
+   caps->timer_resolution = fd_ticks_to_ns(1);
    caps->query_buffer_object =
    caps->query_so_overflow =
    caps->query_pipeline_statistics_single = is_a6xx(screen);
 
+   caps->device_type = PIPE_DEVICE_TYPE_INTEGRATED_GPU;
    caps->vendor_id = 0x5143;
    caps->device_id = 0xFFFFFFFF;
 
@@ -680,7 +709,50 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->max_texture_anisotropy = 16.0f;
    caps->max_texture_lod_bias = 15.0f;
 
-   caps->shader_clock = is_a6xx(screen);
+   if (is_a6xx(screen)) {
+      caps->shader_clock = true;
+
+      caps->shader_subgroup_size = screen->info->threadsize_base *
+         (screen->info->props.supports_double_threadsize ? 2 : 1);
+      caps->shader_subgroup_supported_stages = BITFIELD_BIT(MESA_SHADER_COMPUTE);
+      caps->shader_subgroup_supported_features =
+         PIPE_SHADER_SUBGROUP_FEATURE_BASIC |
+         PIPE_SHADER_SUBGROUP_FEATURE_VOTE |
+         PIPE_SHADER_SUBGROUP_FEATURE_ARITHMETIC |
+         PIPE_SHADER_SUBGROUP_FEATURE_BALLOT |
+         PIPE_SHADER_SUBGROUP_FEATURE_ROTATE |
+         PIPE_SHADER_SUBGROUP_FEATURE_ROTATE_CLUSTERED |
+         PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE |
+         PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE_RELATIVE |
+         PIPE_SHADER_SUBGROUP_FEATURE_CLUSTERED |
+         0;
+      if (screen->info->props.has_getfiberid) {
+         caps->shader_subgroup_supported_stages |=
+            BITFIELD_MASK(MESA_SHADER_STAGES);
+         caps->shader_subgroup_supported_features |=
+            PIPE_SHADER_SUBGROUP_FEATURE_QUAD;
+      }
+
+      caps->shader_ballot = caps->shader_subgroup_size <= 64;
+
+      /* Up to 16 bytes are accelerated */
+      caps->hw_clear_buffer_sizes = 1 | 2 | 4 | 8 | 16;
+   }
+
+   /* All of the varying outputs go into the VPC, which counts towards our
+    * max_outputs cap.  We do skip this on 5xx, where the HW actually supports
+    * 128 (https://vulkan.gpuinfo.org/displayreport.php?id=2037#properties) but
+    * we only claim 64.
+    *
+    * MESA_SHADER_TESS_CTRL is left as default, because that mask is the
+    * per-patch built-ins rather than fixed-function outputs.
+    */
+   if (!is_a5xx(screen)) {
+      caps->ignored_output_varyings[MESA_SHADER_VERTEX] =
+         caps->ignored_output_varyings[MESA_SHADER_TESS_EVAL] =
+            caps->ignored_output_varyings[MESA_SHADER_GEOMETRY] =
+               caps->ignored_output_varyings[MESA_SHADER_MESH] = 0;
+   }
 }
 
 static const struct nir_shader_compiler_options *
@@ -852,6 +924,22 @@ fd_screen_get_fd(struct pipe_screen *pscreen)
    return fd_device_fd(screen->dev);
 }
 
+static void
+__debug_init(void)
+{
+   fd_mesa_debug = debug_get_option_fd_mesa_debug();
+
+   if (FD_DBG(NOBIN))
+      fd_binning_enabled = false;
+}
+
+static void
+fd_screen_debug_init(void)
+{
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, __debug_init);
+}
+
 struct pipe_screen *
 fd_screen_create(int fd,
                  const struct pipe_screen_config *config,
@@ -865,10 +953,7 @@ fd_screen_create(int fd,
    struct pipe_screen *pscreen;
    uint64_t val;
 
-   fd_mesa_debug = debug_get_option_fd_mesa_debug();
-
-   if (FD_DBG(NOBIN))
-      fd_binning_enabled = false;
+   fd_screen_debug_init();
 
    if (!screen)
       return NULL;
@@ -970,9 +1055,14 @@ fd_screen_create(int fd,
    screen->has_syncobj = fd_has_syncobj(screen->dev);
 
    /* parse driconf configuration now for device specific overrides: */
-   driParseConfigFiles(config->options, config->options_info, 0, "msm",
-                       NULL, fd_dev_name(screen->dev_id), NULL, 0, NULL, 0);
+   driParseConfigFiles(config->options, config->options_info,
+                       &(driConfigFileParseParams) {
+                          .driverName = "msm",
+                          .deviceName = fd_dev_name(screen->dev_id),
+                       });
 
+   screen->driconf.heap_memory_percent =
+         driQueryOptionf(config->options, "heap_memory_percent");
    screen->driconf.conservative_lrz =
          !driQueryOptionb(config->options, "disable_conservative_lrz");
    screen->driconf.enable_throttling =
@@ -981,10 +1071,6 @@ fd_screen_create(int fd,
          driQueryOptionb(config->options, "dual_color_blend_by_location");
    if (driQueryOptionb(config->options, "disable_explicit_sync_heuristic"))
       fd_device_disable_explicit_sync_heuristic(dev);
-
-   struct sysinfo si;
-   sysinfo(&si);
-   screen->ram_size = si.totalram;
 
    DBG("Pipe Info:");
    DBG(" GPU-id:          %s", fd_dev_name(screen->dev_id));
@@ -1030,7 +1116,10 @@ fd_screen_create(int fd,
       if (screen->primtypes[i])
          screen->primtypes_mask |= (1 << i);
 
-   if (FD_DBG(PERFC)) {
+   screen->perfcntrs = fd_perfcntr_state_alloc(screen->dev_id, fd);
+
+   if (FD_DBG(PERFC) ||
+       (screen->perfcntrs && fd_perfcntr_has_reservation(screen->perfcntrs))) {
       screen->perfcntr_groups =
          fd_perfcntrs(screen->dev_id, &screen->num_perfcntr_groups);
    }
@@ -1070,6 +1159,9 @@ fd_screen_create(int fd,
 
    pscreen->get_timestamp = fd_screen_get_timestamp;
 
+   if (is_a6xx(screen))
+      pscreen->convert_timestamp = fd_screen_convert_timestamp;
+
    pscreen->fence_reference = _fd_fence_ref;
    pscreen->fence_finish = fd_pipe_fence_finish;
    pscreen->fence_get_fd = fd_pipe_fence_get_fd;
@@ -1104,7 +1196,7 @@ fd_screen_aux_context_get(struct pipe_screen *pscreen)
    simple_mtx_lock(&screen->aux_ctx_lock);
 
    if (!screen->aux_ctx) {
-      screen->aux_ctx = pscreen->context_create(pscreen, NULL, 0);
+      screen->aux_ctx = pscreen->context_create(pscreen, NULL, FD_CONTEXT_FLAG_AUX);
    }
 
    return fd_context(screen->aux_ctx);

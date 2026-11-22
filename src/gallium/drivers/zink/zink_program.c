@@ -745,10 +745,13 @@ static struct zink_gfx_program *
 replace_separable_prog(struct zink_context *ctx, struct hash_entry *entry, struct zink_gfx_program *prog)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
+   bool is_mesh = !!prog->shaders[MESA_SHADER_MESH];
    struct zink_gfx_program *real = prog->full_prog ?
                                    prog->full_prog :
                                    /* this will be NULL with ZINK_DEBUG_NOOPT */
-                                   zink_create_gfx_program(ctx, ctx->gfx_stages, ctx->gfx_pipeline_state.dyn_state2.vertices_per_patch, ctx->gfx_hash, false);
+                                   zink_create_gfx_program(ctx, ctx->gfx_stages,
+                                                           is_mesh ? 0 : ctx->gfx_pipeline_state.dyn_state2.vertices_per_patch,
+                                                           is_mesh ? ctx->mesh_hash : ctx->gfx_hash, is_mesh);
    entry->data = real;
    entry->key = real->shaders;
    real->base.removed = false;
@@ -1361,9 +1364,10 @@ gfx_program_init(struct zink_context *ctx, struct zink_gfx_program *prog)
       if (prog->shaders[i]) {
          util_queue_fence_wait(&prog->shaders[i]->precompile.fence);
          /* this may have already been precompiled for separate shader */
-         if (prog->shaders[i]->info.stage == MESA_SHADER_TESS_CTRL && prog->shaders[i]->non_fs.is_generated && prog->shaders[MESA_SHADER_TESS_CTRL]->nir)
+         if (prog->shaders[i]->info.stage == MESA_SHADER_TESS_CTRL && prog->shaders[i]->non_fs.is_generated && prog->shaders[MESA_SHADER_TESS_CTRL]->nir) {
             zink_shader_tcs_init(screen, prog->shaders[MESA_SHADER_TESS_CTRL], nir[MESA_SHADER_TESS_EVAL], &nir[i]);
-         else
+            prog->shaders[MESA_SHADER_TESS_CTRL]->nir = NULL;
+         } else
             nir[i] = zink_shader_deserialize(screen, prog->shaders[i]);
       } else {
          nir[i] = NULL;
@@ -1393,7 +1397,7 @@ gfx_program_init(struct zink_context *ctx, struct zink_gfx_program *prog)
    _mesa_blake3_init(&sctx);
    for (int i = 0; i < MESA_SHADER_MESH_STAGES; ++i) {
       if (prog->shaders[i])
-         _mesa_blake3_update(&sctx, prog->shaders[i]->base.sha1, sizeof(prog->shaders[i]->base.sha1));
+         _mesa_blake3_update(&sctx, prog->shaders[i]->base.blake3, sizeof(prog->shaders[i]->base.blake3));
    }
    _mesa_blake3_final(&sctx, prog->base.blake3);
 
@@ -1726,8 +1730,10 @@ create_compute_program(struct zink_context *ctx, nir_shader *nir)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    struct zink_compute_program *comp = create_program(ctx, true);
-   if (!comp)
+   if (!comp) {
+      ralloc_free(nir);
       return NULL;
+   }
    simple_mtx_init(&comp->cache_lock, mtx_plain);
    comp->uses_bindless = nir->info.uses_bindless;
    comp->scratch_size = nir->scratch_size;
@@ -2034,6 +2040,8 @@ bind_gfx_stage(struct zink_context *ctx, mesa_shader_stage stage, struct zink_sh
       }
       ctx->shader_stages &= ~BITFIELD_BIT(stage);
    }
+   /* avoid potential overdraw conflicts */
+   ctx->can_promote_depth_op = false;
 }
 
 static enum mesa_prim
@@ -2118,6 +2126,10 @@ bind_last_vertex_stage(struct zink_context *ctx, mesa_shader_stage stage, struct
    ctx->gfx_pipeline_state.shader_rast_prim =
       ctx->last_vertex_stage ? update_rast_prim(ctx->last_vertex_stage) :
                                MESA_PRIM_COUNT;
+
+   if (ctx->last_vertex_stage && ctx->last_vertex_stage->non_fs.is_generated)
+      ctx->gfx_pipeline_state.shader_rast_prim = MESA_PRIM_COUNT;
+
 
    if (old != current) {
       if (!zink_screen(ctx->base.screen)->optimal_keys) {
@@ -2339,6 +2351,67 @@ zink_bind_cs_state(struct pipe_context *pctx,
    zink_select_launch_grid(ctx);
 }
 
+static uint32_t
+zink_get_subgroup_sizes_for_pipeline(struct zink_screen *screen, VkPipeline pipeline)
+{
+   struct VkPipelineInfoKHR info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR,
+      .pipeline = pipeline,
+   };
+
+   uint32_t stat_count;
+   uint32_t subgroup_sizes = 0;
+   VKSCR(GetPipelineExecutablePropertiesKHR)(screen->dev, &info, &stat_count, NULL);
+   struct VkPipelineExecutablePropertiesKHR *stats = CALLOC(stat_count, sizeof(*stats));
+   VKSCR(GetPipelineExecutablePropertiesKHR)(screen->dev, &info, &stat_count, stats);
+
+   for (unsigned i = 0; i < stat_count; i++)
+      subgroup_sizes |= stats[i].subgroupSize;
+
+   FREE(stats);
+   return subgroup_sizes;
+}
+
+uint32_t
+zink_get_subgroup_size_for_block(struct zink_screen *screen, struct zink_compute_program *comp,
+                                 const uint32_t block[3])
+{
+   if (!screen->info.feats13.subgroupSizeControl)
+      return screen->base.compute_caps.subgroup_sizes;
+
+   if (screen->info.props13.minSubgroupSize == screen->info.props13.maxSubgroupSize)
+      return screen->info.props13.minSubgroupSize;
+
+   uint32_t subgroup_sizes = 0;
+   if (screen->info.have_KHR_pipeline_executable_properties) {
+      struct zink_compute_pipeline_state pipeline_state = {
+         .dirty = true,
+         .local_size = { block[0], block[1], block[2] },
+         .variable_shared_mem = 0, // TODO?,
+      };
+
+      VkPipeline pipeline = zink_get_compute_pipeline(screen, comp, &pipeline_state);
+      subgroup_sizes = zink_get_subgroup_sizes_for_pipeline(screen, pipeline);
+      if (util_bitcount(subgroup_sizes) == 1)
+         return subgroup_sizes;
+   } else {
+      uint32_t size = screen->info.props13.minSubgroupSize;
+      uint32_t max = screen->info.props13.maxSubgroupSize;
+
+      for (; size <= max; size <<= 1)
+         subgroup_sizes |= size;
+   }
+
+   uint32_t invocations = block[0] * block[1] * block[2];
+   while (subgroup_sizes) {
+      unsigned size = 1 << u_bit_scan(&subgroup_sizes);
+      if (invocations <= size * screen->info.props13.maxComputeWorkgroupSubgroups)
+         return size;
+   }
+   // Should never happen and if so, not our fault.
+   return 0;
+}
+
 static void
 zink_get_compute_state_info(struct pipe_context *pctx, void *cso, struct pipe_compute_state_object_info *info)
 {
@@ -2349,13 +2422,22 @@ zink_get_compute_state_info(struct pipe_context *pctx, void *cso, struct pipe_co
    info->private_memory = comp->scratch_size;
    if (screen->info.props11.subgroupSize) {
       info->preferred_simd_size = screen->info.props11.subgroupSize;
-      info->simd_sizes = info->preferred_simd_size;
+      info->simd_sizes = screen->base.compute_caps.subgroup_sizes;
    } else {
       // just guess it
       info->preferred_simd_size = 64;
       // only used for actual subgroup support
       info->simd_sizes = 0;
    }
+}
+
+static uint32_t
+zink_get_compute_state_subgroup_size(struct pipe_context *pctx, void *cso,
+                                     const uint32_t block[3])
+{
+   struct zink_compute_program *comp = cso;
+   struct zink_screen *screen = zink_screen(pctx->screen);
+   return zink_get_subgroup_size_for_block(screen, comp, block);
 }
 
 static void
@@ -2616,6 +2698,7 @@ zink_program_init(struct zink_context *ctx)
    ctx->base.create_compute_state = zink_create_cs_state;
    ctx->base.bind_compute_state = zink_bind_cs_state;
    ctx->base.get_compute_state_info = zink_get_compute_state_info;
+   ctx->base.get_compute_state_subgroup_size = zink_get_compute_state_subgroup_size;
    ctx->base.delete_compute_state = zink_delete_cs_shader_state;
 
    if (zink_screen(ctx->base.screen)->info.have_EXT_vertex_input_dynamic_state)
@@ -2854,6 +2937,8 @@ zink_set_primitive_emulation_keys(struct zink_context *ctx)
             ralloc_free(prev_stage);
             struct zink_shader *shader = zink_shader_create(screen, nir);
             zink_shader_init(screen, shader);
+            ralloc_free(shader->nir);
+            shader->nir = NULL;
             shader->needs_inlining = true;
             ctx->gfx_stages[prev_vertex_stage]->non_fs.generated_gs[ctx->gfx_pipeline_state.gfx_prim_mode][zink_prim_type] = shader;
             shader->non_fs.is_generated = true;

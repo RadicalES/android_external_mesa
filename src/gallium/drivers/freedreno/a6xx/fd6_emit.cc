@@ -291,8 +291,8 @@ build_prog_fb_rast(struct fd6_emit *emit) assert_dt
       .frag_writes_sampmask = fs->writes_smask && pfb->samples > 1,
       .frag_writes_stencilref = fs->writes_stencilref,
    ));
-   crb.add(A6XX_RB_PS_MRT_CNTL(.mrt = nr));
-   crb.add(A6XX_SP_PS_MRT_CNTL(.mrt = nr));
+   crb.add(A6XX_RB_PS_MRT_CNTL(.mrt = nr))
+      .add(A6XX_SP_PS_MRT_CNTL(.mrt = nr));
 
    unsigned mrt_components = 0;
    for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
@@ -305,10 +305,17 @@ build_prog_fb_rast(struct fd6_emit *emit) assert_dt
    if (blend->use_dual_src_blend)
       mrt_components |= 0xf << 4;
 
+   /* For multi-planar YUV, the RB treats the chroma plane as a separate MRT,
+    * so enable its write mask even though the shader only outputs to MRT0.
+    */
+   if (blend->base.is_yuv)
+      mrt_components |= 0xf << 4;
+
    mrt_components &= prog->mrt_components;
 
    crb.add(A6XX_SP_PS_OUTPUT_MASK(.dword = mrt_components))
       .add(A6XX_RB_PS_OUTPUT_MASK(.dword = mrt_components));
+
 
    return crb;
 }
@@ -396,9 +403,15 @@ fd6_emit_streamout(fd_cs &cs, struct fd6_emit *emit) assert_dt
       if (so->reset & (1 << i)) {
          assert(so->offsets[i] == 0);
 
+         /* The counter in offset_bo is maintained by the hardware in the
+          * units of VPC_SO_FLUSH_BASE, which are dwords on a6xx and bytes on
+          * a7xx, while VPC_SO_BUFFER_OFFSET is bytes on both.  Seed each of
+          * them in its own units.
+          */
          fd_pkt7(cs, CP_MEM_WRITE, 3)
             .add(A5XX_CP_MEM_WRITE_ADDR(offset_bo))
-            .add(target->base.buffer_offset);
+            .add(CHIP == A6XX ? target->base.buffer_offset >> 2
+                              : target->base.buffer_offset);
 
          fd_pkt4(cs, 1)
             .add(VPC_SO_BUFFER_OFFSET(CHIP, i,target->base.buffer_offset));
@@ -407,7 +420,7 @@ fd6_emit_streamout(fd_cs &cs, struct fd6_emit *emit) assert_dt
             .add(CP_MEM_TO_REG_0(
                .reg = VPC_SO_BUFFER_OFFSET(CHIP, i).reg,
                .shift_by_2 = CHIP == A6XX,
-               .unk31 = true,
+               .wait_cache_flush = true,
             ))
             .add(A5XX_CP_MEM_TO_REG_SRC(offset_bo));
       }
@@ -788,7 +801,7 @@ fd6_emit_gmem_cache_cntl(fd_cs &cs, struct fd_screen *screen, bool gmem)
          .add(RB_CCU_CACHE_CNTL(CHIP,
             .depth_offset_hi = depth_offset_hi,
             .color_offset_hi = color_offset_hi,
-            .depth_cache_size = CCU_CACHE_SIZE_FULL,
+            .depth_cache_size = (enum a6xx_ccu_cache_size)cfg->depth_cache_fraction,
             .depth_offset = depth_offset,
             .color_cache_size = color_cache_size,
             .color_offset = color_offset,
@@ -812,7 +825,7 @@ fd6_emit_gmem_cache_cntl(fd_cs &cs, struct fd_screen *screen, bool gmem)
                screen->info->props.concurrent_resolve,
             .depth_offset_hi = depth_offset_hi,
             .color_offset_hi = color_offset_hi,
-            .depth_cache_size = CCU_CACHE_SIZE_FULL,
+            .depth_cache_size = (enum a6xx_ccu_cache_size)cfg->depth_cache_fraction,
             .depth_offset = depth_offset,
             .color_cache_size = color_cache_size,
             .color_offset = color_offset,
@@ -886,8 +899,7 @@ fd6_emit_static_non_context_regs(struct fd_context *ctx, fd_cs &cs)
    /* gen8 moves magic reg setup to KMD and blocks access from UMD:
     */
    if (CHIP < A8XX) {
-      ncrb.add(A6XX_RB_DBG_ECO_CNTL(.dword = screen->info->magic.RB_DBG_ECO_CNTL));
-      ncrb.add(A6XX_SP_NC_MODE_CNTL_2(.f16_no_inf = true));
+      ncrb.add(A6XX_SP_NC_MODE_CNTL_2(.f16_no_inf = false));
       ncrb.add(VPC_LB_MODE_CNTL(CHIP));
       ncrb.add(PC_CONTEXT_SWITCH_GFX_PREEMPTION_MODE(CHIP));
    }
@@ -924,6 +936,9 @@ fd6_emit_static_non_context_regs(struct fd_context *ctx, fd_cs &cs)
 
    if (CHIP == A7XX)
       ncrb.add(RB_UNKNOWN_8E09(CHIP, 0x7));
+
+   if (CHIP >= A7XX)
+      ncrb.add(RB_A2D_DEST_BUFFER_ARRAY_PITCH(CHIP));
 }
 
 /**
@@ -937,28 +952,16 @@ fd6_emit_static_context_regs(struct fd_context *ctx, fd_cs &cs)
 {
    struct fd_screen *screen = ctx->screen;
 
-   fd_crb crb(cs, 80);
+   fd_crb crb(cs, 84);
 
    crb.add(SP_GFX_USIZE(CHIP));
    crb.add(A6XX_TPL1_PS_ROTATION_CNTL());
 
-   /* gen8 moves magic reg programming to KMD and blocks access for UMD: */
-   if (CHIP < A8XX) {
-      crb.add(A6XX_RB_RBP_CNTL(.dword = screen->info->magic.RB_RBP_CNTL));
-   }
-
    crb.add(A6XX_SP_UNKNOWN_A9A8());
-
-   crb.add(A6XX_SP_MODE_CNTL(
-         .constant_demotion_enable = true,
-         .isammode = ISAMMODE_GL,
-         .shared_consts_enable = false,
-      )
-   );
 
    crb.add(A6XX_VFD_MODE_CNTL(.vertex = true, .instance = true));
    if (CHIP == A6XX)
-      crb.add(VPC_UNKNOWN_9107(CHIP));
+      crb.add(PC_RAST_STREAM_CNTL(CHIP));
    crb.add(A6XX_RB_MODE_CNTL(.dword = 0x00000010));
    crb.add(GRAS_LRZ_PS_INPUT_CNTL(CHIP));
    crb.add(A6XX_GRAS_LRZ_PS_SAMPLEFREQ_CNTL());
@@ -996,14 +999,6 @@ fd6_emit_static_context_regs(struct fd_context *ctx, fd_cs &cs)
       crb.add(VPC_UNKNOWN_9210(CHIP));
    }
 
-   crb.add(TPL1_MODE_CNTL(CHIP,
-         .isammode = ISAMMODE_GL,
-         .texcoordroundmode = COORD_TRUNCATE,
-         .nearestmipsnap = CLAMP_ROUND_TRUNCATE,
-         .destdatatypeoverride = true,
-         .clamp_disable = true,
-   ));
-
    crb.add(SP_REG_PROG_ID_3(
          CHIP,
          .linelengthregid = INVALID_REG,
@@ -1037,6 +1032,8 @@ fd6_emit_static_context_regs(struct fd_context *ctx, fd_cs &cs)
    crb.add(PC_DGEN_SU_CONSERVATIVE_RAS_CNTL(CHIP));
 
    if (CHIP >= A7XX) {
+      crb.add(VPC_UNKNOWN_CNTL(CHIP));
+
       /* Blob sets these two per draw. */
       crb.add(PC_HS_BUFFER_SIZE(CHIP, FD6_TESS<CHIP>::PARAM_SIZE));
       /* Blob adds a bit more space ({0x10, 0x20, 0x30, 0x40} bytes)
@@ -1100,8 +1097,11 @@ fd6_emit_restore(fd_cs &cs, struct fd_batch *batch)
    }
 
    if (FD_DBG(STOMP)) {
-      fd6_emit_stomp<CHIP>(cs, &RP_BLIT_REGS<CHIP>[0], ARRAY_SIZE(RP_BLIT_REGS<CHIP>));
+      fd6_emit_stomp<CHIP>(cs, &DRAW_REGS<CHIP>[0], ARRAY_SIZE(DRAW_REGS<CHIP>));
+      fd6_emit_stomp<CHIP>(cs, &COMPUTE_REGS<CHIP>[0], ARRAY_SIZE(COMPUTE_REGS<CHIP>));
+      fd6_emit_stomp<CHIP>(cs, &BLIT_REGS<CHIP>[0], ARRAY_SIZE(BLIT_REGS<CHIP>));
       fd6_emit_stomp<CHIP>(cs, &CMD_REGS<CHIP>[0], ARRAY_SIZE(CMD_REGS<CHIP>));
+      fd6_emit_stomp<CHIP>(cs, &RESOLVE_REGS<CHIP>[0], ARRAY_SIZE(RESOLVE_REGS<CHIP>));
    }
 
    fd_pkt7(cs, CP_SET_MODE, 1)

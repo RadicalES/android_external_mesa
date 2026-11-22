@@ -106,12 +106,13 @@ resource_is_busy(struct d3d12_context *ctx,
    if (d3d12_batch_has_references(d3d12_current_batch(ctx), res->bo, want_to_write))
       return true;
 
-   bool busy = false;
-   d3d12_foreach_submitted_batch(ctx, batch) {
-      if (!d3d12_reset_batch(ctx, batch, 0))
-         busy |= d3d12_batch_has_references(batch, res->bo, want_to_write);
-   }
-   return busy;
+   d3d12_foreach_submitted_batch(ctx, batch)
+      d3d12_reset_batch(ctx, batch, 0);
+
+   uint64_t offset;
+   struct d3d12_bo *base = d3d12_bo_get_base(res->bo, &offset);
+   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
+   return base->last_used_fence > screen->fence->GetCompletedValue();
 }
 
 void
@@ -121,12 +122,19 @@ d3d12_resource_wait_idle(struct d3d12_context *ctx,
 {
    if (d3d12_batch_has_references(d3d12_current_batch(ctx), res->bo, want_to_write)) {
       d3d12_flush_cmdlist_and_wait(ctx);
-   } else {
-      d3d12_foreach_submitted_batch(ctx, batch) {
-         if (d3d12_batch_has_references(batch, res->bo, want_to_write))
-            d3d12_reset_batch(ctx, batch, OS_TIMEOUT_INFINITE);
-      }
+      return;
    }
+
+   uint64_t offset;
+   struct d3d12_bo *base = d3d12_bo_get_base(res->bo, &offset);
+   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
+   uint64_t target = base->last_used_fence;
+   if (target > screen->fence->GetCompletedValue())
+      screen->fence->SetEventOnCompletion(target, nullptr);
+
+   d3d12_foreach_submitted_batch(ctx, batch)
+      d3d12_reset_batch(ctx, batch, 0);
+   d3d12_screen_reclaim_completed(screen);
 }
 
 void
@@ -185,7 +193,10 @@ init_buffer(struct d3d12_screen *screen,
 
    buf_desc.alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
    res->dxgi_format = DXGI_FORMAT_UNKNOWN;
-   buf = bufmgr->create_buffer(bufmgr, templ->width0, &buf_desc);
+   do {
+      buf = bufmgr->create_buffer(bufmgr, templ->width0, &buf_desc);
+   } while (!buf && d3d12_screen_reclaim_one(screen));
+
    if (!buf)
       return false;
    res->bo = d3d12_bo_wrap_buffer(screen, buf);
@@ -254,6 +265,10 @@ init_texture(struct d3d12_screen *screen,
    if (templ->bind & PIPE_BIND_RENDER_TARGET)
       desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
+   // This is expected from D3D11 openers for D3D12 created shareable resources
+   if (templ->bind & PIPE_BIND_SHARED)
+      desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+
    if (templ->bind & PIPE_BIND_DEPTH_STENCIL) {
       desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 
@@ -309,6 +324,7 @@ init_texture(struct d3d12_screen *screen,
 
    HRESULT hres = E_FAIL;
    enum d3d12_residency_status init_residency;
+   do {
 #ifndef _GAMING_XBOX
 
    if (heap && screen->max_feature_level == D3D_FEATURE_LEVEL_1_0_GENERIC) {
@@ -396,6 +412,7 @@ init_texture(struct d3d12_screen *screen,
                                                      IID_PPV_ARGS(&d3d12_res));
       }
    }
+   } while (hres == E_OUTOFMEMORY && d3d12_screen_reclaim_one(screen));
 
    if (FAILED(hres))
       return false;
@@ -513,7 +530,8 @@ d3d12_resource_create_or_place(struct d3d12_screen *screen,
    init_valid_range(res);
    threaded_resource_init(&res->base.b,
       templ->usage == PIPE_USAGE_DEFAULT &&
-      templ->target == PIPE_BUFFER);
+      templ->target == PIPE_BUFFER &&
+      templ->width0 < 0x1000);
 
    memset(&res->bind_counts, 0, sizeof(d3d12_resource::bind_counts));
 
@@ -531,6 +549,30 @@ d3d12_resource_create(struct pipe_screen *pscreen,
       return NULL;
 
    return d3d12_resource_create_or_place(d3d12_screen(pscreen), res, templ, nullptr, 0);
+}
+
+/* A staging buffer backed by a CPU-visible readback heap can be mapped directly
+ * instead of going through a staging copy. Resources allocated with the properties
+ * returned by GetCustomHeapProperties(D3D12_HEAP_TYPE_READBACK) report their heap
+ * as CUSTOM with CPUPageProperty WRITE_BACK and MemoryPoolPreference L0, so accept
+ * both ways.
+ */
+static bool
+d3d12_resource_can_import_as_staging(const struct pipe_resource *templ, 
+                                     ID3D12Resource *resource)
+{
+   if (!templ || templ->usage != PIPE_USAGE_STAGING)
+      return false;
+
+   D3D12_HEAP_PROPERTIES heap_props = {};
+   D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+   if (FAILED(resource->GetHeapProperties(&heap_props, &heap_flags)))
+      return false;
+
+   return heap_props.Type == D3D12_HEAP_TYPE_READBACK ||
+          (heap_props.Type == D3D12_HEAP_TYPE_CUSTOM &&
+           heap_props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK &&
+           heap_props.MemoryPoolPreference == D3D12_MEMORY_POOL_L0);
 }
 
 static struct pipe_resource *
@@ -575,8 +617,11 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
                       " match d3d12 device (%p) instance from this pipe_screen."
                       " Attempting to re-import via NT Handle...\n", screen_device.Get(), res_device.Get());
 
+         ComPtr<ID3D12Device> res_d3d12_device;
+         res_device.As(&res_d3d12_device);
+
          handle->type = WINSYS_HANDLE_TYPE_FD;
-         HRESULT hr = screen->dev->CreateSharedHandle(((ID3D12DeviceChild *)handle->com_obj),
+         HRESULT hr = res_d3d12_device->CreateSharedHandle(((ID3D12DeviceChild *)handle->com_obj),
                nullptr,
                GENERIC_ALL,
                nullptr,
@@ -604,11 +649,18 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    if (res->bo) {
       d3d12_res = res->bo->res;
    } else if (handle->type == WINSYS_HANDLE_TYPE_D3D12_RES) {
+#ifdef _GAMING_XBOX
       if (handle->modifier == 1) {
          d3d12_heap = (ID3D12Heap *) handle->com_obj;
       } else {
          d3d12_res = (ID3D12Resource *) handle->com_obj;
       }
+#else
+      IUnknown *obj = (IUnknown *) handle->com_obj;
+      (void)obj->QueryInterface(&d3d12_res);
+      (void)obj->QueryInterface(&d3d12_heap);
+      obj->Release();
+#endif
    } else {
       screen->dev->OpenSharedHandle(d3d_handle, IID_PPV_ARGS(&d3d12_res));
    }
@@ -687,7 +739,8 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    }
    res->base.b.nr_samples = static_cast<uint8_t>(incoming_res_desc.SampleDesc.Count);
    res->base.b.last_level = static_cast<uint8_t>(incoming_res_desc.MipLevels - 1);
-   res->base.b.usage = PIPE_USAGE_DEFAULT;
+   res->base.b.usage = d3d12_resource_can_import_as_staging(templ, d3d12_res) ?
+      PIPE_USAGE_STAGING : PIPE_USAGE_DEFAULT;
    res->base.b.bind |= PIPE_BIND_SHARED;
    if (incoming_res_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
       res->base.b.bind |= PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE | PIPE_BIND_DISPLAY_TARGET;
@@ -1070,12 +1123,17 @@ d3d12_memobj_create_from_handle(struct pipe_screen *pscreen, struct winsys_handl
    }
    memobj->base.dedicated = dedicated;
 
+#ifdef _GAMING_XBOX
    obj->AddRef();
    if (handle->modifier == 1) {
       memobj->heap = (ID3D12Heap *) obj;
    } else {
       memobj->res = (ID3D12Resource *) obj;
    }
+#else
+   (void)obj->QueryInterface(&memobj->heap);
+   (void)obj->QueryInterface(&memobj->res);
+#endif
 
    obj->Release();
    if (!memobj->res && !memobj->heap) {
@@ -1123,7 +1181,9 @@ d3d12_resource_from_memobj(struct pipe_screen *pscreen,
 
    whandle.offset = static_cast<unsigned int>(offset);
    whandle.format = templ->format;
+#ifdef _GAMING_XBOX
    whandle.modifier = memobj->res ? 0 : 1;
+#endif
 
    // WINSYS_HANDLE_TYPE_D3D12_RES implies taking ownership of the reference
    ((IUnknown *)whandle.com_obj)->AddRef();
@@ -1767,9 +1827,15 @@ d3d12_transfer_map(struct pipe_context *pctx,
    if (usage & PIPE_MAP_DIRECTLY || !res->bo)
       return NULL;
 
-   slab_child_pool* transfer_pool = (usage & TC_TRANSFER_MAP_THREADED_UNSYNC) ?
-      &ctx->transfer_pool_unsync : &ctx->transfer_pool;
-   struct d3d12_transfer *trans = (struct d3d12_transfer *)slab_zalloc(transfer_pool);
+   slab_child_pool* transfer_pool = NULL;
+   struct d3d12_transfer *trans;
+   if (usage & PIPE_MAP_THREAD_SAFE) {
+      trans = (struct d3d12_transfer *)CALLOC_STRUCT(d3d12_transfer);
+   } else {
+      transfer_pool = (usage & TC_TRANSFER_MAP_THREADED_UNSYNC) ?
+         &ctx->transfer_pool_unsync : &ctx->transfer_pool;
+      trans = (struct d3d12_transfer *)slab_zalloc(transfer_pool);
+   }
    struct pipe_transfer *ptrans = &trans->base.b;
    if (!trans)
       return NULL;
@@ -1795,7 +1861,10 @@ d3d12_transfer_map(struct pipe_context *pctx,
 
       range = linear_range(box, ptrans->stride, ptrans->layer_stride);
       if (!synchronize(ctx, res, usage, &range)) {
-         slab_free(transfer_pool, trans);
+         if (usage & PIPE_MAP_THREAD_SAFE)
+            FREE(trans);
+         else
+            slab_free(transfer_pool, trans);
          return NULL;
       }
       ptr = d3d12_bo_map(res->bo, &range);
@@ -1919,7 +1988,10 @@ d3d12_transfer_map(struct pipe_context *pctx,
                                               staging_usage,
                                               staging_res_size);
       if (!trans->staging_res) {
-         slab_free(transfer_pool, trans);
+         if (usage & PIPE_MAP_THREAD_SAFE)
+            FREE(trans);
+         else
+            slab_free(transfer_pool, trans);
          return NULL;
       }
 
@@ -2047,7 +2119,15 @@ d3d12_transfer_unmap(struct pipe_context *pctx,
    }
 
    pipe_resource_reference(&ptrans->resource, NULL);
-   slab_free(&d3d12_context(pctx)->transfer_pool, ptrans);
+   if (ptrans->usage & PIPE_MAP_THREAD_SAFE) {
+      FREE(ptrans);
+   } else {
+      /* transfer_unmap is always called from the driver thread, so we use
+       * transfer_pool, not transfer_pool_unsync.  Freeing an object into a
+       * different pool is allowed, however.
+       */
+      slab_free(&d3d12_context(pctx)->transfer_pool, ptrans);
+   }
 }
 
 void

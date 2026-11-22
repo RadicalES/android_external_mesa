@@ -175,7 +175,6 @@ static const struct dri2_egl_display_vtbl dri2_device_display_vtbl = {
    .create_pbuffer_surface = dri2_device_create_pbuffer_surface,
    .destroy_surface = device_destroy_surface,
    .create_image = dri2_create_image_khr,
-   .get_dri_drawable = dri2_surface_get_dri_drawable,
 };
 
 static void
@@ -196,24 +195,21 @@ device_get_capability(void *loaderPrivate, enum dri_loader_cap cap)
 }
 
 static const __DRIimageLoaderExtension image_loader_extension = {
-   .base = {__DRI_IMAGE_LOADER, 2},
    .getBuffers = device_image_get_buffers,
    .flushFrontBuffer = device_flush_front_buffer,
    .getCapability = device_get_capability,
 };
 
-static const __DRIextension *image_loader_extensions[] = {
-   &image_loader_extension.base,
-   &image_lookup_extension.base,
-   &kopper_pbuffer_loader_extension.base,
-   NULL,
+static const struct dri_loader_funcs image_loader_funcs = {
+   .image_lookup = &image_lookup_extension,
+   .image = &image_loader_extension,
+   .kopper = &kopper_pbuffer_loader_extension,
 };
 
-static const __DRIextension *swrast_loader_extensions[] = {
-   &swrast_pbuffer_loader_extension.base,
-   &image_lookup_extension.base,
-   &kopper_pbuffer_loader_extension.base,
-   NULL,
+static const struct dri_loader_funcs swrast_loader_funcs = {
+   .image_lookup = &image_lookup_extension,
+   .swrast = &swrast_pbuffer_loader_extension,
+   .kopper = &kopper_pbuffer_loader_extension,
 };
 
 static int
@@ -260,12 +256,7 @@ static bool
 device_probe_device(_EGLDisplay *disp)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
-   bool request_software =
-      debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false);
 
-   if (request_software)
-      _eglLog(_EGL_WARNING, "Not allowed to force software rendering when "
-                            "API explicitly selects a hardware device.");
    dri2_dpy->fd_render_gpu = device_get_fd(disp, disp->Device);
    if (dri2_dpy->fd_render_gpu < 0)
       return false;
@@ -277,7 +268,7 @@ device_probe_device(_EGLDisplay *disp)
       goto err_name;
 
    /* this is software fallback */
-   if (disp->Options.ForceSoftware && !request_software) {
+   if (disp->Options.ForceSoftware) {
       /* When doing software rendering, some times user still want to explicitly
       * choose the render node device since cross node import doesn't work between
       * vgem/virtio_gpu yet. It would be nice to have a new EXTENSION for this.
@@ -295,7 +286,7 @@ device_probe_device(_EGLDisplay *disp)
 
    dri2_detect_swrast_kopper(disp);
 
-   dri2_dpy->loader_extensions = image_loader_extensions;
+   dri2_dpy->loader_funcs = &image_loader_funcs;
    return true;
 
 err_name:
@@ -318,7 +309,7 @@ device_probe_device_sw(_EGLDisplay *disp)
    /* HACK: should be driver_swrast_null */
    dri2_detect_swrast_kopper(disp);
 
-   dri2_dpy->loader_extensions = swrast_loader_extensions;
+   dri2_dpy->loader_funcs = &swrast_loader_funcs;
    return true;
 }
 
@@ -327,15 +318,22 @@ dri2_initialize_device(_EGLDisplay *disp)
 {
    const char *err;
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+   bool request_software =
+      debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false);
 
    /* Extension requires a PlatformDisplay - the EGLDevice. */
    disp->Device = disp->PlatformDisplay;
 
+   if (request_software)
+      _eglLog(_EGL_WARNING, "Not allowed to force software rendering when "
+                            "API explicitly selects a hardware device.");
+
    err = "DRI2: failed to load driver";
-   if (_eglDeviceSupports(disp->Device, _EGL_DEVICE_DRM)) {
+   /* device-drm platform cannot be explicit sw (because explicit sw is llvmpipe) */
+   if (!request_software && _eglDeviceSupports(disp->Device, _EGL_DEVICE_DRM)) {
       if (!device_probe_device(disp))
          goto cleanup;
-   } else if (_eglDeviceSupports(disp->Device, _EGL_DEVICE_SOFTWARE)) {
+   } else if (request_software || _eglDeviceSupports(disp->Device, _EGL_DEVICE_SOFTWARE)) {
       if (!device_probe_device_sw(disp))
          goto cleanup;
    } else {
@@ -351,8 +349,10 @@ dri2_initialize_device(_EGLDisplay *disp)
 
    dri2_setup_screen(disp);
 #ifdef HAVE_WAYLAND_PLATFORM
-   dri2_dpy->device_name =
-      loader_get_device_name_for_fd(dri2_dpy->fd_render_gpu);
+   if (dri2_dpy->fd_render_gpu >= 0) {
+      dri2_dpy->device_name =
+         loader_get_device_name_for_fd(dri2_dpy->fd_render_gpu);
+   }
 #endif
    dri2_set_WL_bind_wayland_display(disp);
 

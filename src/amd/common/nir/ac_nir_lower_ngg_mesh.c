@@ -90,8 +90,8 @@ typedef struct
 
 typedef struct
 {
-   const struct radeon_info *hw_info;
-   bool fast_launch_2;
+   const ac_nir_lower_ngg_options *options;
+   const struct ac_compiler_info *ac;
    bool vert_multirow_export;
    bool prim_multirow_export;
 
@@ -111,17 +111,17 @@ typedef struct
 
    ac_nir_prerast_out out;
 
+   /* True if the shader has waves that don't execute the API shader at all. */
+   bool has_non_api_waves;
    /* True if the lowering needs to insert the layer output. */
    bool insert_layer_output;
    /* True if cull flags are used */
    bool uses_cull_flags;
+   /* True if the output vertex and primitive counts are workgroup-uniform. */
+   bool output_counts_workgroup_uniform;
 
-   uint32_t clipdist_enable_mask;
    const uint8_t *vs_output_param_offset;
    bool has_param_exports;
-
-   /* True if the lowering needs to insert shader query. */
-   bool has_query;
 } lower_ngg_ms_state;
 
 static void
@@ -455,6 +455,12 @@ lower_ms_set_vertex_and_primitive_count(nir_builder *b,
                                         nir_intrinsic_instr *intrin,
                                         lower_ngg_ms_state *s)
 {
+   /* Remember if the output vertex and primitive counts are both workgroup-uniform.
+    * This assumes that the divergence info contains workgroup divergence.
+    */
+   s->output_counts_workgroup_uniform &=
+      !nir_src_is_divergent(&intrin->src[0]) && !nir_src_is_divergent(&intrin->src[1]);
+
    /* If either the number of vertices or primitives is zero, set both of them to zero. */
    nir_def *num_vtx = nir_read_first_invocation(b, intrin->src[0].ssa);
    nir_def *num_prm = nir_read_first_invocation(b, intrin->src[1].ssa);
@@ -653,6 +659,14 @@ set_ms_final_output_counts(nir_builder *b,
                            nir_def **out_num_prm,
                            nir_def **out_num_vtx)
 {
+   if (s->options->rasterizer_discard) {
+      nir_def *zero = nir_imm_int(b, 0);
+
+      ac_nir_ngg_alloc_vertices_and_primitives(b, zero, zero, false);
+      *out_num_vtx = *out_num_prm = zero;
+      return;
+   }
+
    /* The spec allows the numbers to be divergent, and in that case we need to
     * use the values from the first invocation. Also the HW requires us to set
     * both to 0 if either was 0.
@@ -662,22 +676,36 @@ set_ms_final_output_counts(nir_builder *b,
    nir_def *num_prm = nir_load_var(b, s->primitive_count_var);
    nir_def *num_vtx = nir_load_var(b, s->vertex_count_var);
 
+   *out_num_prm = num_prm;
+   *out_num_vtx = num_vtx;
+
    if (s->hw_workgroup_size <= s->wave_size) {
       /* Single-wave mesh shader workgroup. */
       ac_nir_ngg_alloc_vertices_and_primitives(b, num_vtx, num_prm, false);
-
-      *out_num_prm = num_prm;
-      *out_num_vtx = num_vtx;
       return;
    }
 
-   /* Multi-wave mesh shader workgroup:
+   if (s->output_counts_workgroup_uniform && !s->has_non_api_waves) {
+      /* Output counts are workgroup-uniform and all waves execute the API shader.
+       * All waves calculated the same output count values, so we don't
+       * have to distribute the value from the first active invocation.
+       *
+       * Note that this can't be done when there are non-API waves
+       * because those don't execute the API shader and therefore
+       * can't know the value of the output counts and must read it
+       * from LDS.
+       *
+       * We can simply use the values from the first wave when
+       * allocating space for vertices/primitives.
+       */
+      nir_if *if_wave_0 = nir_push_if(b, nir_ieq_imm(b, nir_load_subgroup_id(b), 0));
+      ac_nir_ngg_alloc_vertices_and_primitives(b, num_vtx, num_prm, false);
+      nir_pop_if(b, if_wave_0);
+      return;
+   }
+
+   /* Multi-wave mesh shader workgroup with workgroup-divergent output counts:
     * We need to use LDS to distribute the correct values to the other waves.
-    *
-    * TODO:
-    * If we can prove that the values are workgroup-uniform, we can skip this
-    * and just use whatever the current wave has. However, NIR divergence analysis
-    * currently doesn't support this.
     */
 
    nir_def *zero = nir_imm_int(b, 0);
@@ -796,7 +824,8 @@ ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx,
       indices[i] = nir_umin(b, indices[i], max_vtx_idx);
    }
 
-   return ac_nir_pack_ngg_prim_exp_arg(b, s->vertices_per_prim, indices, cull_flag, s->hw_info->gfx_level);
+   return ac_nir_pack_ngg_prim_exp_arg(b, s->vertices_per_prim, indices, cull_flag,
+                                       s->ac->gfx_level);
 }
 
 static nir_def *
@@ -822,8 +851,8 @@ ms_prim_exp_arg_ch2(nir_builder *b, uint64_t outputs_mask, lower_ngg_ms_state *s
       prim_exp_arg_ch2 = nir_imm_int(b, 0);
 
       if (outputs_mask & VARYING_BIT_LAYER) {
-         nir_def *layer =
-            nir_ishl_imm(b, s->out.outputs[VARYING_SLOT_LAYER][0], s->hw_info->gfx_level >= GFX11 ? 0 : 17);
+         nir_def *layer = nir_ishl_imm(b, s->out.outputs[VARYING_SLOT_LAYER][0],
+                                       s->ac->gfx_level >= GFX11 ? 0 : 17);
          prim_exp_arg_ch2 = nir_ior(b, prim_exp_arg_ch2, layer);
       }
 
@@ -847,7 +876,7 @@ ms_prim_gen_query(nir_builder *b,
                   nir_def *num_prm,
                   lower_ngg_ms_state *s)
 {
-   if (!s->has_query)
+   if (!s->options->has_gen_prim_query)
       return;
 
    nir_if *if_invocation_index_zero = nir_push_if(b, nir_ieq_imm(b, invocation_index, 0));
@@ -866,7 +895,7 @@ ms_invocation_query(nir_builder *b,
                     nir_def *invocation_index,
                     lower_ngg_ms_state *s)
 {
-   if (!s->has_query)
+   if (!s->options->has_ms_gs_invocations_query)
       return;
 
    nir_if *if_invocation_index_zero = nir_push_if(b, nir_ieq_imm(b, invocation_index, 0));
@@ -887,19 +916,19 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool 
    ms_emit_arrayed_outputs(b, index, per_vertex_outputs, s);
 
    if (exports) {
-      ac_nir_export_position(b, s->hw_info->gfx_level, s->clipdist_enable_mask, false, false,
-                             !s->has_param_exports, false,
-                             s->per_vertex_outputs | VARYING_BIT_POS, &s->out, row);
+      ac_nir_export_position(b, s->ac->gfx_level, s->options->export_clipdist_mask, false, false,
+                             !s->has_param_exports, false, s->per_vertex_outputs | VARYING_BIT_POS,
+                             &s->out, row);
    }
 
    if (parameters) {
       /* Export generic attributes when there is no attribute ring. */
-      if (s->has_param_exports && !s->hw_info->has_attr_ring) {
+      if (s->has_param_exports && !s->ac->has_attr_ring) {
          ac_nir_export_parameters(b, s->vs_output_param_offset, per_vertex_outputs, 0, &s->out);
       }
 
       /* Also store special outputs to the attribute ring so PS can load them. */
-      if (s->hw_info->has_attr_ring && (per_vertex_outputs & MS_VERT_ARG_EXP_MASK))
+      if (s->ac->has_attr_ring && (per_vertex_outputs & MS_VERT_ARG_EXP_MASK))
          ms_emit_attribute_ring_output_stores(b, per_vertex_outputs & MS_VERT_ARG_EXP_MASK, index, s);
    }
 }
@@ -930,12 +959,12 @@ emit_ms_primitive(nir_builder *b, nir_def *index, nir_def *row, bool exports, bo
 
    if (parameters) {
       /* Export generic attributes when there is no attribute ring. */
-      if (s->has_param_exports && !s->hw_info->has_attr_ring) {
+      if (s->has_param_exports && !s->ac->has_attr_ring) {
          ac_nir_export_parameters(b, s->vs_output_param_offset, per_primitive_outputs, 0, &s->out);
       }
 
       /* Also store special outputs to the attribute ring so PS can load them. */
-      if (s->hw_info->has_attr_ring)
+      if (s->ac->has_attr_ring)
          ms_emit_attribute_ring_output_stores(b, per_primitive_outputs & MS_PRIM_ARG_EXP_MASK, index, s);
    }
 }
@@ -947,6 +976,9 @@ emit_ms_outputs(nir_builder *b, nir_def *invocation_index, nir_def *row_start,
                            uint64_t, lower_ngg_ms_state *),
                 lower_ngg_ms_state *s)
 {
+   if (s->options->rasterizer_discard)
+      return;
+
    if (cb == &emit_ms_primitive ? s->prim_multirow_export : s->vert_multirow_export) {
       assert(s->hw_workgroup_size % s->wave_size == 0);
       const unsigned num_waves = s->hw_workgroup_size / s->wave_size;
@@ -994,8 +1026,10 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
    nir_block *last_block = nir_impl_last_block(b->impl);
    b->cursor = nir_after_block(last_block);
 
-   nir_barrier(b, .execution_scope=SCOPE_WORKGROUP, .memory_scope=SCOPE_WORKGROUP,
-                         .memory_semantics=NIR_MEMORY_ACQ_REL, .memory_modes=nir_var_shader_out|nir_var_mem_shared);
+   if (!s->options->rasterizer_discard) {
+      nir_barrier(b, .execution_scope=SCOPE_WORKGROUP, .memory_scope=SCOPE_WORKGROUP,
+                     .memory_semantics=NIR_MEMORY_ACQ_REL, .memory_modes=nir_var_shader_out | nir_var_mem_shared);
+   }
 
    nir_def *num_prm;
    nir_def *num_vtx;
@@ -1007,7 +1041,7 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
    ms_prim_gen_query(b, invocation_index, num_prm, s);
 
    nir_def *row_start = NULL;
-   if (s->fast_launch_2)
+   if (s->ac->gfx_level >= GFX11)
       row_start = s->hw_workgroup_size <= s->wave_size ? nir_imm_int(b, 0) : nir_load_subgroup_id(b);
 
    /* Load vertex/primitive attributes from shared memory and
@@ -1033,7 +1067,7 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
    const bool has_special_param_exports =
       (per_vertex_outputs & MS_VERT_ARG_EXP_MASK) ||
       (per_primitive_outputs & MS_PRIM_ARG_EXP_MASK);
-   const bool wait_attr_ring = has_special_param_exports && s->hw_info->has_attr_ring_wait_bug;
+   const bool wait_attr_ring = has_special_param_exports && s->ac->has_attr_ring_wait_bug;
 
    /* Export vertices. */
    if ((per_vertex_outputs & ~VARYING_BIT_POS) || !wait_attr_ring) {
@@ -1089,12 +1123,16 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
     *    barrier on the extra waves.
     */
    assert(s->hw_workgroup_size % s->wave_size == 0);
-   bool scan_barriers = align(s->api_workgroup_size, s->wave_size) < s->hw_workgroup_size;
-   bool can_shrink_barriers = s->api_workgroup_size <= s->wave_size;
+   const unsigned num_api_waves = DIV_ROUND_UP(s->api_workgroup_size, s->wave_size);
+   const unsigned num_hw_waves = DIV_ROUND_UP(s->hw_workgroup_size, s->wave_size);
+   const bool scan_barriers = num_api_waves < num_hw_waves;
+   const bool can_shrink_barriers = s->api_workgroup_size <= s->wave_size;
+
    bool need_additional_barriers = scan_barriers && !can_shrink_barriers;
 
    unsigned api_waves_in_flight_addr = s->layout.lds.workgroup_info_addr + lds_ms_num_api_waves;
-   unsigned num_api_waves = DIV_ROUND_UP(s->api_workgroup_size, s->wave_size);
+
+   s->has_non_api_waves = scan_barriers;
 
    /* Scan the shader for workgroup barriers. */
    if (scan_barriers) {
@@ -1106,23 +1144,24 @@ handle_smaller_ms_api_workgroup(nir_builder *b,
                continue;
 
             nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-            bool is_workgroup_barrier =
-               intrin->intrinsic == nir_intrinsic_barrier &&
-               nir_intrinsic_execution_scope(intrin) == SCOPE_WORKGROUP;
-
-            if (!is_workgroup_barrier)
+            if (intrin->intrinsic != nir_intrinsic_barrier)
                continue;
 
-            if (can_shrink_barriers) {
-               /* Every API invocation runs in the first wave.
-                * In this case, we can change the barriers to subgroup scope
-                * and avoid adding additional barriers.
-                */
-               nir_intrinsic_set_memory_scope(intrin, SCOPE_SUBGROUP);
+            /* Every API invocation runs in the first wave.
+             * In this case, we can change the barriers to subgroup scope
+             * and avoid adding additional barriers.
+             */
+            if (can_shrink_barriers &&
+                nir_intrinsic_execution_scope(intrin) == SCOPE_WORKGROUP) {
                nir_intrinsic_set_execution_scope(intrin, SCOPE_SUBGROUP);
-            } else {
-               has_any_workgroup_barriers = true;
             }
+            if (can_shrink_barriers &&
+                nir_intrinsic_memory_scope(intrin) == SCOPE_WORKGROUP) {
+               nir_intrinsic_set_memory_scope(intrin, SCOPE_SUBGROUP);
+            }
+
+            if (nir_intrinsic_execution_scope(intrin) == SCOPE_WORKGROUP)
+               has_any_workgroup_barriers = true;
          }
       }
 
@@ -1236,7 +1275,7 @@ ms_calculate_arrayed_output_layout(ms_out_mem_layout *l,
 }
 
 static ms_out_mem_layout
-ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_shared_size,
+ms_calculate_output_layout(const struct ac_compiler_info *info, unsigned api_shared_size,
                            uint64_t per_vertex_output_mask, uint64_t per_primitive_output_mask,
                            uint64_t cross_invocation_output_access, unsigned max_vertices,
                            unsigned max_primitives, unsigned vertices_per_prim)
@@ -1249,7 +1288,7 @@ ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_share
       VARYING_BIT_PRIMITIVE_COUNT |
       VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_CULL_PRIMITIVE;
 
-   const bool use_attr_ring = hw_info->has_attr_ring;
+   const bool use_attr_ring = info->has_attr_ring;
    const uint64_t attr_ring_per_vertex_output_mask =
       use_attr_ring ? per_vertex_output_mask & ~always_export_mask : 0;
    const uint64_t attr_ring_per_primitive_output_mask =
@@ -1333,16 +1372,8 @@ ms_calculate_output_layout(const struct radeon_info *hw_info, unsigned api_share
 }
 
 bool
-ac_nir_lower_ngg_mesh(nir_shader *shader,
-                      const struct radeon_info *hw_info,
-                      uint32_t clipdist_enable_mask,
-                      const uint8_t *vs_output_param_offset,
-                      bool has_param_exports,
-                      bool *out_needs_scratch_ring,
-                      unsigned wave_size,
-                      unsigned hw_workgroup_size,
-                      bool multiview,
-                      bool has_query)
+ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *options,
+                      bool *out_needs_scratch_ring)
 {
    unsigned vertices_per_prim =
       mesa_vertices_per_prim(shader->info.mesh.primitive_type);
@@ -1363,7 +1394,7 @@ ac_nir_lower_ngg_mesh(nir_shader *shader,
    unsigned max_primitives = shader->info.mesh.max_primitives_out;
 
    ms_out_mem_layout layout = ms_calculate_output_layout(
-      hw_info, shader->info.shared_size, per_vertex_outputs, per_primitive_outputs,
+      options->compiler_info, shader->info.shared_size, per_vertex_outputs, per_primitive_outputs,
       cross_invocation_access, max_vertices, max_primitives, vertices_per_prim);
 
    shader->info.shared_size = layout.lds.total_size;
@@ -1380,26 +1411,30 @@ ac_nir_lower_ngg_mesh(nir_shader *shader,
                                  shader->info.workgroup_size[1] *
                                  shader->info.workgroup_size[2];
 
-   bool fast_launch_2 = hw_info->mesh_fast_launch_2;
+   nir_custom_divergence_analysis(shader,
+      api_workgroup_size <= options->wave_size ? 0 : nir_divergence_across_subgroups);
 
+   bool fast_launch_2 = options->compiler_info->gfx_level >= GFX11;
+
+   unsigned hw_workgroup_size = options->max_workgroup_size;
    lower_ngg_ms_state state = {
+      .options = options,
       .layout = layout,
-      .wave_size = wave_size,
+      .wave_size = options->wave_size,
       .per_vertex_outputs = per_vertex_outputs,
       .per_primitive_outputs = per_primitive_outputs,
       .vertices_per_prim = vertices_per_prim,
       .api_workgroup_size = api_workgroup_size,
       .hw_workgroup_size = hw_workgroup_size,
-      .insert_layer_output = multiview && !(shader->info.outputs_written & VARYING_BIT_LAYER),
+      .insert_layer_output =
+         options->multiview && !(shader->info.outputs_written & VARYING_BIT_LAYER),
       .uses_cull_flags = uses_cull,
-      .hw_info = hw_info,
-      .fast_launch_2 = fast_launch_2,
+      .ac = options->compiler_info,
       .vert_multirow_export = fast_launch_2 && max_vertices > hw_workgroup_size,
       .prim_multirow_export = fast_launch_2 && max_primitives > hw_workgroup_size,
-      .clipdist_enable_mask = clipdist_enable_mask,
-      .vs_output_param_offset = vs_output_param_offset,
-      .has_param_exports = has_param_exports,
-      .has_query = has_query,
+      .output_counts_workgroup_uniform = true,
+      .vs_output_param_offset = options->vs_output_param_offset,
+      .has_param_exports = options->has_param_exports,
    };
 
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);

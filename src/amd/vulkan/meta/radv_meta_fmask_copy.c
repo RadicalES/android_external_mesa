@@ -7,6 +7,7 @@
 #include "nir/radv_meta_nir.h"
 #include "radv_formats.h"
 #include "radv_meta.h"
+#include "vk_shader_module.h"
 
 static VkResult
 get_pipeline_layout(struct radv_device *device, VkPipelineLayout *layout_out)
@@ -65,7 +66,7 @@ get_pipeline(struct radv_device *device, uint32_t samples_log2, VkPipeline *pipe
       return VK_SUCCESS;
    }
 
-   nir_shader *cs = radv_meta_nir_build_fmask_copy_compute_shader(device, samples);
+   nir_shader *cs = radv_meta_nir_build_fmask_copy_compute_shader(samples);
 
    const VkPipelineShaderStageCreateInfo stage_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -93,7 +94,7 @@ static void
 radv_fixup_copy_dst_metadata(struct radv_cmd_buffer *cmd_buffer, const struct radv_image *src_image,
                              const struct radv_image *dst_image)
 {
-   enum radv_copy_flags src_copy_flags = 0, dst_copy_flags = 0;
+   VkAddressCopyFlagsKHR src_copy_flags = 0, dst_copy_flags = 0;
    uint64_t src_va, dst_va, size;
 
    assert(src_image->planes[0].surface.cmask_size == dst_image->planes[0].surface.cmask_size &&
@@ -177,11 +178,11 @@ radv_fmask_copy(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf
       return;
    }
 
-   radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
 
-   const VkImageViewUsageCreateInfo src_iview_usage_info = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+   const VkImageViewUsage2CreateInfoKHR src_iview_usage_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_2_CREATE_INFO_KHR,
+      .usage = VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR,
    };
 
    radv_image_view_init(&src_iview, device,
@@ -190,7 +191,7 @@ radv_fmask_copy(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf
                            .pNext = &src_iview_usage_info,
                            .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                            .image = radv_image_to_handle(src->image),
-                           .viewType = radv_meta_get_view_type(src->image),
+                           .viewType = radv_meta_get_view_type(src->image, false),
                            .format = vk_format_no_srgb(src->image->vk.format),
                            .subresourceRange =
                               {
@@ -203,9 +204,9 @@ radv_fmask_copy(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf
                         },
                         NULL);
 
-   const VkImageViewUsageCreateInfo dst_iview_usage_info = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-      .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+   const VkImageViewUsage2CreateInfoKHR dst_iview_usage_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_2_CREATE_INFO_KHR,
+      .usage = VK_IMAGE_USAGE_2_STORAGE_BIT_KHR,
    };
 
    radv_image_view_init(&dst_iview, device,
@@ -214,7 +215,7 @@ radv_fmask_copy(struct radv_cmd_buffer *cmd_buffer, struct radv_meta_blit2d_surf
                            .pNext = &dst_iview_usage_info,
                            .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                            .image = radv_image_to_handle(dst->image),
-                           .viewType = radv_meta_get_view_type(dst->image),
+                           .viewType = radv_meta_get_view_type(dst->image, false),
                            .format = vk_format_no_srgb(dst->image->vk.format),
                            .subresourceRange =
                               {

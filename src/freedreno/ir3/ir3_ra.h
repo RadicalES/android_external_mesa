@@ -185,6 +185,9 @@ void ir3_ra_validate(struct ir3_shader_variant *v, unsigned full_size,
                      unsigned half_size, unsigned block_count, bool shared_ra);
 
 void ir3_lower_copies(struct ir3_shader_variant *v);
+void ir3_lower_copies_validate(struct ir3_shader_variant *v,
+                               struct ir3_instruction *copy_instr,
+                               struct ir3_instruction *before);
 
 /* Register interval datastructure
  *
@@ -298,5 +301,8 @@ void ra_update_affinity(unsigned file_size, struct ir3_register *reg,
                         physreg_t physreg);
 
 void ir3_ra_handle_unavailable_merge_set(struct ir3_register *reg);
+
+bool ir3_ra_src_is_killed(struct ir3_register *src,
+                          struct ir3_reg_interval *def_interval);
 
 #endif

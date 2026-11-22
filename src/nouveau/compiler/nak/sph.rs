@@ -1,17 +1,19 @@
 // Copyright © 2023 Collabora, Ltd.
 // SPDX-License-Identifier: MIT
 
-extern crate bitview;
+extern crate mesa_util;
 extern crate nvidia_headers;
 
 use crate::ir::{
-    ShaderInfo, ShaderIoInfo, ShaderModel, ShaderModelInfo, ShaderStageInfo,
+    MeshShaderInfo, ShaderInfo, ShaderIoInfo, ShaderModel, ShaderModelInfo,
+    ShaderStageInfo, VtgIoInfo,
 };
-use bitview::{
+use mesa_util::bitview::{
     BitMutView, BitMutViewable, BitView, BitViewable, SetBit, SetField,
 };
 use nak_bindings::*;
 use nvidia_headers::classes::cla097::sph::*;
+use nvidia_headers::classes::clc797::sph::*;
 use std::ops::Range;
 
 pub const _SPHV3_SHADER_HEADER_SIZE: usize = 20;
@@ -32,13 +34,22 @@ pub enum ShaderType {
 impl From<&ShaderStageInfo> for ShaderType {
     fn from(value: &ShaderStageInfo) -> Self {
         match value {
-            ShaderStageInfo::Vertex(_) => ShaderType::Vertex,
+            ShaderStageInfo::Vertex(_) | ShaderStageInfo::Task(_) => {
+                ShaderType::Vertex
+            }
             ShaderStageInfo::Fragment(_) => ShaderType::Fragment,
             ShaderStageInfo::Geometry(_) => ShaderType::Geometry,
             ShaderStageInfo::TessellationInit(_) => {
                 ShaderType::TessellationInit
             }
             ShaderStageInfo::Tessellation(_) => ShaderType::Tessellation,
+            ShaderStageInfo::Mesh(info) => {
+                if info.has_task_shader {
+                    ShaderType::Tessellation
+                } else {
+                    ShaderType::Vertex
+                }
+            }
             _ => panic!("Invalid ShaderStageInfo {:?}", value),
         }
     }
@@ -435,15 +446,15 @@ impl ShaderProgramHeader {
     }
 
     #[inline]
-    pub fn set_does_interlock(&mut self, does_interlock: bool) {
+    pub fn set_reads_interlock_ticket(&mut self, reads_interlock_ticket: bool) {
         assert!(self.shader_type == ShaderType::Fragment);
-        self.set_bit(610, does_interlock);
+        self.set_field(SPHV4_T2_READS_INTERLOCK_TICKET, reads_interlock_ticket);
     }
 
     #[inline]
-    pub fn set_uses_underestimate(&mut self, uses_underestimate: bool) {
+    pub fn set_uses_inner_coverage(&mut self, uses_inner_coverage: bool) {
         assert!(self.shader_type == ShaderType::Fragment);
-        self.set_bit(611, uses_underestimate);
+        self.set_field(SPHV4_T2_USES_INNER_COVERAGE, uses_inner_coverage);
     }
 
     #[inline]
@@ -461,6 +472,27 @@ impl ShaderProgramHeader {
         self.pervertex_imap_vector_ps()
             .set_field(index * 32..(index + 1) * 32, value);
     }
+}
+
+fn encode_vtg_io(sph: &mut ShaderProgramHeader, io: &VtgIoInfo) {
+    sph.set_imap_system_values_ab(io.sysvals_in.ab);
+    sph.set_imap_system_values_c(io.sysvals_in.c);
+    sph.set_imap_system_values_d_vtg(io.sysvals_in_d);
+
+    for (index, value) in io.attr_in.iter().enumerate() {
+        sph.set_imap_vector_vtg(index, *value);
+    }
+
+    for (index, value) in io.attr_out.iter().enumerate() {
+        sph.set_omap_vector(index, *value);
+    }
+
+    sph.set_store_req_start(io.store_req_start);
+    sph.set_store_req_end(io.store_req_end);
+
+    sph.set_omap_system_values_ab(io.sysvals_out.ab);
+    sph.set_omap_system_values_c(io.sysvals_out.c);
+    sph.set_omap_system_values_d_vtg(io.sysvals_out_d);
 }
 
 pub fn encode_header(
@@ -488,26 +520,7 @@ pub fn encode_header(
     sph.set_shader_local_memory_crs_size(crs_size);
 
     match &shader_info.io {
-        ShaderIoInfo::Vtg(io) => {
-            sph.set_imap_system_values_ab(io.sysvals_in.ab);
-            sph.set_imap_system_values_c(io.sysvals_in.c);
-            sph.set_imap_system_values_d_vtg(io.sysvals_in_d);
-
-            for (index, value) in io.attr_in.iter().enumerate() {
-                sph.set_imap_vector_vtg(index, *value);
-            }
-
-            for (index, value) in io.attr_out.iter().enumerate() {
-                sph.set_omap_vector(index, *value);
-            }
-
-            sph.set_store_req_start(io.store_req_start);
-            sph.set_store_req_end(io.store_req_end);
-
-            sph.set_omap_system_values_ab(io.sysvals_out.ab);
-            sph.set_omap_system_values_c(io.sysvals_out.c);
-            sph.set_omap_system_values_d_vtg(io.sysvals_out_d);
-        }
+        ShaderIoInfo::Vtg(io) => encode_vtg_io(&mut sph, io),
         ShaderIoInfo::Fragment(io) => {
             sph.set_imap_system_values_ab(io.sysvals_in.ab);
             sph.set_imap_system_values_c(io.sysvals_in.c);
@@ -534,7 +547,7 @@ pub fn encode_header(
             sph.set_omap_sample_mask(io.writes_sample_mask);
             sph.set_omap_depth(io.writes_depth);
             sph.set_omap_targets(io.writes_color);
-            sph.set_uses_underestimate(uses_underestimate);
+            sph.set_uses_inner_coverage(uses_underestimate);
 
             for (index, value) in io.barycentric_attr_in.iter().enumerate() {
                 sph.set_pervertex_imap_vector(index, *value);
@@ -550,7 +563,7 @@ pub fn encode_header(
         ShaderStageInfo::Fragment(stage) => {
             let zs_self_dep = fs_key.is_some_and(|key| key.zs_self_dep);
             sph.set_kills_pixels(stage.uses_kill || zs_self_dep);
-            sph.set_does_interlock(stage.does_interlock);
+            sph.set_reads_interlock_ticket(stage.reads_interlock_ticket);
         }
         ShaderStageInfo::Geometry(stage) => {
             sph.set_gs_passthrough_enable(stage.passthrough_enable);
@@ -570,6 +583,28 @@ pub fn encode_header(
         }
         _ => {}
     };
+
+    sph.data
+}
+
+pub fn encode_gs_mesh_header(
+    sm: u8,
+    mesh_info: &MeshShaderInfo,
+) -> [u32; CURRENT_MAX_SHADER_HEADER_SIZE] {
+    // If there is no usage of per primitive output, we can skip the GS stage.
+    if !mesh_info.has_gs_sph {
+        return [0_u32; CURRENT_MAX_SHADER_HEADER_SIZE];
+    }
+
+    let mut sph = ShaderProgramHeader::new(ShaderType::Geometry, sm);
+    sph.set_sass_version(1);
+    sph.set_gs_passthrough_enable(true);
+    sph.set_stream_out_mask(0);
+    sph.set_threads_per_input_primitive(1);
+    sph.set_output_topology(OutputTopology::PointList);
+    sph.set_max_output_vertex_count(1);
+
+    encode_vtg_io(&mut sph, &mesh_info.primitive_io);
 
     sph.data
 }

@@ -1,24 +1,6 @@
 /*
  * Copyright © 2015-2016 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "brw_compiler.h"
@@ -31,13 +13,13 @@
 #include "util/u_debug.h"
 
 const struct nir_shader_compiler_options brw_scalar_nir_options = {
-   .avoid_ternary_with_two_constants = true,
    .compact_arrays = true,
    .discard_is_demote = true,
    .divergence_analysis_options =
       (nir_divergence_single_patch_per_tcs_subgroup |
        nir_divergence_single_patch_per_tes_subgroup |
-       nir_divergence_shader_record_ptr_uniform),
+       nir_divergence_shader_record_ptr_uniform |
+       nir_divergence_tcs_invocation_id_uniform),
    .force_indirect_unrolling = nir_var_function_temp,
    .has_bfe = true,
    .has_bfi = true,
@@ -47,6 +29,8 @@ const struct nir_shader_compiler_options brw_scalar_nir_options = {
    .has_pack_32_4x8 = true,
    .has_uclz = true,
    .has_pixel_coord = true,
+   .float_mul_add16 = nir_float_muladd_support_has_ffma,
+   .float_mul_add32 = nir_float_muladd_support_has_ffma,
    .lower_base_vertex = true,
    .lower_bitfield_extract = true,
    .lower_bitfield_extract8 = true,
@@ -64,17 +48,18 @@ const struct nir_shader_compiler_options brw_scalar_nir_options = {
    .lower_insert_word = true,
    .lower_isign = true,
    .lower_layer_fs_input_to_sysval = true,
-   .lower_ldexp = true,
    .lower_pack_half_2x16 = true,
    .lower_pack_snorm_2x16 = true,
    .lower_pack_snorm_4x8 = true,
    .lower_pack_unorm_2x16 = true,
    .lower_pack_unorm_4x8 = true,
    .lower_pack_64_4x16 = true,
+   .lower_pack_64_2x32 = true,
    .lower_scmp = true,
    .lower_to_scalar = true,
    .lower_uadd_carry = true,
    .lower_ufind_msb = true,
+   .lower_ifind_msb = true,
    .lower_uniforms_to_ubo = true,
    .lower_unpack_half_2x16 = true,
    .lower_unpack_snorm_2x16 = true,
@@ -93,6 +78,8 @@ const struct nir_shader_compiler_options brw_scalar_nir_options = {
    .support_indirect_outputs = (uint8_t)BITFIELD_MASK(MESA_SHADER_STAGES),
    .per_view_unique_driver_locations = true,
    .compact_view_index = true,
+   .io_options = nir_io_use_frag_result_dual_src_blend,
+   .has_find_msb_rev = true,
 };
 
 struct brw_compiler *
@@ -105,14 +92,11 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
 
    brw_init_isa_info(&compiler->isa, devinfo);
 
-   brw_alloc_reg_sets(compiler);
+   brw_alloc_reg_sets(compiler, 0);
+   if (intel_threads_per_eu_min != -1 || intel_threads_per_eu_set != -1)
+      brw_alloc_reg_sets(compiler, 1);
 
    compiler->precise_trig = debug_get_bool_option("INTEL_PRECISE_TRIG", false);
-
-   compiler->extended_bindless_surface_offset = devinfo->verx10 >= 125;
-   compiler->use_tcs_multi_patch = devinfo->ver >= 12;
-
-   compiler->indirect_ubos_use_sampler = devinfo->ver < 12;
 
    compiler->lower_dpas = !devinfo->has_systolic ||
                           debug_get_bool_option("INTEL_LOWER_DPAS", false);
@@ -186,6 +170,12 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
    struct nir_shader_compiler_options *nir_options = &compiler->nir_options[0];
    *nir_options = brw_scalar_nir_options;
 
+   /* Weigh gcm loop hoist pressure against the same number the backend uses
+    * to decide a shader is under too much pressure.
+    */
+   nir_options->max_gcm_loop_pressure = compiler->register_pressure_threshold;
+   nir_options->gcm_divergent_pressure_scale = devinfo->ver >= 30 ? 2 : 1;
+
    /* Gfx11 loses LRP. */
    nir_options->lower_flrp32 = devinfo->ver >= 11;
 
@@ -204,11 +194,16 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
 
    nir_options->has_bitfield_select = devinfo->verx10 >= 125;
 
+   /* jay (>=xe2) shouldn't have this; brw (<=xe1) should */
+   nir_options->avoid_ternary_with_two_constants = devinfo->ver < 20;
+
    nir_options->lower_int64_options = int64_options;
    nir_options->lower_doubles_options = fp64_options;
+   if (!(fp64_options & nir_lower_fp64_full_software))
+      nir_options->float_mul_add64 |= nir_float_muladd_support_has_ffma;
    nir_options->max_samples = devinfo->ver >= 30 ? 8 : 16;
 
-   if (compiler->use_tcs_multi_patch) {
+   if (intel_use_tcs_multi_patch(devinfo)) {
       /* TCS MULTI_PATCH mode has multiple patches per subgroup */
       nir_options->divergence_analysis_options &=
          ~nir_divergence_single_patch_per_tcs_subgroup;
@@ -218,6 +213,8 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
       nir_options->divergence_analysis_options |=
          nir_divergence_single_prim_per_subgroup;
 
+   nir_options->has_tanh = devinfo->ver >= 35;
+
    for (int i = 0; i < MESA_ALL_SHADER_STAGES; i++) {
       struct nir_shader_compiler_options *stage_options =
          &compiler->nir_options[i];
@@ -225,8 +222,7 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
 
       stage_options->unify_interfaces = i < MESA_SHADER_FRAGMENT;
 
-      stage_options->force_indirect_unrolling |=
-         brw_nir_no_indirect_mask(compiler, i);
+      stage_options->force_indirect_unrolling |= brw_nir_no_indirect_mask(i);
    }
 
    /* Build a list of storage format compatible in component bit size &
@@ -269,6 +265,8 @@ brw_get_compiler_config_value(const struct brw_compiler *compiler)
 
    insert_u64_bit(&config, compiler->precise_trig);
    bits++;
+   insert_u64_bit(&config, compiler->limit_trig_input_range);
+   bits++;
    insert_u64_bit(&config, compiler->lower_dpas);
    bits++;
    insert_u64_bit(&config, compiler->optimistic_simd_heuristic);
@@ -279,11 +277,12 @@ brw_get_compiler_config_value(const struct brw_compiler *compiler)
       DEBUG_SPILL_FS,
       DEBUG_SPILL_VEC4,
       DEBUG_NO_COMPACTION,
-      DEBUG_DO32,
       DEBUG_SOFT64,
       DEBUG_NO_SEND_GATHER,
       DEBUG_NO_VRT,
       DEBUG_NO_FILL_OPT,
+      DEBUG_NO_JAY,
+      DEBUG_SHADER_HASH,
    };
    for (uint32_t i = 0; i < ARRAY_SIZE(debug_bits); i++) {
       insert_u64_bit(&config, INTEL_DEBUG(debug_bits[i]));
@@ -296,6 +295,14 @@ brw_get_compiler_config_value(const struct brw_compiler *compiler)
    u_foreach_bit64(bit, mask)
       insert_u64_bit(&config, (intel_simd & (1ULL << bit)) != 0);
 
+   for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
+      insert_u64_bit(&config, (intel_simd_overridden & (1 << i)) != 0);
+      bits++;
+      insert_u64_bit(&config,
+                     intel_use_jay_for_stage(compiler->devinfo, i) != 0);
+      bits++;
+   }
+
    mask = 3;
    bits += util_bitcount64(mask);
 
@@ -305,14 +312,14 @@ brw_get_compiler_config_value(const struct brw_compiler *compiler)
 }
 
 void
-brw_device_sha1(char *hex,
+brw_device_blake3(char *hex,
                 const struct intel_device_info *devinfo) {
-   struct mesa_sha1 ctx;
-   _mesa_sha1_init(&ctx);
-   brw_device_sha1_update(&ctx, devinfo);
-   unsigned char result[SHA1_DIGEST_LENGTH];
-   _mesa_sha1_final(&ctx, result);
-   _mesa_sha1_format(hex, result);
+   blake3_hasher ctx;
+   _mesa_blake3_init(&ctx);
+   brw_device_blake3_update(&ctx, devinfo);
+   unsigned char result[BLAKE3_KEY_LEN];
+   _mesa_blake3_final(&ctx, result);
+   _mesa_blake3_format(hex, result);
 }
 
 unsigned
@@ -323,7 +330,7 @@ brw_prog_data_size(mesa_shader_stage stage)
       [MESA_SHADER_TESS_CTRL]    = sizeof(struct brw_tcs_prog_data),
       [MESA_SHADER_TESS_EVAL]    = sizeof(struct brw_tes_prog_data),
       [MESA_SHADER_GEOMETRY]     = sizeof(struct brw_gs_prog_data),
-      [MESA_SHADER_FRAGMENT]     = sizeof(struct brw_wm_prog_data),
+      [MESA_SHADER_FRAGMENT]     = sizeof(struct brw_fs_prog_data),
       [MESA_SHADER_COMPUTE]      = sizeof(struct brw_cs_prog_data),
       [MESA_SHADER_TASK]         = sizeof(struct brw_task_prog_data),
       [MESA_SHADER_MESH]         = sizeof(struct brw_mesh_prog_data),
@@ -347,7 +354,7 @@ brw_prog_key_size(mesa_shader_stage stage)
       [MESA_SHADER_TESS_CTRL]    = sizeof(struct brw_tcs_prog_key),
       [MESA_SHADER_TESS_EVAL]    = sizeof(struct brw_tes_prog_key),
       [MESA_SHADER_GEOMETRY]     = sizeof(struct brw_gs_prog_key),
-      [MESA_SHADER_FRAGMENT]     = sizeof(struct brw_wm_prog_key),
+      [MESA_SHADER_FRAGMENT]     = sizeof(struct brw_fs_prog_key),
       [MESA_SHADER_COMPUTE]      = sizeof(struct brw_cs_prog_key),
       [MESA_SHADER_TASK]         = sizeof(struct brw_task_prog_key),
       [MESA_SHADER_MESH]         = sizeof(struct brw_mesh_prog_key),
@@ -381,7 +388,7 @@ brw_write_shader_relocs(const struct brw_isa_info *isa,
                *(uint32_t *)dst = value;
                break;
             case INTEL_SHADER_RELOC_TYPE_MOV_IMM:
-               brw_update_reloc_imm(isa, dst, value);
+               gen_update_reloc_imm(isa->devinfo, dst, value);
                break;
             default:
                UNREACHABLE("Invalid relocation type");
@@ -390,14 +397,4 @@ brw_write_shader_relocs(const struct brw_isa_info *isa,
          }
       }
    }
-}
-
-unsigned
-ptl_register_blocks(unsigned grf_used)
-{
-   if (INTEL_DEBUG(DEBUG_NO_VRT))
-      return (BRW_MAX_GRF / 32) - 1;
-
-   const unsigned n = DIV_ROUND_UP(grf_used, 32) - 1;
-   return (n < 6 ? n : 7);
 }

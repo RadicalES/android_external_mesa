@@ -33,7 +33,6 @@ typedef struct glsl_type glsl_type;
 /* Minimum number of inlined shaders to use binary search to select which shader to run. */
 #define INLINED_SHADER_BSEARCH_THRESHOLD 16
 
-
 /*
  *
  * Shader Inlining
@@ -41,7 +40,7 @@ typedef struct glsl_type glsl_type;
  */
 
 struct radv_rt_case_data {
-   struct radv_device *device;
+   const struct radv_compiler_info *compiler_info;
    struct radv_ray_tracing_pipeline *pipeline;
    void *param_data;
 };
@@ -57,7 +56,6 @@ void radv_visit_inlined_shaders(nir_builder *b, nir_def *sbt_idx, bool can_have_
 
 /* Transfer inline constant data from src to dst, to prepare inlining src into dst */
 void radv_nir_inline_constants(nir_shader *dst, nir_shader *src);
-
 
 /*
  *
@@ -154,8 +152,12 @@ struct radv_nir_rt_traversal_result {
    nir_variable *barycentrics;
 };
 
-struct radv_nir_rt_traversal_result radv_build_traversal(struct radv_device *device,
+struct radv_nir_rt_traversal_result radv_build_traversal(const struct radv_compiler_info *compiler_info,
                                                          struct radv_ray_tracing_pipeline *pipeline, nir_builder *b,
                                                          struct radv_nir_rt_traversal_params *params,
                                                          struct radv_ray_tracing_stage_info *info);
+
+void radv_build_rt_prolog(const struct radv_compiler_info *compiler_info, struct radv_shader_stage *stage,
+                          bool uses_descriptor_heap, struct radv_shader_debug_info *debug);
+
 #endif // MESA_RADV_NIR_RT_STAGE_COMMON_H

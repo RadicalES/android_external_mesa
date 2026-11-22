@@ -229,6 +229,7 @@ nouveau_object_channel_del(struct nouveau_object *obj)
 static void
 nouveau_object_subchan_del(struct nouveau_object *obj)
 {
+   struct nouveau_drm *drm = nouveau_drm(obj->parent);
    struct {
       struct nvif_ioctl_v0 ioctl;
       struct nvif_ioctl_del del;
@@ -242,7 +243,7 @@ nouveau_object_subchan_del(struct nouveau_object *obj)
       },
    };
 
-   drmCommandWrite(obj->parent->handle, DRM_NOUVEAU_NVIF, &args, sizeof(args));
+   drmCommandWrite(drm->fd, DRM_NOUVEAU_NVIF, &args, sizeof(args));
 }
 
 static void
@@ -1163,8 +1164,8 @@ pushbuf_submit(struct nouveau_pushbuf *push, struct nouveau_object *chan)
    if (chan->oclass != NOUVEAU_FIFO_CHANNEL_CLASS)
       return -EINVAL;
 
-   if (push->kick_notify)
-      push->kick_notify(push);
+   if (push->kick_notify && !push->kick_notify(push))
+      return -EINVAL;
 
    nouveau_pushbuf_data(push, NULL, 0, 0);
 
@@ -1723,7 +1724,7 @@ nouveau_pushbuf_space(struct nouveau_pushbuf *push, uint32_t dwords, uint32_t re
    int ret = 0;
 
    /* switch to next buffer if insufficient space in the current one */
-   if (push->cur + dwords >= push->end) {
+   if (!push->cur || (push->cur + dwords >= push->end)) {
       if (nvpb->bo_next < nvpb->bo_nr) {
          nouveau_bo_ref(nvpb->bos[nvpb->bo_next++], &bo);
          if (nvpb->bo_next == nvpb->bo_nr)

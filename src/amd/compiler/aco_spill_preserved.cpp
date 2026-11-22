@@ -52,7 +52,8 @@ struct spill_preserved_ctx {
             DIV_ROUND_UP(program_->config->scratch_bytes_per_wave, program_->wave_size)),
          next_preserved_lane(0)
    {
-      program->callee_abi.preservedRegisters(abi_preserved_regs);
+      if (program->is_callee)
+         program->callee_abi.preservedRegisters(abi_preserved_regs);
       dom_info.resize(program->blocks.size(), {-1u, -1u});
    }
 };
@@ -197,34 +198,32 @@ emit_vgpr_spills_reloads(spill_preserved_ctx& ctx, Builder& bld,
                   Operand(stack_reg.advance(4), s1), Operand::c32(0), Operand(scc, s1));
       bld.sopc(aco_opcode::s_bitcmp1_b32, Definition(scc, s1), Operand(stack_reg, s1),
                Operand::c32(0));
-      bld.sop1(aco_opcode::s_bitset0_b32, Definition(stack_reg, s1), Operand::c32(0), Operand(stack_reg, s1));
+      bld.sop1(aco_opcode::s_bitset0_b32, Definition(stack_reg, s1), Operand::c32(0),
+               Operand(stack_reg, s1));
    }
 
    for (const auto& spill : spills) {
       if (ctx.program->gfx_level >= GFX9) {
          if (reload)
-            bld.scratch(aco_opcode::scratch_load_dword,
-                        Definition(spill.first, linear ? v1.as_linear() : v1), Operand(v1),
-                        Operand(stack_reg, s1), spill.second - spill_stack_base,
+            bld.scratch(aco_opcode::scratch_load_dword, Definition(spill.first, linear ? lv1 : v1),
+                        Operand(v1), Operand(stack_reg, s1), spill.second - spill_stack_base,
                         memory_sync_info(storage_vgpr_spill, semantic_private));
          else
             bld.scratch(aco_opcode::scratch_store_dword, Operand(v1), Operand(stack_reg, s1),
-                        Operand(spill.first, linear ? v1.as_linear() : v1),
-                        spill.second - spill_stack_base,
+                        Operand(spill.first, linear ? lv1 : v1), spill.second - spill_stack_base,
                         memory_sync_info(storage_vgpr_spill, semantic_private));
       } else {
          if (reload) {
-            Instruction* instr = bld.mubuf(aco_opcode::buffer_load_dword,
-                                           Definition(spill.first, linear ? v1.as_linear() : v1),
-                                           Operand(stack_reg, s4), Operand(v1), Operand::c32(0),
-                                           spill.second - spill_stack_base, false);
+            Instruction* instr =
+               bld.mubuf(aco_opcode::buffer_load_dword, Definition(spill.first, linear ? lv1 : v1),
+                         Operand(stack_reg, s4), Operand(v1), Operand::c32(0),
+                         spill.second - spill_stack_base, false);
             instr->mubuf().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
             instr->mubuf().cache.value = ac_swizzled;
          } else {
-            Instruction* instr =
-               bld.mubuf(aco_opcode::buffer_store_dword, Operand(stack_reg, s4), Operand(v1),
-                         Operand::c32(0), Operand(spill.first, linear ? v1.as_linear() : v1),
-                         spill.second - spill_stack_base, false);
+            Instruction* instr = bld.mubuf(
+               aco_opcode::buffer_store_dword, Operand(stack_reg, s4), Operand(v1), Operand::c32(0),
+               Operand(spill.first, linear ? lv1 : v1), spill.second - spill_stack_base, false);
             instr->mubuf().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
             instr->mubuf().cache.value = ac_swizzled;
          }
@@ -259,7 +258,7 @@ emit_sgpr_spills_reloads(spill_preserved_ctx& ctx, std::vector<aco_ptr<Instructi
    for (auto& spill : spills) {
       unsigned vgpr_idx = spill.second / ctx.program->wave_size;
       unsigned lane = spill.second % ctx.program->wave_size;
-      Operand vgpr_op = Operand(spill_reg.advance(vgpr_idx * 4), v1.as_linear());
+      Operand vgpr_op = Operand(spill_reg.advance(vgpr_idx * 4), lv1);
       if (reload)
          bld.pseudo(aco_opcode::p_reload, bld.def(s1, spill.first), vgpr_op, Operand::c32(lane));
       else
@@ -325,7 +324,7 @@ emit_spills_reloads(spill_preserved_ctx& ctx, std::vector<aco_ptr<Instruction>>&
 
       bool found_reg = false;
       unsigned start_reg, end_reg;
-      BITSET_FOREACH_RANGE(start_reg, end_reg, unused_sgprs, 256) {
+      BITSET_FOREACH_RANGE (start_reg, end_reg, unused_sgprs, 256) {
          if (ctx.program->lane_mask.size() > 1 && (start_reg & 0x1))
             ++start_reg;
 
@@ -364,7 +363,7 @@ emit_spills_reloads(spill_preserved_ctx& ctx, std::vector<aco_ptr<Instruction>>&
       ++insert_point;
 
    insert_point = instructions.insert(insert_point, std::move_iterator(spill_instructions.begin()),
-                       std::move_iterator(spill_instructions.end()));
+                                      std::move_iterator(spill_instructions.end()));
 }
 
 void
@@ -490,7 +489,8 @@ init_block_info(spill_preserved_ctx& ctx)
        * VGPRs used to spill preserved SGPRs to the set of used linear VGPRs, as add_instr might not
        * have seen any actual uses of these VGPRs yet.
        */
-      unsigned linear_vgprs_needed = DIV_ROUND_UP(ctx.preserved_sgprs.size(), ctx.program->wave_size);
+      unsigned linear_vgprs_needed =
+         DIV_ROUND_UP(ctx.preserved_sgprs.size(), ctx.program->wave_size);
 
       for (auto spill_reg : ctx.sgpr_spill_regs) {
          for (unsigned i = 0; i < linear_vgprs_needed; ++i)
@@ -678,8 +678,8 @@ emit_preserved_spills(spill_preserved_ctx& ctx)
       emit_spills_reloads(ctx, ctx.program->blocks[i].instructions, end_instr, block_reloads[i],
                           lvgpr_block_reloads[i], true);
       if (spill_reg) {
-         emit_sgpr_spills_reloads(ctx, ctx.program->blocks[i].instructions, end_instr,
-                                  *spill_reg, sgpr_block_reloads[i], true);
+         emit_sgpr_spills_reloads(ctx, ctx.program->blocks[i].instructions, end_instr, *spill_reg,
+                                  sgpr_block_reloads[i], true);
       }
    }
 }

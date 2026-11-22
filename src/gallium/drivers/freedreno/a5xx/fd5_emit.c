@@ -15,6 +15,7 @@
 
 #include "freedreno_query_hw.h"
 #include "freedreno_resource.h"
+#include "freedreno_state.h"
 
 #include "fd5_blend.h"
 #include "fd5_blitter.h"
@@ -304,7 +305,7 @@ emit_border_color(struct fd_context *ctx, struct fd_ringbuffer *ring) assert_dt
    setup_border_colors(&ctx->tex[MESA_SHADER_FRAGMENT],
                        &entries[ctx->tex[MESA_SHADER_VERTEX].num_samplers]);
 
-   OUT_PKT4(ring, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR_LO, 2);
+   OUT_PKT4(ring, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR, 2);
    OUT_RELOC(ring, fd_resource(fd5_ctx->border_color_buf)->bo, off, 0, 0);
 
    u_upload_unmap(fd5_ctx->border_color_uploader);
@@ -462,11 +463,17 @@ fd5_emit_vertex_bufs(struct fd_ringbuffer *ring, struct fd5_emit *emit)
          enum a5xx_vtx_fmt fmt = fd5_pipe2vtx(pfmt);
          bool isint = util_format_is_pure_integer(pfmt);
          uint32_t off = vb->buffer_offset + elem->src_offset;
-         uint32_t size = vb->buffer.resource->width0 - off;
+         uint32_t size = rsc ? vb->buffer.resource->width0 - off : 0;
          assert(fmt != VFMT5_NONE);
 
          OUT_PKT4(ring, REG_A5XX_VFD_FETCH(j), 4);
-         OUT_RELOC(ring, rsc->bo, off, 0, 0);
+         /* undefined results are allowed here, a crash is not */
+         if (rsc) {
+            OUT_RELOC(ring, rsc->bo, off, 0, 0);
+         } else {
+            OUT_RING(ring, 0); /* VFD_FETCH[j].BASE_LO */
+            OUT_RING(ring, 0); /* VFD_FETCH[j].BASE_HI */
+         }
          OUT_RING(ring, size);       /* VFD_FETCH[j].SIZE */
          OUT_RING(ring, elem->src_stride); /* VFD_FETCH[j].STRIDE */
 
@@ -507,12 +514,17 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
 
    emit_marker5(ring, 5);
 
-   if ((dirty & FD_DIRTY_FRAMEBUFFER) && !emit->binning_pass) {
+   if ((dirty & (FD_DIRTY_FRAMEBUFFER | FD_DIRTY_PROG)) &&
+       !emit->binning_pass) {
       unsigned char mrt_comp[A5XX_MAX_RENDER_TARGETS] = {0};
 
       for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
          mrt_comp[i] = ((i < pfb->nr_cbufs) && pfb->cbufs[i].texture) ? 0xf : 0;
       }
+
+      /* dual source blending has an extra fs output in the 2nd slot */
+      if (fp->dual_src_blend)
+         mrt_comp[1] = 0xf;
 
       OUT_PKT4(ring, REG_A5XX_RB_RENDER_COMPONENTS, 1);
       OUT_RING(ring, A5XX_RB_RENDER_COMPONENTS_RT0(mrt_comp[0]) |
@@ -574,7 +586,9 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
                    fp->writes_pos;
 
       OUT_PKT4(ring, REG_A5XX_RB_DEPTH_CNTL, 1);
-      OUT_RING(ring, zsa->rb_depth_cntl);
+      OUT_RING(ring, zsa->rb_depth_cntl |
+                        COND(fd_depth_clamp_enabled(ctx),
+                             A5XX_RB_DEPTH_CNTL_Z_CLAMP_ENABLE));
 
       OUT_PKT4(ring, REG_A5XX_RB_DEPTH_PLANE_CNTL, 1);
       OUT_RING(ring, COND(fragz, A5XX_RB_DEPTH_PLANE_CNTL_FRAG_WRITES_Z) |
@@ -628,6 +642,24 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
       OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZSCALE_0(vp->scale[2]));
    }
 
+   if ((dirty & (FD_DIRTY_VIEWPORT | FD_DIRTY_RASTERIZER)) &&
+       fd_depth_clamp_enabled(ctx)) {
+      struct pipe_viewport_state *vp = &ctx->viewport[0];
+      /* Not min/max: a reversed range stays reversed or the clamp inverts. */
+      float znear = ctx->rasterizer->clip_halfz
+                       ? vp->translate[2]
+                       : vp->translate[2] - vp->scale[2];
+      float zfar = vp->translate[2] + vp->scale[2];
+
+      OUT_PKT4(ring, REG_A5XX_GRAS_CL_VIEWPORT_ZCLAMP_NEAR_0, 2);
+      OUT_RING(ring, A5XX_GRAS_CL_VIEWPORT_ZCLAMP_NEAR_0(znear));
+      OUT_RING(ring, A5XX_GRAS_CL_VIEWPORT_ZCLAMP_FAR_0(zfar));
+
+      OUT_PKT4(ring, REG_A5XX_RB_VIEWPORT_ZCLAMP_NEAR, 2);
+      OUT_RING(ring, A5XX_RB_VIEWPORT_ZCLAMP_NEAR(znear));
+      OUT_RING(ring, A5XX_RB_VIEWPORT_ZCLAMP_FAR(zfar));
+   }
+
    if (dirty & FD_DIRTY_PROG)
       fd5_program_emit(ctx, ring, emit);
 
@@ -679,22 +711,39 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
 
    if (dirty & (FD_DIRTY_FRAMEBUFFER | FD_DIRTY_RASTERIZER | FD_DIRTY_PROG)) {
       uint32_t posz_regid = ir3_find_output_regid(fp, FRAG_RESULT_DEPTH);
+      uint32_t smask_regid = ir3_find_output_regid(fp, FRAG_RESULT_SAMPLE_MASK);
+      bool writes_smask = fp->writes_smask;
       unsigned nr = pfb->nr_cbufs;
+      bool dual = false;
+
+      /* gl_SampleMask is a multisample-only op; ignore it on single-sample. */
+      if (pfb->samples <= 1) {
+         smask_regid = regid(63, 0);
+         writes_smask = false;
+      }
 
       if (emit->binning_pass)
          nr = 0;
       else if (ctx->rasterizer->rasterizer_discard)
          nr = 0;
+      else if (fp->dual_src_blend) {
+         nr = 2;
+         dual = true;
+      }
 
       OUT_PKT4(ring, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
       OUT_RING(ring,
                A5XX_RB_FS_OUTPUT_CNTL_MRT(nr) |
-                  COND(fp->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z));
+                  COND(dual, A5XX_RB_FS_OUTPUT_CNTL_DUAL_COLOR_IN_ENABLE) |
+                  COND(fp->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z) |
+                  COND(writes_smask,
+                       A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_SAMPMASK));
 
       OUT_PKT4(ring, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
       OUT_RING(ring, A5XX_SP_FS_OUTPUT_CNTL_MRT(nr) |
+                        COND(dual, A5XX_SP_FS_OUTPUT_CNTL_DUAL_COLOR_IN_ENABLE) |
                         A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(posz_regid) |
-                        A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
+                        A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(smask_regid));
    }
 
    ir3_emit_vs_consts(vp, ring, ctx, emit->info, emit->indirect, emit->draw);
@@ -712,7 +761,7 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
          if (!target)
             continue;
 
-         OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE_LO(i), 3);
+         OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE(i), 3);
          /* VPC_SO[i].BUFFER_BASE_LO: */
          OUT_RELOC(ring, fd_resource(target->base.buffer)->bo, 0, 0, 0);
          OUT_RING(ring, target->base.buffer_size + target->base.buffer_offset);
@@ -724,7 +773,8 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
 
             OUT_PKT7(ring, CP_MEM_WRITE, 3);
             OUT_RELOC(ring, offset_bo, 0, 0, 0);
-            OUT_RING(ring, target->base.buffer_offset);
+            /* the counter is in dwords, VPC_SO_BUFFER_OFFSET in bytes: */
+            OUT_RING(ring, target->base.buffer_offset >> 2);
 
             OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_OFFSET(i), 1);
             OUT_RING(ring, target->base.buffer_offset);
@@ -732,13 +782,13 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
             OUT_PKT7(ring, CP_MEM_TO_REG, 3);
             OUT_RING(ring,
                      CP_MEM_TO_REG_0_REG(REG_A5XX_VPC_SO_BUFFER_OFFSET(i)) |
-                        CP_MEM_TO_REG_0_SHIFT_BY_2 | CP_MEM_TO_REG_0_UNK31 |
+                        CP_MEM_TO_REG_0_SHIFT_BY_2 | CP_MEM_TO_REG_0_WAIT_CACHE_FLUSH |
                         CP_MEM_TO_REG_0_CNT(0));
             OUT_RELOC(ring, offset_bo, 0, 0, 0);
          }
 
          // After a draw HW would write the new offset to offset_bo
-         OUT_PKT4(ring, REG_A5XX_VPC_SO_FLUSH_BASE_LO(i), 2);
+         OUT_PKT4(ring, REG_A5XX_VPC_SO_FLUSH_BASE(i), 2);
          OUT_RELOC(ring, offset_bo, 0, 0, 0);
 
          so->reset &= ~(1 << i);
@@ -822,14 +872,19 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
       OUT_RING(ring, A5XX_RB_BLEND_ALPHA_F32(bcolor->color[3]));
    }
 
-   if (ctx->dirty_shader[MESA_SHADER_VERTEX] & FD_DIRTY_SHADER_TEX) {
+   /* The program's HLSQ_UPDATE_CNTL write discards state loaded before it
+    * that no draw has used yet, so reload it after the program.
+    */
+   bool reload = dirty & FD_DIRTY_PROG;
+
+   if (reload || (ctx->dirty_shader[MESA_SHADER_VERTEX] & FD_DIRTY_SHADER_TEX)) {
       needs_border |=
          emit_textures(ctx, ring, SB4_VS_TEX, &ctx->tex[MESA_SHADER_VERTEX]);
       OUT_PKT4(ring, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
       OUT_RING(ring, ctx->tex[MESA_SHADER_VERTEX].num_textures);
    }
 
-   if (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & FD_DIRTY_SHADER_TEX) {
+   if (reload || (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & FD_DIRTY_SHADER_TEX)) {
       needs_border |=
          emit_textures(ctx, ring, SB4_FS_TEX, &ctx->tex[MESA_SHADER_FRAGMENT]);
    }
@@ -846,11 +901,11 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
       emit_border_color(ctx, ring);
 
    if (!emit->binning_pass) {
-      if (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & FD_DIRTY_SHADER_SSBO)
+      if (reload || (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & FD_DIRTY_SHADER_SSBO))
          emit_ssbos(ctx, ring, SB4_SSBO, &ctx->shaderbuf[MESA_SHADER_FRAGMENT],
                   fp);
 
-      if (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & FD_DIRTY_SHADER_IMAGE)
+      if (reload || (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & FD_DIRTY_SHADER_IMAGE))
          fd5_emit_images(ctx, ring, MESA_SHADER_FRAGMENT, fp);
    }
 }
@@ -896,6 +951,38 @@ fd5_emit_cs_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
 
    if (dirty & FD_DIRTY_SHADER_IMAGE)
       fd5_emit_images(ctx, ring, MESA_SHADER_COMPUTE, cp);
+}
+
+/* Workaround bits the kernel sets in hw_init, which the restore rewrites */
+static bool
+fd5_rb_dp2_clock_gating_disabled(const struct fd_screen *screen)
+{
+   switch (screen->gpu_id) {
+   case 505:
+   case 506:
+   case 508:
+   case 509:
+   case 512:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+fd5_lm_load_kill_disabled(const struct fd_screen *screen)
+{
+   switch (screen->gpu_id) {
+   case 505:
+   case 506:
+   case 508:
+   case 509:
+   case 512:
+   case 540:
+      return true;
+   default:
+      return false;
+   }
 }
 
 /* emit setup at begin of new cmdstream buffer (don't rely on previous
@@ -953,7 +1040,8 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
    OUT_RING(ring, 0x00000044); /* RB_MODE_CNTL */
 
    OUT_PKT4(ring, REG_A5XX_RB_DBG_ECO_CNTL, 1);
-   OUT_RING(ring, 0x00100000); /* RB_DBG_ECO_CNTL */
+   OUT_RING(ring, 0x00100000 |
+            COND(fd5_rb_dp2_clock_gating_disabled(ctx->screen), BIT(9)));
 
    OUT_PKT4(ring, REG_A5XX_VFD_MODE_CNTL, 1);
    OUT_RING(ring, 0x00000000); /* VFD_MODE_CNTL */
@@ -970,9 +1058,6 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
 
       OUT_PKT4(ring, REG_A5XX_HLSQ_DBG_ECO_CNTL, 1);
       OUT_RING(ring, 0x0);
-
-      OUT_PKT4(ring, REG_A5XX_VPC_DBG_ECO_CNTL, 1);
-      OUT_RING(ring, 0x800400);
    } else {
       OUT_PKT4(ring, REG_A5XX_SP_DBG_ECO_CNTL, 1);
       OUT_RING(ring, 0x40000800); /* SP_DBG_ECO_CNTL */
@@ -986,7 +1071,9 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
    OUT_RING(ring, 0x00000000); /* HLSQ_TIMEOUT_THRESHOLD_1 */
 
    OUT_PKT4(ring, REG_A5XX_VPC_DBG_ECO_CNTL, 1);
-   OUT_RING(ring, 0x00000400); /* VPC_DBG_ECO_CNTL */
+   OUT_RING(ring, A5XX_VPC_DBG_ECO_CNTL_ALLFLATOPTDIS |
+            /* referenced as LMLOADKILLDIS in msm-4.4/kgsl */
+            COND(fd5_lm_load_kill_disabled(ctx->screen), BIT(23)));
 
    OUT_PKT4(ring, REG_A5XX_HLSQ_MODE_CNTL, 1);
    OUT_RING(ring, 0x00000001); /* HLSQ_MODE_CNTL */
@@ -1017,13 +1104,13 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
    OUT_PKT4(ring, REG_A5XX_VPC_SO_OVERRIDE, 1);
    OUT_RING(ring, A5XX_VPC_SO_OVERRIDE_SO_DISABLE);
 
-   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE_LO(0), 3);
-   OUT_RING(ring, 0x00000000); /* VPC_SO_BUFFER_BASE_LO_0 */
+   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE(0), 3);
+   OUT_RING(ring, 0x00000000); /* VPC_SO_BUFFER_BASE_0 */
    OUT_RING(ring, 0x00000000); /* VPC_SO_BUFFER_BASE_HI_0 */
    OUT_RING(ring, 0x00000000); /* VPC_SO_BUFFER_SIZE_0 */
 
-   OUT_PKT4(ring, REG_A5XX_VPC_SO_FLUSH_BASE_LO(0), 2);
-   OUT_RING(ring, 0x00000000); /* VPC_SO_FLUSH_BASE_LO_0 */
+   OUT_PKT4(ring, REG_A5XX_VPC_SO_FLUSH_BASE(0), 2);
+   OUT_RING(ring, 0x00000000); /* VPC_SO_FLUSH_BASE_0 */
    OUT_RING(ring, 0x00000000); /* VPC_SO_FLUSH_BASE_HI_0 */
 
    OUT_PKT4(ring, REG_A5XX_PC_GS_PARAM, 1);
@@ -1056,7 +1143,7 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
    OUT_PKT4(ring, REG_A5XX_UNKNOWN_E5C2, 1);
    OUT_RING(ring, 0x00000000); /* UNKNOWN_E5C2 */
 
-   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE_LO(1), 3);
+   OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE(1), 3);
    OUT_RING(ring, 0x00000000);
    OUT_RING(ring, 0x00000000);
    OUT_RING(ring, 0x00000000);

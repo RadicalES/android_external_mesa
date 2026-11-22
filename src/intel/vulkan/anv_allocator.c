@@ -33,6 +33,7 @@
 #include "common/intel_aux_map.h"
 #include "util/anon_file.h"
 #include "util/futex.h"
+#include "util/os_mman.h"
 
 #ifdef HAVE_VALGRIND
 #define VG_NOACCESS_READ(__ptr) ({                       \
@@ -72,16 +73,7 @@
  * block (8k) allocator, which operates out of a bo.  Allocation is done by
  * either pulling a block from the free list or growing the used range of the
  * bo.  Growing the range may run out of space in the bo which we then need to
- * grow.  Growing the bo is tricky in a multi-threaded, lockless environment:
- * we need to keep all pointers and contents in the old map valid.  GEM bos in
- * general can't grow, but we use a trick: we create a memfd and use ftruncate
- * to grow it as necessary.  We mmap the new size and then create a gem bo for
- * it using the new gem userptr ioctl.  Without heavy-handed locking around
- * our allocation fast-path, there isn't really a way to munmap the old mmap,
- * so we just keep it around until garbage collection time.  While the block
- * allocator is lockless for normal operations, we block other threads trying
- * to allocate while we're growing the map.  It shouldn't happen often, and
- * growing is fast anyway.
+ * grow.
  *
  * At the next level we can use various sub-allocators.  The state pool is a
  * pool of smaller, fixed size objects, which operates much like the block
@@ -354,8 +346,8 @@ anv_block_pool_init(struct anv_block_pool *pool,
                     struct anv_device *device,
                     const char *name,
                     uint64_t start_address,
-                    uint32_t initial_size,
-                    uint32_t max_size)
+                    uint64_t initial_size,
+                    uint64_t max_size)
 {
    VkResult result;
 
@@ -499,6 +491,11 @@ anv_device_has_perf_improvement_with_2mb_pages(struct anv_device *device)
 static bool
 anv_device_has_perf_improvement_with_64k_pages(struct anv_device *device)
 {
+   /* Whether to reduce page count at the cost of increased memory footprint.
+    * On MTL(Xe KMD only)/LNL platforms, there is a large perf penalty from
+    * page misses. On PTL platforms, there is a large perf penalty from IOMMU
+    * TLB thrashing.
+    */
    if (device->info->has_local_mem || device->info->verx10 < 110)
       return false;
 
@@ -540,7 +537,7 @@ anv_block_pool_grow(struct anv_block_pool *pool, struct anv_block_state *state,
 {
    VkResult result = VK_SUCCESS;
 
-   pthread_mutex_lock(&pool->device->mutex);
+   simple_mtx_lock(&pool->device->mutex);
 
    assert(state == &pool->state);
 
@@ -588,7 +585,7 @@ anv_block_pool_grow(struct anv_block_pool *pool, struct anv_block_state *state,
       result = anv_block_pool_expand_range(pool, size);
    }
 
-   pthread_mutex_unlock(&pool->device->mutex);
+   simple_mtx_unlock(&pool->device->mutex);
 
    if (result != VK_SUCCESS)
       return 0;
@@ -1242,7 +1239,16 @@ anv_state_reserved_array_pool_free(struct anv_state_reserved_array_pool *pool,
    simple_mtx_lock(&pool->mutex);
    BITSET_SET(pool->states, idx);
    simple_mtx_unlock(&pool->mutex);
- }
+}
+
+void
+anv_state_reserved_array_pool_index_free(struct anv_state_reserved_array_pool *pool,
+                                         uint32_t index)
+{
+   simple_mtx_lock(&pool->mutex);
+   BITSET_SET(pool->states, index);
+   simple_mtx_unlock(&pool->mutex);
+}
 
 void
 anv_bo_pool_init(struct anv_bo_pool *pool, struct anv_device *device,
@@ -1368,7 +1374,7 @@ anv_scratch_pool_finish(struct anv_device *device, struct anv_scratch_pool *pool
 
    for (unsigned i = 0; i < 16; i++) {
       if (pool->surf_states[i].map != NULL) {
-         anv_state_pool_free(&device->scratch_surface_state_pool,
+         anv_state_pool_free(anv_device_get_scratch_surface_state_pool(device),
                              pool->surf_states[i]);
       }
    }
@@ -1464,7 +1470,7 @@ anv_scratch_pool_get_surf(struct anv_device *device,
    struct anv_address addr = { .bo = bo };
 
    struct anv_state state =
-      anv_state_pool_alloc(&device->scratch_surface_state_pool,
+      anv_state_pool_alloc(anv_device_get_scratch_surface_state_pool(device),
                            device->isl_dev.ss.size, 64);
 
    isl_surf_usage_flags_t usage =
@@ -1483,7 +1489,7 @@ anv_scratch_pool_get_surf(struct anv_device *device,
 
    uint32_t current = p_atomic_cmpxchg(&pool->surfs[bucket], 0, state.offset);
    if (current) {
-      anv_state_pool_free(&device->scratch_surface_state_pool, state);
+      anv_state_pool_free(anv_device_get_scratch_surface_state_pool(device), state);
       return current;
    } else {
       pool->surf_states[bucket] = state;
@@ -1491,16 +1497,32 @@ anv_scratch_pool_get_surf(struct anv_device *device,
    }
 }
 
+uint32_t
+anv_shader_get_scratch_surf(struct anv_batch *batch,
+                            struct anv_device *device,
+                            mesa_shader_stage stage,
+                            uint32_t total_scratch,
+                            bool protected)
+{
+   if (total_scratch == 0)
+      return 0;
+
+   struct anv_scratch_pool *pool = protected ?
+      &device->protected_scratch_pool : &device->scratch_pool;
+   struct anv_bo *bo =
+      anv_scratch_pool_alloc(device, pool, stage, total_scratch);
+   if (batch != NULL)
+      anv_reloc_list_add_bo(batch->relocs, bo);
+   uint32_t ret = anv_scratch_pool_get_surf(device, pool, total_scratch);
+
+   return device->physical->uses_efficient_64bit ? ret : (ret >> ANV_SCRATCH_SPACE_SHIFT);
+}
+
 VkResult
 anv_bo_cache_init(struct anv_bo_cache *cache, struct anv_device *device)
 {
    util_sparse_array_init(&cache->bo_map, sizeof(struct anv_bo), 1024);
-
-   if (pthread_mutex_init(&cache->mutex, NULL)) {
-      util_sparse_array_finish(&cache->bo_map);
-      return vk_errorf(device, VK_ERROR_OUT_OF_HOST_MEMORY,
-                       "pthread_mutex_init failed: %m");
-   }
+   simple_mtx_init(&cache->mutex, mtx_plain);
 
    return VK_SUCCESS;
 }
@@ -1509,7 +1531,7 @@ void
 anv_bo_cache_finish(struct anv_bo_cache *cache)
 {
    util_sparse_array_finish(&cache->bo_map);
-   pthread_mutex_destroy(&cache->mutex);
+   simple_mtx_destroy(&cache->mutex);
 }
 
 static void
@@ -1527,7 +1549,7 @@ anv_bo_vma_free(struct anv_device *device, struct anv_bo *bo)
 {
    if (bo->offset != 0 && !(bo->alloc_flags & ANV_BO_ALLOC_FIXED_ADDRESS)) {
       assert(bo->vma_heap != NULL);
-      anv_vma_free(device, bo->vma_heap, bo->offset, bo->size);
+      anv_vma_free(device, bo->vma_heap, bo->offset, bo->actual_size);
    }
    bo->vma_heap = NULL;
 }
@@ -1597,13 +1619,13 @@ anv_bo_vma_alloc_or_close(struct anv_device *device,
     * Only available on ICL+.
     */
    if (anv_device_has_perf_improvement_with_2mb_pages(device) &&
-       (bo->size >= 1 * 1024 * 1024) && !is_small_heap)
+       (bo->actual_size >= 1 * 1024 * 1024) && !is_small_heap)
       align = MAX2(2 * 1024 * 1024, align);
 
    if (alloc_flags & ANV_BO_ALLOC_FIXED_ADDRESS) {
       bo->offset = intel_canonical_address(explicit_address);
    } else {
-      bo->offset = anv_vma_alloc(device, bo->size, align, alloc_flags,
+      bo->offset = anv_vma_alloc(device, bo->actual_size, align, alloc_flags,
                                  explicit_address, &bo->vma_heap);
       if (bo->offset == 0) {
          anv_bo_unmap_close(device, bo);
@@ -1613,40 +1635,6 @@ anv_bo_vma_alloc_or_close(struct anv_device *device,
    }
 
    return VK_SUCCESS;
-}
-
-enum intel_device_info_mmap_mode
-anv_bo_get_mmap_mode(struct anv_device *device, struct anv_bo *bo)
-{
-   enum anv_bo_alloc_flags alloc_flags = bo->alloc_flags;
-
-   if (device->info->has_set_pat_uapi)
-      return anv_device_get_pat_entry(device, alloc_flags)->mmap;
-
-   if (anv_physical_device_has_vram(device->physical)) {
-      if ((alloc_flags & ANV_BO_ALLOC_NO_LOCAL_MEM) ||
-          (alloc_flags & ANV_BO_ALLOC_IMPORTED))
-         return INTEL_DEVICE_INFO_MMAP_MODE_WB;
-
-      return INTEL_DEVICE_INFO_MMAP_MODE_WC;
-   }
-
-   /* gfx9 atom */
-   if (!device->info->has_llc) {
-      /* user wants a cached and coherent memory but to achieve it without
-       * LLC in older platforms DRM_IOCTL_I915_GEM_SET_CACHING needs to be
-       * supported and set.
-       */
-      if (alloc_flags & ANV_BO_ALLOC_HOST_CACHED)
-         return INTEL_DEVICE_INFO_MMAP_MODE_WB;
-
-      return INTEL_DEVICE_INFO_MMAP_MODE_WC;
-   }
-
-   if (alloc_flags & (ANV_BO_ALLOC_SCANOUT | ANV_BO_ALLOC_EXTERNAL))
-      return INTEL_DEVICE_INFO_MMAP_MODE_WC;
-
-   return INTEL_DEVICE_INFO_MMAP_MODE_WB;
 }
 
 VkResult
@@ -1703,22 +1691,14 @@ anv_device_alloc_bo(struct anv_device *device,
       size = align64(size, 4096);
    }
 
-   /* Round up allocations to 2MB intervals so long as increase doesn't
-    * increase allocation by more than 1.33%. This reduces page
-    * count at the cost of increased memory footprint. Only apply on
-    * MTL(Xe KMD only)/LNL platforms, which incur largest perf penalty from
-    * page misses.
+   /* Try to allocate memory in multiples of 2MB, as this allows us to use
+    * 2MB pages rather than the less-efficient 4K pages.
     */
-   if (align64(size, 2 * 1024 * 1024) <= (size * 4 / 3) &&
-       anv_device_has_perf_improvement_with_2mb_pages_oversubscription(device))
-      size = align64(size, 2 * 1024 * 1024);
-   /* bos larger than 1MB can't be allocated with slab but to reduce pages we
-    * could align size to 64k pages to gain performance with minimum memory
-    * waste.
-    */
-   else if ((size > (1 * 1024 * 1024)) &&
-            anv_device_has_perf_improvement_with_64k_pages(device))
-      size = align64(size, 64 * 1024);
+   if (device->physical->drirc.perf.alloc_oversubscription) {
+      if (size >= 1 * 1024 * 1024 &&
+          anv_device_has_perf_improvement_with_2mb_pages_oversubscription(device))
+         size = align64(size, 2 * 1024 * 1024);
+   }
 
    const struct intel_memory_class_instance *regions[2];
    uint32_t nregions = 0;
@@ -1806,6 +1786,46 @@ anv_device_alloc_bo(struct anv_device *device,
    return VK_SUCCESS;
 }
 
+static VkResult
+map_placed_addr_slab(struct anv_device *device,
+                     struct anv_bo *bo,
+                     uint64_t offset,
+                     size_t size,
+                     void *placed_addr,
+                     void **map_out)
+{
+   int prime_handle = anv_gem_handle_to_fd(device, bo->gem_handle);
+   VkResult result = VK_SUCCESS;
+
+   if (prime_handle < 0) {
+      return vk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
+                       "anv_gem_handle_to_fd() before mmap failed: %m");
+   }
+
+   offset += (bo->offset - bo->slab_parent->offset);
+   void *map = os_mmap(placed_addr,
+                       size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_FIXED | MAP_SHARED,
+                       prime_handle,
+                       offset);
+   if (map == MAP_FAILED) {
+      result = vk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED, "mmap failed: %m");
+      goto end;
+   }
+
+   assert(placed_addr == NULL || map == placed_addr);
+   assert(map != NULL);
+   VG(VALGRIND_MALLOCLIKE_BLOCK(map, size, 0, 1));
+
+   if (map_out)
+      *map_out = map;
+
+end:
+   close(prime_handle);
+   return result;
+}
+
 VkResult
 anv_device_map_bo(struct anv_device *device,
                   struct anv_bo *bo,
@@ -1820,6 +1840,9 @@ anv_device_map_bo(struct anv_device *device,
    struct anv_bo *real = anv_bo_get_real(bo);
    uint64_t offset_adjustment = 0;
    if (real != bo) {
+      if (placed_addr)
+         return map_placed_addr_slab(device, bo, offset, size, placed_addr, map_out);
+
       offset += (bo->offset - real->offset);
 
       const uint64_t page_size = device->physical->page_size;
@@ -1829,9 +1852,6 @@ anv_device_map_bo(struct anv_device *device,
          offset_adjustment = offset - munmap_offset;
          size += offset_adjustment;
          offset = munmap_offset;
-
-         if (placed_addr)
-            placed_addr -= offset_adjustment;
       }
 
       assert((offset & (page_size - 1)) == 0);
@@ -1911,14 +1931,14 @@ anv_device_import_bo_from_host_ptr(struct anv_device *device,
    if (!gem_handle)
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
-   pthread_mutex_lock(&cache->mutex);
+   simple_mtx_lock(&cache->mutex);
 
    struct anv_bo *bo = NULL;
    if (device->info->kmd_type == INTEL_KMD_TYPE_XE) {
       bo = vk_zalloc(&device->vk.alloc, sizeof(*bo), 8,
                      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
       if (!bo) {
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
    } else {
@@ -1932,21 +1952,13 @@ anv_device_import_bo_from_host_ptr(struct anv_device *device,
        */
       assert(bo->gem_handle == gem_handle);
       if (bo_flags != bo->flags) {
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                           "same host pointer imported two different ways");
       }
 
-      if ((bo->alloc_flags & ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS) !=
-          (alloc_flags & ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS)) {
-         pthread_mutex_unlock(&cache->mutex);
-         return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                          "The same BO was imported with and without buffer "
-                          "device address");
-      }
-
       if (client_address && client_address != intel_48b_address(bo->offset)) {
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                           "The same BO was imported at two different "
                           "addresses");
@@ -1974,14 +1986,14 @@ anv_device_import_bo_from_host_ptr(struct anv_device *device,
                                                   client_address,
                                                   alignment);
       if (result != VK_SUCCESS) {
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return result;
       }
 
       result = device->kmd_backend->vm_bind_bo(device, &new_bo);
       if (result != VK_SUCCESS) {
          anv_bo_vma_free(device, &new_bo);
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return result;
       }
 
@@ -1990,7 +2002,7 @@ anv_device_import_bo_from_host_ptr(struct anv_device *device,
       ANV_RMV(bo_allocate, device, bo);
    }
 
-   pthread_mutex_unlock(&cache->mutex);
+   simple_mtx_unlock(&cache->mutex);
    *bo_out = bo;
 
    return VK_SUCCESS;
@@ -2011,11 +2023,11 @@ anv_device_import_bo(struct anv_device *device,
 
    struct anv_bo_cache *cache = &device->bo_cache;
 
-   pthread_mutex_lock(&cache->mutex);
+   simple_mtx_lock(&cache->mutex);
 
    uint32_t gem_handle = anv_gem_fd_to_handle(device, fd);
    if (!gem_handle) {
-      pthread_mutex_unlock(&cache->mutex);
+      simple_mtx_unlock(&cache->mutex);
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
 
@@ -2026,21 +2038,13 @@ anv_device_import_bo(struct anv_device *device,
                                                                alloc_flags,
                                                                &bo_flags);
    if (result != VK_SUCCESS) {
-      pthread_mutex_unlock(&cache->mutex);
+      simple_mtx_unlock(&cache->mutex);
       return result;
    }
 
    if (bo->refcount > 0) {
-      if ((bo->alloc_flags & ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS) !=
-          (alloc_flags & ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS)) {
-         pthread_mutex_unlock(&cache->mutex);
-         return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                          "The same BO was imported with and without buffer "
-                          "device address");
-      }
-
       if (client_address && client_address != intel_48b_address(bo->offset)) {
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                           "The same BO was imported at two different "
                           "addresses");
@@ -2060,7 +2064,7 @@ anv_device_import_bo(struct anv_device *device,
       off_t size = lseek(fd, 0, SEEK_END);
       if (size == (off_t)-1) {
          device->kmd_backend->gem_close(device, &new_bo);
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
       }
       new_bo.size = size;
@@ -2072,14 +2076,14 @@ anv_device_import_bo(struct anv_device *device,
                                                   client_address,
                                                   alignment);
       if (result != VK_SUCCESS) {
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return result;
       }
 
       result = device->kmd_backend->vm_bind_bo(device, &new_bo);
       if (result != VK_SUCCESS) {
          anv_bo_vma_free(device, &new_bo);
-         pthread_mutex_unlock(&cache->mutex);
+         simple_mtx_unlock(&cache->mutex);
          return result;
       }
 
@@ -2090,7 +2094,7 @@ anv_device_import_bo(struct anv_device *device,
 
    bo->flags = bo_flags;
 
-   pthread_mutex_unlock(&cache->mutex);
+   simple_mtx_unlock(&cache->mutex);
    *bo_out = bo;
 
    return VK_SUCCESS;
@@ -2150,24 +2154,6 @@ anv_device_set_bo_tiling(struct anv_device *device,
    return VK_SUCCESS;
 }
 
-static bool
-atomic_dec_not_one(uint32_t *counter)
-{
-   uint32_t old, val;
-
-   val = *counter;
-   while (1) {
-      if (val == 1)
-         return false;
-
-      old = __sync_val_compare_and_swap(counter, val, val - 1);
-      if (old == val)
-         return true;
-
-      val = old;
-   }
-}
-
 void
 anv_device_release_bo(struct anv_device *device,
                       struct anv_bo *bo)
@@ -2180,10 +2166,10 @@ anv_device_release_bo(struct anv_device *device,
     * then the refcount has been decremented and we are not the last
     * reference.
     */
-   if (atomic_dec_not_one(&bo->refcount))
+   if (p_atomic_dec_not_one(&bo->refcount))
       return;
 
-   pthread_mutex_lock(&cache->mutex);
+   simple_mtx_lock(&cache->mutex);
 
    /* We are probably the last reference since our attempt to decrement above
     * failed.  However, we can't actually know until we are inside the mutex.
@@ -2192,13 +2178,13 @@ anv_device_release_bo(struct anv_device *device,
     */
    if (unlikely(__sync_sub_and_fetch(&bo->refcount, 1) > 0)) {
       /* Turns out we're not the last reference.  Unlock and bail. */
-      pthread_mutex_unlock(&cache->mutex);
+      simple_mtx_unlock(&cache->mutex);
       return;
    }
    assert(bo->refcount == 0);
 
    if (bo->slab_parent) {
-      pthread_mutex_unlock(&cache->mutex);
+      simple_mtx_unlock(&cache->mutex);
       anv_slab_bo_free(device, bo);
       return;
    }
@@ -2229,5 +2215,5 @@ anv_device_release_bo(struct anv_device *device,
     * and releasing GEM handles and we don't want to let someone import the BO
     * again between mutex unlock and closing the GEM handle.
     */
-   pthread_mutex_unlock(&cache->mutex);
+   simple_mtx_unlock(&cache->mutex);
 }

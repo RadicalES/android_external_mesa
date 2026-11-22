@@ -81,15 +81,16 @@ spec@nv_copy_image@nv_copy_image.*
 # If we find any non-piglit users of these features, then maybe a driconf
 # way to force fall-over to zink for that app could make sense.  Until
 # then, just pretend that this stuff doesn't exist:
-.*edgeflag.*
-.*stipple.*
+spec@.*edgeflag.*
+spec@.*line.*stipple.*
 # uses edgeflags:
 shaders@point-vertex-id.*
-# uses stipple:
-spec@!opengl 1.0@gl-1.0-no-op-paths
 
-# Some reconvergence tests are very slow:
+# Some reconvergence tests are very slow, especially with large subgoup sizes:
 (gmem-|stale-regs-)?dEQP-VK.reconvergence.(sub|work)group_uniform_control_flow_(ballot|elect).compute.nesting4.(0.40|7.10)
+dEQP-VK.reconvergence.maximal.compute.nesting4.7.10
+dEQP-VK.reconvergence.maximal.compute.nesting5.0.11
+dEQP-VK.reconvergence.maximal.compute.nesting6.2.9
 
 # Piglit assumes fp16 denorms are supported, which the driver doesn't.
 program@execute@amdgcn-f16-inline-immediates
@@ -97,15 +98,6 @@ program@execute@amdgcn-f16-inline-immediates@add integer 64
 
 # Vulkan Video isn't supported, since video isn't part of the gpu
 dEQP-VK.video.*
-
-# These tests try to allocate up to half of the device memory, which doesn't go
-# great when other tests are running in parallel.
-dEQP-VK.memory.mapping.suballocation.full.variable.implicit_unmap
-dEQP-VK.memory.mapping.suballocation.full.variable.implicit_unmap_map2
-dEQP-VK.memory.mapping.dedicated_alloc.buffer.full.variable.implicit_unmap
-dEQP-VK.memory.mapping.dedicated_alloc.buffer.full.variable.implicit_unmap_map2
-dEQP-VK.memory.mapping.dedicated_alloc.image.full.variable.implicit_unmap
-dEQP-VK.memory.mapping.dedicated_alloc.image.full.variable.implicit_unmap_map2
 
 # Generates too many immediates due to loop unrolling
 KHR-GLES31.core.geometry_shader.limits.max_output_components

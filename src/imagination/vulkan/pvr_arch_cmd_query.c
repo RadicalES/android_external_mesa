@@ -10,6 +10,7 @@
 #include "pvr_macros.h"
 #include "pvr_pass.h"
 #include "pvr_query.h"
+#include "pvr_xfb.h"
 
 void PVR_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
                                      VkQueryPool queryPool,
@@ -21,6 +22,9 @@ void PVR_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   if (queryCount == 0)
+      return;
 
    query_info.type = PVR_QUERY_TYPE_RESET_QUERY_POOL;
 
@@ -81,6 +85,9 @@ void PVR_PER_ARCH(CmdCopyQueryPoolResults)(VkCommandBuffer commandBuffer,
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
+   if (queryCount == 0)
+      return;
+
    query_info.type = PVR_QUERY_TYPE_COPY_QUERY_RESULTS;
 
    query_info.copy_query_results.query_pool = queryPool;
@@ -112,7 +119,7 @@ void PVR_PER_ARCH(CmdCopyQueryPoolResults)(VkCommandBuffer commandBuffer,
    cmd_buffer->state.current_sub_cmd->event = (struct pvr_sub_cmd_event){
       .type = PVR_EVENT_TYPE_BARRIER,
       .barrier = {
-         .wait_for_stage_mask = PVR_PIPELINE_STAGE_TRANSFER_BIT,
+         .wait_for_stage_mask = PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS | PVR_PIPELINE_STAGE_TRANSFER_BIT,
          .wait_at_stage_mask = PVR_PIPELINE_STAGE_QUERY_BIT,
       },
    };
@@ -132,7 +139,7 @@ void PVR_PER_ARCH(CmdCopyQueryPoolResults)(VkCommandBuffer commandBuffer,
       .type = PVR_EVENT_TYPE_BARRIER,
       .barrier = {
          .wait_for_stage_mask = PVR_PIPELINE_STAGE_QUERY_BIT,
-         .wait_at_stage_mask = PVR_PIPELINE_STAGE_TRANSFER_BIT,
+         .wait_at_stage_mask = PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS | PVR_PIPELINE_STAGE_TRANSFER_BIT,
       },
    };
 }
@@ -155,24 +162,18 @@ pvr_cmd_buffer_state_get_view_count(const struct pvr_cmd_buffer_state *state)
    return view_count;
 }
 
-void PVR_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer,
-                                 VkQueryPool queryPool,
-                                 uint32_t query,
-                                 VkQueryControlFlags flags)
+static void pvr_occlusion_query_begin(struct pvr_cmd_buffer *cmd_buffer,
+                                      struct pvr_query_pool *pool,
+                                      uint32_t query)
 {
-   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
    uint32_t view_count = 1;
-   VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
-
-   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
    /* Occlusion queries can't be nested. */
    assert(!state->vis_test_enabled);
 
-   if (state->current_sub_cmd) {
-      assert(state->current_sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS);
-
+   if (state->current_sub_cmd &&
+       state->current_sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS) {
       if (!state->current_sub_cmd->gfx.query_pool) {
          state->current_sub_cmd->gfx.query_pool = pool;
       } else if (state->current_sub_cmd->gfx.query_pool != pool) {
@@ -201,7 +202,7 @@ void PVR_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer,
       view_count = pvr_cmd_buffer_state_get_view_count(state);
    }
 
-   state->query_pool = pool;
+   state->query_pools[PVR_QUERY_POOL_INDEX_OCCLUSION] = pool;
    state->vis_test_enabled = true;
    state->vis_reg = query;
    state->dirty.vis_test = true;
@@ -212,15 +213,59 @@ void PVR_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer,
    }
 }
 
-void PVR_PER_ARCH(CmdEndQuery)(VkCommandBuffer commandBuffer,
-                               VkQueryPool queryPool,
-                               uint32_t query)
+static void pvr_occlusion_query_end(struct pvr_cmd_buffer *cmd_buffer)
+{
+   cmd_buffer->state.vis_test_enabled = false;
+   cmd_buffer->state.dirty.vis_test = true;
+}
+
+void PVR_PER_ARCH(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+                                           VkQueryPool queryPool,
+                                           uint32_t query,
+                                           VkQueryControlFlags flags,
+                                           uint32_t index)
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
-   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+   VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
 
-   state->vis_test_enabled = false;
-   state->dirty.vis_test = true;
+   switch (pool->query_type) {
+   case VK_QUERY_TYPE_OCCLUSION:
+      pvr_occlusion_query_begin(cmd_buffer, pool, query);
+      break;
+
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      assert(index < PVR_XFB_MAX_STREAMS);
+      PVR_PER_ARCH(xfb_query_pool_begin)(cmd_buffer, pool, query);
+      break;
+
+   default:
+      UNREACHABLE("unsupported query type");
+   }
+}
+
+void PVR_PER_ARCH(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+                                         VkQueryPool queryPool,
+                                         uint32_t query,
+                                         uint32_t index)
+{
+   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+   VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
+
+   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+
+   switch (pool->query_type) {
+   case VK_QUERY_TYPE_OCCLUSION:
+      pvr_occlusion_query_end(cmd_buffer);
+      break;
+
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      assert(index < PVR_XFB_MAX_STREAMS);
+      PVR_PER_ARCH(xfb_query_pool_end)(cmd_buffer, pool, query);
+      break;
+
+   default:
+      UNREACHABLE("unsupported query type");
+   }
 }

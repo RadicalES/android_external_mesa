@@ -26,7 +26,7 @@
 #include "nir_clc_helpers.h"
 #include "nir_serialize.h"
 #include "nir_spirv.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 
 #ifdef DYNAMIC_LIBCLC_PATH
 #include <fcntl.h>
@@ -52,7 +52,7 @@ struct clc_file {
    unsigned bit_size;
    const char *static_data;
    size_t static_data_size;
-   const char *sys_path;
+   const char *sys_paths[2];
 };
 
 static const struct clc_file libclc_files[] = {
@@ -63,7 +63,10 @@ static const struct clc_file libclc_files[] = {
       .static_data_size = sizeof(libclc_spirv_mesa3d_spv),
 #endif
 #ifdef DYNAMIC_LIBCLC_PATH
-      .sys_path = DYNAMIC_LIBCLC_PATH "spirv-mesa3d-.spv",
+      .sys_paths = {
+         DYNAMIC_LIBCLC_PATH "spirv-mesa3d-.spv",
+         DYNAMIC_LIBCLC_PATH "spirv32-unknown-unknown/libclc.spv",
+      },
 #endif
    },
    {
@@ -73,7 +76,10 @@ static const struct clc_file libclc_files[] = {
       .static_data_size = sizeof(libclc_spirv64_mesa3d_spv),
 #endif
 #ifdef DYNAMIC_LIBCLC_PATH
-      .sys_path = DYNAMIC_LIBCLC_PATH "spirv64-mesa3d-.spv",
+      .sys_paths = {
+         DYNAMIC_LIBCLC_PATH "spirv64-mesa3d-.spv",
+         DYNAMIC_LIBCLC_PATH "spirv64-unknown-unknown/libclc.spv",
+      },
 #endif
    },
 };
@@ -88,64 +94,21 @@ get_libclc_file(unsigned ptr_bit_size)
 struct clc_data {
    const struct clc_file *file;
 
-   unsigned char cache_key[SHA1_DIGEST_LENGTH];
+   unsigned char cache_key[BLAKE3_KEY_LEN];
 
    int fd;
    const void *data;
    size_t size;
 };
 
-static bool
-open_clc_data(struct clc_data *clc, unsigned ptr_bit_size)
-{
-   memset(clc, 0, sizeof(*clc));
-   clc->file = get_libclc_file(ptr_bit_size);
-   clc->fd = -1;
-
-   if (clc->file->static_data) {
-      snprintf((char *)clc->cache_key, sizeof(clc->cache_key),
-               "libclc-spirv%d", ptr_bit_size);
-      return true;
-   }
-
-#ifdef DYNAMIC_LIBCLC_PATH
-   if (clc->file->sys_path != NULL) {
-      int fd = open(clc->file->sys_path, O_RDONLY);
-      if (fd < 0)
-         return false;
-
-      struct stat stat;
-      int ret = fstat(fd, &stat);
-      if (ret < 0) {
-         fprintf(stderr, "fstat failed on %s: %m\n", clc->file->sys_path);
-         close(fd);
-         return false;
-      }
-
-      struct mesa_sha1 ctx;
-      _mesa_sha1_init(&ctx);
-      _mesa_sha1_update(&ctx, clc->file->sys_path, strlen(clc->file->sys_path));
-#if defined(__APPLE__) || defined(__MACOSX)
-      _mesa_sha1_update(&ctx, &stat.st_mtime, sizeof(stat.st_mtime));
-#else
-      _mesa_sha1_update(&ctx, &stat.st_mtim, sizeof(stat.st_mtim));
-#endif
-      _mesa_sha1_final(&ctx, clc->cache_key);
-
-      clc->fd = fd;
-
-      return true;
-   }
-#endif
-
-   return false;
-}
-
 #define SPIRV_WORD_SIZE 4
 
 static bool
 map_clc_data(struct clc_data *clc)
 {
+   if (clc->data)
+      return true;
+
    if (clc->file->static_data) {
 #ifdef HAVE_STATIC_LIBCLC_ZSTD
       unsigned long long cmp_size =
@@ -188,22 +151,18 @@ map_clc_data(struct clc_data *clc)
    }
 
 #ifdef DYNAMIC_LIBCLC_PATH
-   if (clc->file->sys_path != NULL) {
-      off_t len = lseek(clc->fd, 0, SEEK_END);
-      if (len % SPIRV_WORD_SIZE != 0) {
-         fprintf(stderr, "File length isn't a multiple of the word size\n");
-         return false;
-      }
-      clc->size = len;
-
-      clc->data = mmap(NULL, len, PROT_READ, MAP_PRIVATE, clc->fd, 0);
-      if (clc->data == MAP_FAILED) {
-         fprintf(stderr, "Failed to mmap libclc SPIR-V: %m\n");
-         return false;
-      }
-
-      return true;
+   if (clc->size % SPIRV_WORD_SIZE != 0) {
+      fprintf(stderr, "File length isn't a multiple of the word size\n");
+      return false;
    }
+
+   clc->data = mmap(NULL, clc->size, PROT_READ, MAP_PRIVATE, clc->fd, 0);
+   if (clc->data == MAP_FAILED) {
+      fprintf(stderr, "Failed to mmap libclc SPIR-V: %m\n");
+      return false;
+   }
+
+   return true;
 #endif
 
    return true;
@@ -220,12 +179,59 @@ close_clc_data(struct clc_data *clc)
    }
 
 #ifdef DYNAMIC_LIBCLC_PATH
-   if (clc->file->sys_path != NULL) {
-      if (clc->data)
-         munmap((void *)clc->data, clc->size);
-      close(clc->fd);
+   if (clc->data)
+      munmap((void *)clc->data, clc->size);
+   clc->data = NULL;
+   close(clc->fd);
+#endif
+}
+
+static bool
+open_clc_data(struct clc_data *clc, unsigned ptr_bit_size)
+{
+   memset(clc, 0, sizeof(*clc));
+   clc->file = get_libclc_file(ptr_bit_size);
+   clc->fd = -1;
+
+   if (clc->file->static_data) {
+      snprintf((char *)clc->cache_key, sizeof(clc->cache_key),
+               "libclc-spirv%d", ptr_bit_size);
+      return true;
+   }
+
+#ifdef DYNAMIC_LIBCLC_PATH
+   for (unsigned i = 0; i < ARRAY_SIZE(clc->file->sys_paths); i++) {
+      const char *sys_path = clc->file->sys_paths[i];
+      int fd = open(sys_path, O_RDONLY);
+      if (fd < 0)
+         continue;
+
+      struct stat stat;
+      int ret = fstat(fd, &stat);
+      if (ret < 0) {
+         fprintf(stderr, "fstat failed on %s: %m\n", sys_path);
+         close(fd);
+         continue;
+      }
+
+      clc->fd = fd;
+      clc->size = stat.st_size;
+
+      if (!map_clc_data(clc)) {
+         close_clc_data(clc);
+         continue;
+      }
+
+      blake3_hasher ctx;
+      _mesa_blake3_init(&ctx);
+      _mesa_blake3_update(&ctx, clc->data, clc->size);
+      _mesa_blake3_final(&ctx, clc->cache_key);
+
+      return true;
    }
 #endif
+
+   return false;
 }
 
 /** Returns true if libclc is found
@@ -321,7 +327,7 @@ libclc_add_generic_variants(nir_shader *shader)
 static bool
 mark_exact(nir_builder *b, nir_alu_instr *alu, UNUSED void *_)
 {
-   alu->fp_math_ctrl |= nir_fp_exact;
+   alu->fp_math_ctrl |= nir_op_valid_fp_math_ctrl(alu->op, nir_fp_exact);
    return true;
 }
 
@@ -368,7 +374,7 @@ nir_load_libclc_shader(unsigned ptr_bit_size,
 
    assert(clc.size % SPIRV_WORD_SIZE == 0);
    nir_shader *nir = spirv_to_nir(clc.data, clc.size / SPIRV_WORD_SIZE,
-                                  NULL, 0, MESA_SHADER_KERNEL, NULL,
+                                  NULL, MESA_SHADER_KERNEL, NULL,
                                   &spirv_lib_options, nir_options);
    nir_validate_shader(nir, "after nir_load_clc_shader");
 

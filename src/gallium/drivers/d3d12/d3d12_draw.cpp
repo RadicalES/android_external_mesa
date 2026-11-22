@@ -95,13 +95,7 @@ fill_srv_descriptors(struct d3d12_context *ctx,
 
    for (unsigned i = shader->begin_srv_binding; i < shader->end_srv_binding; i++)
    {
-      struct d3d12_sampler_view *view;
-
-      if (i == shader->pstipple_binding) {
-         view = (struct d3d12_sampler_view*)ctx->pstipple.sampler_view;
-      } else {
-         view = (struct d3d12_sampler_view*)ctx->sampler_views[stage][i];
-      }
+      struct d3d12_sampler_view *view = (struct d3d12_sampler_view*)ctx->sampler_views[stage][i];
 
       unsigned desc_idx = i - shader->begin_srv_binding;
       if (view != NULL) {
@@ -193,13 +187,7 @@ fill_sampler_descriptors(struct d3d12_context *ctx,
 
    view.count = 0;
    for (unsigned i = shader->begin_srv_binding; i < shader->end_srv_binding; i++, view.count++) {
-      struct d3d12_sampler_state *sampler;
-
-      if (i == shader->pstipple_binding) {
-         sampler = ctx->pstipple.sampler_cso;
-      } else {
-         sampler = ctx->samplers[stage][i];
-      }
+      struct d3d12_sampler_state *sampler = ctx->samplers[stage][i];
 
       unsigned desc_idx = i - shader->begin_srv_binding;
       if (sampler != NULL) {
@@ -334,7 +322,7 @@ fill_image_descriptors(struct d3d12_context *ctx,
             unsigned transition_array_size = array_size;
             if (res->base.b.target == PIPE_TEXTURE_3D) {
                transition_first_layer = 0;
-               transition_array_size = 0;
+               transition_array_size = 1;
             }
             d3d12_transition_subresources_state(ctx, res,
                                                 view->u.tex.level, 1,
@@ -954,10 +942,6 @@ d3d12_draw_vbo(struct pipe_context *pctx,
       ctx->initial_api_prim = saved_mode;
    }
 
-   if (ctx->pstipple.enabled && ctx->gfx_pipeline_state.rast->base.poly_stipple_enable)
-      ctx->shader_dirty[MESA_SHADER_FRAGMENT] |= D3D12_SHADER_DIRTY_SAMPLER_VIEWS |
-                                                 D3D12_SHADER_DIRTY_SAMPLERS;
-
    /* this should *really* be fixed at a higher level than here! */
    enum mesa_prim reduced_prim = u_reduced_prim((enum mesa_prim)dinfo->mode);
    if (reduced_prim == MESA_PRIM_TRIANGLES &&
@@ -969,7 +953,11 @@ d3d12_draw_vbo(struct pipe_context *pctx,
       ctx->state_dirty |= D3D12_DIRTY_PRIM_MODE;
    }
 
-   d3d12_select_shader_variants(ctx, dinfo);
+   if (!d3d12_select_shader_variants(ctx, dinfo)) {
+      ctx->initial_api_prim = MESA_PRIM_COUNT;
+      pipe_resource_reference(&patched_indirect.buffer, NULL);
+      return;
+   }
    d3d12_validate_queries(ctx);
    for (unsigned i = 0; i < D3D12_GFX_SHADER_STAGES; ++i) {
       struct d3d12_shader *shader = ctx->gfx_stages[i] ? ctx->gfx_stages[i]->current : NULL;
@@ -1327,6 +1315,10 @@ void
 d3d12_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
 {
    struct d3d12_context *ctx = d3d12_context(pctx);
+
+   if (!d3d12_select_compute_shader_variants(ctx, info))
+      return;
+
    struct d3d12_batch *batch;
    struct pipe_resource *patched_indirect = nullptr;
 
@@ -1340,7 +1332,6 @@ d3d12_launch_grid(struct pipe_context *pctx, const struct pipe_grid_info *info)
    if (indirect && update_dispatch_indirect_with_sysvals(ctx, &indirect, &indirect_offset, &patched_indirect))
       cmd_sig_key.multi_draw_stride = sizeof(D3D12_DISPATCH_ARGUMENTS) * 2;
 
-   d3d12_select_compute_shader_variants(ctx, info);
    d3d12_validate_queries(ctx);
    struct d3d12_shader *shader = ctx->compute_state ? ctx->compute_state->current : NULL;
    if (ctx->compute_pipeline_state.stage != shader) {

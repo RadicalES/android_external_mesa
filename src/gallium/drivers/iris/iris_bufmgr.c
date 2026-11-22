@@ -1,26 +1,7 @@
 /*
  * Copyright © 2017 Intel Corporation
+ * SPDX-License-Identifier: MIT
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included
- * in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
- * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- */
-
-/**
  * @file iris_bufmgr.c
  *
  * The Iris buffer manager.
@@ -243,6 +224,8 @@ struct iris_bufmgr {
 
    struct iris_bo *dummy_aux_bo;
    struct iris_bo *mem_fence_bo;
+
+   bool enable_efficient_64bit;
 };
 
 static simple_mtx_t global_bufmgr_list_mutex = SIMPLE_MTX_INITIALIZER;
@@ -1048,21 +1031,15 @@ alloc_bo_from_slabs(struct iris_bufmgr *bufmgr,
 }
 
 static struct iris_bo *
-alloc_bo_from_cache(struct iris_bufmgr *bufmgr,
-                    struct bo_cache_bucket *bucket,
-                    uint32_t alignment,
-                    enum iris_memory_zone memzone,
-                    enum iris_mmap_mode mmap_mode,
-                    enum bo_alloc_flags flags,
-                    bool match_zone)
+get_bo_from_bucket(struct iris_bufmgr *bufmgr,
+                   struct bo_cache_bucket *bucket,
+                   uint32_t alignment,
+                   enum iris_memory_zone memzone,
+                   enum iris_mmap_mode mmap_mode,
+                   enum bo_alloc_flags flags,
+                   bool match_zone,
+                   enum iris_bo_state bo_state)
 {
-   if (!bucket)
-      return NULL;
-
-   struct iris_bo *bo = NULL;
-
-   simple_mtx_assert_locked(&bufmgr->lock);
-
    list_for_each_entry_safe(struct iris_bo, cur, &bucket->head, head) {
       assert(iris_bo_is_real(cur));
 
@@ -1085,6 +1062,9 @@ alloc_bo_from_cache(struct iris_bufmgr *bufmgr,
             continue;
       }
 
+      if (cur->real.bo_state != bo_state)
+         continue;
+
       /* If the last BO in the cache is busy, there are no idle BOs.  Bail,
        * either falling back to a non-matching memzone, or if that fails,
        * allocating a fresh buffer.
@@ -1094,11 +1074,13 @@ alloc_bo_from_cache(struct iris_bufmgr *bufmgr,
 
       list_del(&cur->head);
 
-      /* Tell the kernel we need this BO and check if it still exist */
-      if (!iris_bo_madvise(cur, IRIS_MADVICE_WILL_NEED)) {
-         /* This BO was purged, throw it out and keep looking. */
-         bo_free(cur);
-         continue;
+      if (bo_state == IRIS_BO_STATE_NOT_IN_USE_MAYBE_PURGED) {
+         /* Tell the kernel we need this BO and check if it still exist */
+         if (!iris_bo_madvise(cur, IRIS_MADVICE_WILL_NEED)) {
+            /* This BO was purged, throw it out and keep looking. */
+            bo_free(cur);
+            continue;
+         }
       }
 
       if (cur->aux_map_address) {
@@ -1130,10 +1112,35 @@ alloc_bo_from_cache(struct iris_bufmgr *bufmgr,
          cur->address = 0ull;
       }
 
-      bo = cur;
-      break;
+      cur->real.bo_state = IRIS_BO_STATE_IN_USE;
+      return cur;
    }
 
+   return NULL;
+}
+
+static struct iris_bo *
+alloc_bo_from_cache(struct iris_bufmgr *bufmgr,
+                    struct bo_cache_bucket *bucket,
+                    uint32_t alignment,
+                    enum iris_memory_zone memzone,
+                    enum iris_mmap_mode mmap_mode,
+                    enum bo_alloc_flags flags,
+                    bool match_zone)
+{
+   if (!bucket)
+      return NULL;
+
+   struct iris_bo *bo = NULL;
+
+   simple_mtx_assert_locked(&bufmgr->lock);
+
+   /* First try to get a bo known to be alive; if that fails, try to get one
+    * that may have been purged by the kmd.
+    */
+   bo = get_bo_from_bucket(bufmgr, bucket, alignment, memzone, mmap_mode, flags, match_zone, IRIS_BO_STATE_NOT_IN_USE_BUT_ALIVE);
+   if (!bo)
+      bo = get_bo_from_bucket(bufmgr, bucket, alignment, memzone, mmap_mode, flags, match_zone, IRIS_BO_STATE_NOT_IN_USE_MAYBE_PURGED);
    if (!bo)
       return NULL;
 
@@ -1438,12 +1445,16 @@ iris_bo_set_prime_fd(struct iris_bo *bo)
    struct iris_bufmgr *bufmgr = bo->bufmgr;
 
    if (needs_prime_fd(bufmgr) && bo->real.prime_fd == -1) {
-      if (drmPrimeHandleToFD(bufmgr->fd, bo->gem_handle,
-                             DRM_CLOEXEC | DRM_RDWR, &bo->real.prime_fd)) {
+      struct drm_prime_handle prime_arg = {
+         .handle = bo->gem_handle,
+         .flags = DRM_CLOEXEC | DRM_RDWR,
+      };
+      if (intel_ioctl(bufmgr->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_arg)) {
          fprintf(stderr, "Failed to get prime fd for bo %s/%u\n",
                  bo->name, bo->gem_handle);
          return false;
       }
+      bo->real.prime_fd = prime_arg.fd;
    }
 
    return true;
@@ -1537,6 +1548,8 @@ out:
 
 err_vm_alloc:
    vma_free(bufmgr, bo->address, bo->size);
+   /* clear bo->address to prevent double free in bo_close() */
+   bo->address = 0;
 err_free:
    bo_free(bo);
    simple_mtx_unlock(&bufmgr->lock);
@@ -1658,9 +1671,23 @@ cleanup_bo_cache(struct iris_bufmgr *bufmgr, time_t time)
             if (time - bo->real.free_time <= 1)
                break;
 
-            list_del(&bo->head);
-
-            bo_free(bo);
+            switch (bo->real.bo_state) {
+            case IRIS_BO_STATE_NOT_IN_USE_BUT_ALIVE:
+               if (iris_bo_madvise(bo, IRIS_MADVICE_DONT_NEED)) {
+                  bo->real.free_time = time;
+                  bo->real.bo_state = IRIS_BO_STATE_NOT_IN_USE_MAYBE_PURGED;
+               } else {
+                  list_del(&bo->head);
+                  bo_free(bo);
+               }
+               break;
+            case IRIS_BO_STATE_NOT_IN_USE_MAYBE_PURGED:
+               list_del(&bo->head);
+               bo_free(bo);
+               break;
+            default:
+               UNREACHABLE("not expected state");
+            }
          }
       }
    }
@@ -1692,9 +1719,10 @@ bo_unreference_final(struct iris_bo *bo, time_t time)
       bucket_for_size(bufmgr, bo->size, bo->real.heap, 0);
 
    /* Put the buffer into our internal cache for reuse if we can. */
-   if (bucket && iris_bo_madvise(bo, IRIS_MADVICE_DONT_NEED)) {
+   if (bucket) {
       bo->real.free_time = time;
       bo->name = NULL;
+      bo->real.bo_state = IRIS_BO_STATE_NOT_IN_USE_BUT_ALIVE;
 
       list_addtail(&bo->head, &bucket->head);
    } else {
@@ -1943,6 +1971,8 @@ iris_bufmgr_destroy(struct iris_bufmgr *bufmgr)
 
    iris_bufmgr_destroy_global_vm(bufmgr);
 
+   intel_virtio_unref_fd(bufmgr->fd);
+
    close(bufmgr->fd);
 
    simple_mtx_unlock(&bufmgr->lock);
@@ -1992,13 +2022,16 @@ iris_bo_import_dmabuf(struct iris_bufmgr *bufmgr, int prime_fd,
    assert(!(flags & BO_ALLOC_NO_VMA));
 
    simple_mtx_lock(&bufmgr->lock);
-   int ret = drmPrimeFDToHandle(bufmgr->fd, prime_fd, &handle);
-   if (ret) {
+   struct drm_prime_handle prime_arg = {
+      .fd = prime_fd,
+   };
+   if (intel_ioctl(bufmgr->fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime_arg)) {
       DBG("import_dmabuf: failed to obtain handle from fd: %s\n",
           strerror(errno));
       simple_mtx_unlock(&bufmgr->lock);
       return NULL;
    }
+   handle = prime_arg.handle;
 
    /*
     * See if the kernel has already returned this buffer to us. Just as
@@ -2020,7 +2053,7 @@ iris_bo_import_dmabuf(struct iris_bufmgr *bufmgr, int prime_fd,
     * later, we can lseek on the prime fd to get the size.  Older
     * kernels will just fail, in which case we fall back to the
     * provided (estimated or guess size). */
-   ret = lseek(prime_fd, 0, SEEK_END);
+   int ret = lseek(prime_fd, 0, SEEK_END);
    if (ret != -1)
       bo->size = ret;
 
@@ -2044,7 +2077,7 @@ iris_bo_import_dmabuf(struct iris_bufmgr *bufmgr, int prime_fd,
    } else if (modifier == I915_FORMAT_MOD_4_TILED_LNL_CCS) {
       bo->real.heap = IRIS_HEAP_SYSTEM_MEMORY_UNCACHED_COMPRESSED_SCANOUT;
    }  else {
-      assert(bufmgr->devinfo.ver <= 20 || !isl_drm_modifier_has_aux(modifier));
+      assert(bufmgr->devinfo.ver < 20 || !isl_drm_modifier_has_aux(modifier));
    }
 
    if (INTEL_DEBUG(DEBUG_CAPTURE_ALL))
@@ -2054,12 +2087,15 @@ iris_bo_import_dmabuf(struct iris_bufmgr *bufmgr, int prime_fd,
 
    uint64_t alignment = 1;
 
-   /* When an aux map will be used, there is an alignment requirement on the
-    * main surface from the mapping granularity. Some planes of the image may
-    * have smaller alignment requirements, but this one should work for all.
-    */
    if (bufmgr->devinfo.has_aux_map && isl_drm_modifier_has_aux(modifier))
+      /* There is an alignment requirement on the main surface from the
+       * aux-map's mapping granularity. Some planes of the image may have
+       * smaller alignment requirements, but this one should work for all.
+       */
       alignment = intel_aux_map_get_alignment(bufmgr->aux_map_ctx);
+   else if (bo->size >= 64 * 1024)
+      /* The BO may contain a surface that is tiled with a 64K tiling. */
+      alignment = 64 * 1024;
 
    bo->address = vma_alloc(bufmgr, IRIS_MEMZONE_OTHER, bo->size, alignment);
    if (bo->address == 0ull)
@@ -2140,9 +2176,14 @@ iris_bo_export_dmabuf(struct iris_bo *bo, int *prime_fd)
    /* We cannot export suballocated BOs. */
    assert(iris_bo_is_real(bo));
 
-   if (drmPrimeHandleToFD(bufmgr->fd, bo->gem_handle,
-                          DRM_CLOEXEC | DRM_RDWR, prime_fd) != 0)
+   struct drm_prime_handle prime_arg = {
+      .handle = bo->gem_handle,
+      .flags = DRM_CLOEXEC | DRM_RDWR,
+   };
+   if (intel_ioctl(bufmgr->fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_arg))
       return -errno;
+
+   *prime_fd = prime_arg.fd;
 
    iris_bo_mark_exported(bo);
 
@@ -2406,7 +2447,7 @@ iris_bufmgr_init_global_vm(struct iris_bufmgr *bufmgr)
  * \param fd File descriptor of the opened DRM device.
  */
 static struct iris_bufmgr *
-iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse)
+iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse, struct driOptionCache *options)
 {
    if (devinfo->gtt_size <= IRIS_MEMZONE_OTHER_START)
       return NULL;
@@ -2428,6 +2469,8 @@ iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse)
    if (bufmgr->fd == -1)
       goto error_dup;
 
+   intel_virtio_ref_fd(bufmgr->fd);
+
    p_atomic_set(&bufmgr->refcount, 1);
 
    simple_mtx_init(&bufmgr->lock, mtx_plain);
@@ -2445,6 +2488,9 @@ iris_bufmgr_create(struct intel_device_info *devinfo, int fd, bool bo_reuse)
 
    if (!iris_bufmgr_init_global_vm(bufmgr))
       goto error_init_vm;
+
+   bufmgr->enable_efficient_64bit = devinfo->verx10 >= 350 &&
+                                    driQueryOptionb(options, "intel_enable_efficient_64bit");
 
    STATIC_ASSERT(IRIS_MEMZONE_SHADER_START == 0ull);
    const uint64_t _4GB = 1ull << 32;
@@ -2595,6 +2641,7 @@ error_bucket_cache:
       util_vma_heap_finish(&bufmgr->vma_allocator[i]);
    iris_bufmgr_destroy_global_vm(bufmgr);
 error_init_vm:
+   intel_virtio_unref_fd(bufmgr->fd);
    close(bufmgr->fd);
 error_dup:
    free(bufmgr);
@@ -2632,7 +2679,7 @@ iris_bufmgr_create_screen_id(struct iris_bufmgr *bufmgr)
  * \param fd File descriptor of the opened DRM device.
  */
 struct iris_bufmgr *
-iris_bufmgr_get_for_fd(int fd, bool bo_reuse)
+iris_bufmgr_get_for_fd(int fd, bool bo_reuse, struct driOptionCache *options)
 {
    struct intel_device_info devinfo;
    struct stat st;
@@ -2669,7 +2716,7 @@ iris_bufmgr_get_for_fd(int fd, bool bo_reuse)
    }
 #endif
 
-   bufmgr = iris_bufmgr_create(&devinfo, fd, bo_reuse);
+   bufmgr = iris_bufmgr_create(&devinfo, fd, bo_reuse, options);
    if (bufmgr)
       list_addtail(&bufmgr->link, &global_bufmgr_list);
 
@@ -2792,4 +2839,10 @@ struct iris_bo *
 iris_bufmgr_get_mem_fence_bo(struct iris_bufmgr *bufmgr)
 {
    return bufmgr->mem_fence_bo;
+}
+
+bool
+iris_bufmgr_is_eff_64bit_enabled(const struct iris_bufmgr *bufmgr)
+{
+   return bufmgr->enable_efficient_64bit;
 }

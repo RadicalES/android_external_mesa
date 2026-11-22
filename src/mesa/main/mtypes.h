@@ -292,7 +292,7 @@ struct gl_colorbuffer_attrib
     * draw buffer, and NVX_blend_equation_advanced_multi_draw_buffer still
     * requires all draw buffers to match, so we only need a single value.
     */
-   enum gl_advanced_blend_mode _AdvancedBlendMode;
+   enum pipe_advanced_blend_mode _AdvancedBlendMode;
 
    /** Coherency requested via glEnable(GL_BLEND_ADVANCED_COHERENT_KHR)? */
    bool BlendCoherent;
@@ -993,6 +993,15 @@ struct gl_texture_object
     */
    struct pipe_resource *pt;
 
+   /* Cached flag: whether the extra YUV plane-view / lowering setup in
+    * st_get_sampler_views() and st_get_external_sampler_key() must run for
+    * this texture.  Computed whenever pt/surface_format is assigned
+    * (st_finalize_texture(), st_bind_egl_image(), st_context_teximage(),
+    * st_TextureView()), to avoid re-deriving it on every atom update and
+    * shader variant lookup.
+    */
+   bool needs_yuv_plane_views;
+
    /* Protect modifications of the sampler_views array */
    simple_mtx_t validate_mutex;
 
@@ -1467,6 +1476,10 @@ struct gl_buffer_object
 
    struct gl_buffer_mapping Mappings[MAP_COUNT];
    struct pipe_transfer *transfer[MAP_COUNT];
+
+   /** Is set to size of a needed pointer range the failure path of
+    *  glMapBuffer*Range (access=GL_MAP_CLIENT_POINTER_BIT_MESA)  */
+   unsigned ClientPointerSize;
 };
 
 
@@ -1630,6 +1643,15 @@ struct gl_vertex_array_object
    GLbitfield NonIdentityBufferAttribMapping;
 
    /**
+    * Mask of vertex attributes whose VertexAttrib[i].Format._PipeFormat is
+    * set in gl_array_attrib::VertexFormatFallbacks, i.e. the attributes that
+    * the driver can only draw with after u_vbuf has translated them.
+    * This is indexed like Enabled and is updated for all attributes
+    * regardless of whether they are enabled.
+    */
+   GLbitfield FormatFallbackMask;
+
+   /**
     * Mask indicating which VertexAttrib and BufferBinding structures have
     * been changed since the VAO creation. No bit is ever cleared to 0 by
     * state updates. Setting to the default state doesn't update this.
@@ -1709,6 +1731,12 @@ struct gl_array_attrib
     * by polygon mode to be not drawn. (i.e. culled)
     */
    bool _PolygonModeAlwaysCulls;
+
+   /**
+    * The vertex formats that the driver doesn't support and that u_vbuf has
+    * to translate. This is set at context creation and never changes.
+    */
+   BITSET_DECLARE(VertexFormatFallbacks, PIPE_FORMAT_COUNT);
 
    /**
     * If gallium vertex buffers are dirty, this flag indicates whether gallium
@@ -2500,6 +2528,9 @@ struct gl_shared_state
     */
    bool HasExternallySharedImages;
 
+   /** MESA_map_buffer_client_pointer */
+   struct pipe_clientptr_heap *ClientPointerHeap;
+
    /* Small display list storage */
    struct {
       union gl_dlist_node *ptr;
@@ -2557,12 +2588,6 @@ struct gl_renderbuffer
    /** Delete this renderbuffer */
    void (*Delete)(struct gl_context *ctx, struct gl_renderbuffer *rb);
 
-   /** Allocate new storage for this renderbuffer */
-   GLboolean (*AllocStorage)(struct gl_context *ctx,
-                             struct gl_renderbuffer *rb,
-                             GLenum internalFormat,
-                             GLuint width, GLuint height);
-
    struct pipe_resource *texture;
    enum pipe_format format_linear;
    enum pipe_format format_srgb;
@@ -2585,6 +2610,11 @@ struct gl_renderbuffer
    bool rtt_layered; /**< whether glFramebufferTexture was called */
    unsigned rtt_nr_samples; /**< from FramebufferTexture2DMultisampleEXT */
    unsigned rtt_numviews;
+
+   /** storage from RenderbufferStorageMultisampleEXT on GLES, whose samples
+    * are implicitly resolved like those of FramebufferTexture2DMultisampleEXT
+    */
+   bool msrtt;
 };
 
 
@@ -2925,6 +2955,9 @@ struct gl_driver_flags
 
    /** For GL_CLAMP emulation */
    st_state_bitset NewSamplersWithClamp;
+
+   /** For polygon stipple emulation: the current draw's primitive type or the emulation state changed. */
+   st_state_bitset NewStippleEmulate;
 };
 
 struct gl_buffer_binding
@@ -3247,6 +3280,9 @@ struct gl_dispatch
     * - ContextLost
     */
    struct _glapi_table *Current;
+
+   struct _glapi_table *Trace;
+   struct _glapi_table *RealPublished;
 };
 
 /**
@@ -3582,8 +3618,6 @@ struct gl_context
     */
    GLboolean HasConfig;
 
-   GLboolean TextureFormatSupported[MESA_FORMAT_COUNT];
-
    GLboolean RasterDiscard;  /**< GL_RASTERIZER_DISCARD */
    GLboolean IntelConservativeRasterization; /**< GL_CONSERVATIVE_RASTERIZATION_INTEL */
    GLboolean ConservativeRasterization; /**< GL_CONSERVATIVE_RASTERIZATION_NV */
@@ -3656,6 +3690,14 @@ struct gl_context
 
    struct pipe_draw_start_count_bias *tmp_draws;
    unsigned num_tmp_draws;
+
+   /**
+    * \name GL_MESA_map_buffer_client_pointer
+    *
+    * Range sent to AddClientPointerRange is client state until
+    * consumed or released.
+    */
+   struct pipe_clientptr_range AddClientPointerRange;
 };
 
 #ifndef NDEBUG
@@ -3670,19 +3712,9 @@ extern int MESA_DEBUG_FLAGS;
 /** The MESA_VERBOSE var is a bitmask of these flags */
 enum _verbose
 {
-   VERBOSE_VARRAY		= 0x0001,
-   VERBOSE_TEXTURE		= 0x0002,
-   VERBOSE_MATERIAL		= 0x0004,
-   VERBOSE_PIPELINE		= 0x0008,
-   VERBOSE_DRIVER		= 0x0010,
-   VERBOSE_STATE		= 0x0020,
-   VERBOSE_API			= 0x0040,
-   VERBOSE_DISPLAY_LIST		= 0x0100,
-   VERBOSE_LIGHTING		= 0x0200,
-   VERBOSE_PRIMS		= 0x0400,
-   VERBOSE_VERTS		= 0x0800,
-   VERBOSE_DISASSEM		= 0x1000,
-   VERBOSE_SWAPBUFFERS          = 0x4000
+   VERBOSE_STATE        = 0x0001,
+   VERBOSE_DISPLAY_LIST = 0x0002,
+   VERBOSE_API          = 0x0004,
 };
 
 

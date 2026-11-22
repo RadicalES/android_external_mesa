@@ -53,6 +53,14 @@ radeon_winsys(struct pipe_screen *screen) {
     return r300_screen(screen)->rws;
 }
 
+static inline unsigned
+r300_hyperz_pipe_count(const struct r300_screen *screen)
+{
+   if (screen->caps.family == CHIP_RV530)
+      return screen->info.r300_num_z_pipes;
+   return screen->info.r300_num_gb_pipes;
+}
+
 /* Debug functionality. */
 
 /**
@@ -113,6 +121,9 @@ static inline void SCREEN_DBG(struct r300_screen * screen, unsigned flags,
 }
 
 void r300_init_debug(struct r300_screen* ctx);
+
+bool r300_is_blending_supported(struct r300_screen *rscreen,
+                                enum pipe_format format);
 
 void r300_init_screen_resource_functions(struct r300_screen *r300screen);
 

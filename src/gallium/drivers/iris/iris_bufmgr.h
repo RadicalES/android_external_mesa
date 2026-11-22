@@ -1,24 +1,6 @@
 /*
  * Copyright © 2017 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef IRIS_BUFMGR_H
@@ -37,6 +19,7 @@
 #include "util/u_dynarray.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/xmlconfig.h"
 #include "pipe/p_defines.h"
 #include "util/pb_slab.h"
 #include "intel/dev/intel_device_info.h"
@@ -245,6 +228,12 @@ struct iris_bo_screen_deps {
    struct iris_syncobj *read_syncobjs[IRIS_BATCH_COUNT];
 };
 
+enum iris_bo_state {
+   IRIS_BO_STATE_IN_USE = 0,
+   IRIS_BO_STATE_NOT_IN_USE_BUT_ALIVE,
+   IRIS_BO_STATE_NOT_IN_USE_MAYBE_PURGED
+};
+
 struct iris_bo {
    /**
     * Size in bytes of the buffer object.
@@ -375,6 +364,15 @@ struct iris_bo {
 
          /** Boolean of whether this buffer can be scanout to display */
          bool scanout;
+
+         /** State of bo, mainly used to reduce madvise call.
+          * When bo is not needed first for 1sec we put it on bo cache but don't
+          * tell anything to KMD.
+          * Then if after that time it was not used, we tell KMD that it can be
+          * purged.
+          * Then after another second if not used we free it.
+          */
+         enum iris_bo_state bo_state;
       } real;
       struct {
          struct pb_slab_entry entry;
@@ -583,7 +581,9 @@ void iris_bo_mark_exported(struct iris_bo *bo);
  */
 bool iris_bo_busy(struct iris_bo *bo);
 
-struct iris_bufmgr *iris_bufmgr_get_for_fd(int fd, bool bo_reuse);
+bool iris_bufmgr_is_eff_64bit_enabled(const struct iris_bufmgr *bufmgr);
+
+struct iris_bufmgr *iris_bufmgr_get_for_fd(int fd, bool bo_reuse, struct driOptionCache *options);
 int iris_bufmgr_get_fd(struct iris_bufmgr *bufmgr);
 
 struct iris_bo *iris_bo_gem_create_from_name(struct iris_bufmgr *bufmgr,
@@ -613,8 +613,6 @@ int iris_bo_export_gem_handle_for_device(struct iris_bo *bo, int drm_fd,
                                          uint32_t *out_handle);
 
 /**
- * Returns the BO's address relative to the appropriate base address.
- *
  * All of our base addresses are programmed to the start of a 4GB region,
  * so simply returning the bottom 32 bits of the BO address will give us
  * the offset from whatever base address corresponds to that memory region.
@@ -625,8 +623,9 @@ iris_bo_offset_from_base_address(struct iris_bo *bo)
    /* This only works for buffers in the memory zones corresponding to a
     * base address - the top, unbounded memory zone doesn't have a base.
     */
+   assert(!iris_bufmgr_is_eff_64bit_enabled(bo->bufmgr));
    assert(bo->address < IRIS_MEMZONE_OTHER_START);
-   return bo->address;
+   return bo->address & UINT32_MAX;
 }
 
 /**

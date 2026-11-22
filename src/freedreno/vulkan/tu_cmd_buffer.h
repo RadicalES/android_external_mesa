@@ -15,10 +15,11 @@
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
+#include "tu_image.h"
 #include "tu_lrz.h"
 #include "tu_pass.h"
 #include "tu_pipeline.h"
-#include "tu_image.h"
+#include "tu_tile_config.h"
 
 enum tu_draw_state_group_id
 {
@@ -45,6 +46,9 @@ enum tu_draw_state_group_id
    /* dynamic state related draw states */
    TU_DRAW_STATE_DYNAMIC,
    TU_DRAW_STATE_COUNT = TU_DRAW_STATE_DYNAMIC + TU_DYNAMIC_STATE_COUNT,
+
+   /* autotune preemption delay tracking draw state */
+   TU_DRAW_STATE_AT_WRITE_RP_HASH = TU_DRAW_STATE_COUNT + 1,
 };
 
 struct tu_descriptor_state
@@ -77,9 +81,11 @@ enum tu_cmd_dirty_bits
    TU_CMD_DIRTY_SHADING_RATE = BIT(15),
    TU_CMD_DIRTY_DISABLE_FS = BIT(16),
    TU_CMD_DIRTY_TCS = BIT(17),
+   TU_CMD_DIRTY_VS = BIT(18),
+   TU_CMD_DIRTY_RAST = BIT(19),
 
    /* all draw states were disabled and need to be re-enabled: */
-   TU_CMD_DIRTY_DRAW_STATE = BIT(18)
+   TU_CMD_DIRTY_DRAW_STATE = BIT(20)
 };
 
 /* There are only three cache domains we have to care about: the CCU, or
@@ -211,6 +217,10 @@ enum tu_stage {
    TU_STAGE_BOTTOM,
 };
 
+enum tu_stage
+vk2tu_dst_stage(struct tu_device *dev,
+                VkPipelineStageFlags2 vk_stages);
+
 enum tu_cmd_flush_bits {
    TU_CMD_FLAG_CCU_CLEAN_DEPTH = 1 << 0,
    TU_CMD_FLAG_CCU_CLEAN_COLOR = 1 << 1,
@@ -229,6 +239,8 @@ enum tu_cmd_flush_bits {
    TU_CMD_FLAG_BLIT_CACHE_CLEAN = 1 << 11,
    TU_CMD_FLAG_RTU_INVALIDATE = 1 << 12,
    TU_CMD_FLAG_WAIT_FOR_BR = 1 << 13,
+   TU_CMD_FLAG_CACHE_INVALIDATE_GMEM = 1 << 14,
+   TU_CMD_FLAG_SUBPASS_SLICE_FENCE = 1 << 15,
 
    TU_CMD_FLAG_ALL_CLEAN =
       TU_CMD_FLAG_CCU_CLEAN_DEPTH |
@@ -243,6 +255,7 @@ enum tu_cmd_flush_bits {
       TU_CMD_FLAG_CCU_INVALIDATE_DEPTH |
       TU_CMD_FLAG_CCU_INVALIDATE_COLOR |
       TU_CMD_FLAG_CACHE_INVALIDATE |
+      TU_CMD_FLAG_CACHE_INVALIDATE_GMEM |
       TU_CMD_FLAG_BINDLESS_DESCRIPTOR_INVALIDATE |
       TU_CMD_FLAG_CCHE_INVALIDATE |
       /* Treat CP_WAIT_FOR_ME as a "cache" that needs to be invalidated when a
@@ -281,6 +294,13 @@ struct tu_vs_params {
    uint32_t vertex_offset;
    uint32_t first_instance;
    uint32_t draw_id;
+   uint32_t view_index;
+   /* Whether the last emitted params were for a SW multiview replay. Both the
+    * size of the uploaded const and whether VFD registers are part of the draw
+    * state depend on it, so it has to invalidate the cache below.
+    */
+   bool sw_multiview;
+   bool skip_vfd;
    bool empty;
 };
 
@@ -304,6 +324,18 @@ struct tu_render_pass_state
    bool has_zpass_done_sample_count_write_in_rp;
    bool disable_gmem;
    bool sysmem_single_prim_mode;
+   bool lrz_disable_for_next_rp;
+   /* Sticky for the RP duration */
+   bool lrz_write_disabled;
+
+   /* We need to track a specific stencil state to determine if we can keep LRZ writes
+    * in stencil-writes-based-on-depth-test case.
+    */
+   struct {
+      uint8_t write_mask;
+      bool has_depth_dependent_stencil_write;
+      bool incompatible;
+   } lrz_stencil_tag;
 
    /* This is set if, at any point in the render pass, we were not able to
     * duplicate the viewport per-view due to the user using multiple viewports
@@ -315,6 +347,16 @@ struct tu_render_pass_state
 
    /* Track whether conditional predicate for COND_REG_EXEC is changed in draw_cs */
    bool draw_cs_writes_to_cond_pred;
+
+   /* Track whether there has been a pipeline barrier in the subpass with an
+    * INPUT_ATTACHMENT_READ destination access.
+    */
+   bool input_attachment_read_barrier;
+
+   /* Track whether any FS have used dynamic rendering with read-only input
+    * attachments.
+    */
+   bool read_only_input_attachments;
 
    uint32_t drawcall_count;
 
@@ -344,9 +386,14 @@ struct tu_render_pass_state
 
    const char *lrz_disable_reason;
    uint32_t lrz_disabled_at_draw;
+   const char *lrz_write_disable_reason;
    uint32_t lrz_write_disabled_at_draw;
 
-   const char *gmem_disable_reason;
+   /* Which check took the SYSMEM/GMEM decision away from the autotuner, or NULL
+    * if the autotuner was free to choose.
+    */
+   const char *force_render_mode_reason;
+
    const char *cb_disable_reason;
 };
 
@@ -440,7 +487,7 @@ enum tu_suspend_resume_state
    SR_IN_CHAIN_AFTER_PRE_CHAIN,
 };
 
-typedef char tu_sha1_str[SHA1_DIGEST_STRING_LENGTH];
+typedef char tu_blake3_str[BLAKE3_HEX_LEN];
 
 struct tu_cmd_state
 {
@@ -453,6 +500,7 @@ struct tu_cmd_state
    struct tu_render_pass_state rp;
 
    struct vk_render_pass_state vk_rp;
+   struct vk_multiview_state vk_mv;
    struct vk_vertex_input_state vi;
    struct vk_sample_locations_state sl;
 
@@ -526,13 +574,15 @@ struct tu_cmd_state
    /* Decides which GMEM layout to use from the tu_pass, based on whether the CCU
     * might get used by tu_store_gmem_attachment().
     */
-   enum tu_gmem_layout gmem_layout;
+   tu_gmem_layout gmem_layout;
+   uint32_t gmem_layout_divisor;
 
    const struct tu_render_pass *pass;
    const struct tu_subpass *subpass;
-   const struct tu_framebuffer *framebuffer;
+   struct tu_framebuffer *framebuffer;
    const struct tu_tiling_config *tiling;
-   VkRect2D render_area;
+   VkRect2D render_areas[MAX_VIEWS];
+   bool per_layer_render_area;
 
    const struct tu_image_view **attachments;
    VkClearValue *clear_values;
@@ -545,17 +595,24 @@ struct tu_cmd_state
    struct {
       const struct tu_render_pass *pass;
       const struct tu_subpass *subpass;
-      const struct tu_framebuffer *framebuffer;
-      VkRect2D render_area;
+      struct tu_framebuffer *framebuffer;
+      VkRect2D render_areas[MAX_VIEWS];
+      bool per_layer_render_area;
+      bool fdm_any_subsampled;
+      bool fdm_custom_resolve_subsampled;
       enum tu_gmem_layout gmem_layout;
+      uint32_t gmem_layout_divisor;
 
       const struct tu_image_view **attachments;
       VkClearValue *clear_values;
 
       struct tu_lrz_state lrz;
+      bool lrz_write_disabled;
    } suspended_pass;
 
    bool fdm_enabled;
+   bool fdm_any_subsampled;
+   bool fdm_custom_resolve_subsampled;
 
    bool tessfactor_addr_set;
    bool predication_active;
@@ -606,6 +663,13 @@ struct tu_cmd_state
    struct tu_vs_params last_vs_params;
    bool last_draw_indexed;
 
+   /* Set by tu_sw_multiview_draw() while it replays a draw for a single view
+    * on devices without HW multiview. Outside of it SW multiview is never
+    * active, so ordinary draws are unaffected.
+    */
+   bool sw_multiview;
+   uint32_t sw_view_index;
+
    struct tu_tess_params tess_params;
 
    uint64_t descriptor_buffer_iova[MAX_SETS];
@@ -646,8 +710,7 @@ struct tu_cmd_buffer
    struct u_trace_iterator trace_renderpass_start;
    struct u_trace trace, rp_trace;
 
-   struct list_head renderpass_autotune_results;
-   struct tu_autotune_results_buffer* autotune_buffer;
+   tu_autotune::cmd_buf_ctx autotune_ctx;
 
    void *patchpoints_ctx;
    struct util_dynarray fdm_bin_patchpoints;
@@ -679,6 +742,11 @@ struct tu_cmd_buffer
    struct tu_subpass_attachment dynamic_color_attachments[MAX_RTS];
    struct tu_subpass_attachment dynamic_input_attachments[MAX_RTS + 1];
    struct tu_subpass_attachment dynamic_resolve_attachments[MAX_RTS + 1];
+   /* The color attachments of the custom resolve subpass, which cannot share
+    * dynamic_resolve_attachments: the main subpass still needs its resolve
+    * list for any fixed-function resolves mixed into the pass.
+    */
+   struct tu_subpass_attachment dynamic_custom_resolve_attachments[MAX_RTS];
    struct tu_subpass_attachment dynamic_unresolve_attachments[MAX_RTS + 1];
    const struct tu_image_view *dynamic_attachments[3 * (MAX_RTS + 1) + 2];
    VkClearValue dynamic_clear_values[3 * (MAX_RTS + 1)];
@@ -734,6 +802,17 @@ struct tu_cmd_buffer
 
    bool prev_fsr_is_null;
 };
+
+struct vk_device_dispatch_table;
+
+/* Replaces the draw entrypoints with wrappers emulating multiview by replaying
+ * each draw once per view. Only for devices without HW multiview.
+ */
+void
+tu_install_sw_multiview_draw_entrypoints(
+   struct vk_device_dispatch_table *dispatch_table,
+   const struct fd_dev_info *info);
+
 VK_DEFINE_HANDLE_CASTS(tu_cmd_buffer, vk.base, VkCommandBuffer,
                        VK_OBJECT_TYPE_COMMAND_BUFFER)
 
@@ -760,9 +839,6 @@ tu_attachment_gmem_offset_stencil(struct tu_cmd_buffer *cmd,
       layer * cmd->state.tiling->tile0.width * cmd->state.tiling->tile0.height *
       att->samples;
 }
-
-void tu_render_pass_state_merge(struct tu_render_pass_state *dst,
-                                const struct tu_render_pass_state *src);
 
 VkResult tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
                              const VkCommandBufferBeginInfo *pBeginInfo);
@@ -825,6 +901,7 @@ tu_emit_event_write(struct tu_cmd_buffer *cmd,
                     struct tu_cs *cs,
                     enum fd_gpu_event event);
 
+template <chip CHIP>
 void
 tu_flush_for_access(struct tu_cache_state *cache,
                     enum tu_cmd_access_mask src_mask,
@@ -846,10 +923,16 @@ void tu6_emit_window_scissor(struct tu_cs *cs, uint32_t x1, uint32_t y1, uint32_
 
 void tu6_emit_window_offset(struct tu_cs *cs, uint32_t x1, uint32_t y1);
 
+void tu6_emit_blit_scissor(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                           unsigned view, bool align);
+
 void tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs);
 
 void tu6_apply_depth_bounds_workaround(struct tu_device *device,
                                        uint32_t *rb_depth_cntl);
+
+void
+tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state);
 
 bool tu_enable_fdm_offset(struct tu_cmd_buffer *cmd);
 
@@ -859,7 +942,7 @@ typedef void (*tu_fdm_bin_apply_t)(struct tu_cmd_buffer *cmd,
                                    VkOffset2D common_bin_offset,
                                    const VkOffset2D *hw_viewport_offsets,
                                    unsigned views,
-                                   const VkExtent2D *frag_areas,
+                                   const struct tu_tile_config *tile_config,
                                    const VkRect2D *bins,
                                    bool binning);
 
@@ -886,7 +969,8 @@ struct tu_vis_stream_patchpoint_cs {
 void
 tu_barrier(struct tu_cmd_buffer *cmd,
            uint32_t dep_count,
-           const VkDependencyInfo *dep_info);
+           const VkDependencyInfo *dep_info,
+           bool no_sync);
 
 template <chip CHIP>
 void
@@ -918,18 +1002,18 @@ _tu_create_fdm_bin_patchpoint(struct tu_cmd_buffer *cmd,
     * sysmem is required, and uses up the dwords that have been reserved.
     */
    unsigned num_views = MAX2(cmd->state.pass->num_views, 1);
-   VkExtent2D unscaled_frag_areas[num_views];
+   struct tu_tile_config dummy_config = {};
    VkOffset2D hw_viewport_offsets[num_views];
    VkRect2D bins[num_views];
    for (unsigned i = 0; i < num_views; i++) {
-      unscaled_frag_areas[i] = (VkExtent2D) { 1, 1 };
+      dummy_config.frag_areas[i] = (VkExtent2D) { 1, 1 };
       bins[i] = (VkRect2D) {
          { 0, 0 },
          { MAX_VIEWPORT_SIZE, MAX_VIEWPORT_SIZE },
       };
       hw_viewport_offsets[i] = (VkOffset2D) { 0, 0 };
    }
-   apply(cmd, cs, state, (VkOffset2D) {0, 0}, hw_viewport_offsets, num_views, unscaled_frag_areas, bins, false);
+   apply(cmd, cs, state, (VkOffset2D) {0, 0}, hw_viewport_offsets, num_views, &dummy_config, bins, false);
    assert(tu_cs_get_cur_iova(cs) == patch.iova + patch.size * sizeof(uint32_t));
 
    util_dynarray_append(&cmd->fdm_bin_patchpoints, patch);
@@ -940,9 +1024,55 @@ _tu_create_fdm_bin_patchpoint(struct tu_cmd_buffer *cmd,
 
 VkResult tu_init_bin_preamble(struct tu_device *device);
 
+template <chip CHIP>
+void tu_init_hw_rp(struct tu_cs *cs);
+
 void
 tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
                              struct tu_cs *cs,
                              bool force_disable_cb);
+
+void
+tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
+                               struct tu_cs *cs);
+
+/* For bin offsetting we want to do "Euclidean division," where the remainder
+ * (i.e. the offset of the bin) is always positive. Unfortunately C/C++
+ * remainder and division don't do this, so we have to implement it ourselves.
+ *
+ * For example, we should have:
+ *
+ * euclid_rem(-3, 4) = 1
+ * euclid_rem(-4, 4) = 0
+ * euclid_rem(-4, 4) = 3
+ */
+
+static inline int32_t
+euclid_rem(int32_t divisor, int32_t divisend)
+{
+   if (divisor >= 0)
+      return divisor % divisend;
+   int32_t tmp = divisend - (-divisor % divisend);
+   return tmp == divisend ? 0 : tmp;
+}
+
+/* Calculate how much the bins for a given view should be shifted to the left
+ * and upwards, given the application-provided FDM offset.
+ */
+static inline VkOffset2D
+tu_bin_offset(VkOffset2D fdm_offset, const struct tu_tiling_config *tiling)
+{
+   return (VkOffset2D) {
+      euclid_rem(-fdm_offset.x, tiling->tile0.width),
+      euclid_rem(-fdm_offset.y, tiling->tile0.height),
+   };
+}
+
+static inline uint32_t
+tu_fdm_num_layers(const struct tu_cmd_buffer *cmd)
+{
+   return cmd->state.pass->num_views ? cmd->state.pass->num_views : 
+      (cmd->state.fdm_per_layer ? cmd->state.framebuffer->layers : 1);
+}
 
 #endif /* TU_CMD_BUFFER_H */

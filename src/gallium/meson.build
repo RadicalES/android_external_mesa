@@ -197,6 +197,9 @@ else
   driver_ethosu = declare_dependency()
 endif
 if with_gallium_zink
+  if not with_platform_windows
+    subdir('winsys/zink/drm')
+  endif
   subdir('drivers/zink')
 else
   driver_zink = declare_dependency()
@@ -209,11 +212,6 @@ endif
 if with_gallium_rusticl
   subdir('frontends/rusticl')
   subdir('targets/rusticl')
-endif
-if with_glx == 'xlib'
-  subdir('winsys/sw/xlib')
-  subdir('frontends/glx/xlib')
-  subdir('targets/libgl-xlib')
 endif
 if with_gallium_va
   subdir('frontends/va')
@@ -231,10 +229,6 @@ if with_dri
 endif
 if with_platform_haiku
   subdir('frontends/hgl')
-endif
-if with_gallium_st_d3d10umd
-  subdir('frontends/d3d10umd')
-  subdir('targets/d3d10umd')
 endif
 if with_platform_windows
   if with_opengl
@@ -256,4 +250,8 @@ endif
 if with_teflon
   subdir('frontends/teflon')
   subdir('targets/teflon')
+endif
+if with_torx
+  subdir('frontends/torx')
+  subdir('targets/torx')
 endif

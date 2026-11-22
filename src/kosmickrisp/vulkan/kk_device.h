@@ -15,6 +15,9 @@
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
+#include "kosmickrisp/clc/kk_precompiled_shader.h"
+#include "libkk_shaders.h"
+
 #include "util/u_dynarray.h"
 
 #include "vk_device.h"
@@ -24,13 +27,6 @@
 struct kk_bo;
 struct kk_physical_device;
 struct vk_pipeline_cache;
-
-enum kk_device_lib_pipeline {
-   KK_LIB_IMM_WRITE = 0,
-   KK_LIB_COPY_QUERY,
-   KK_LIB_TRIANGLE_FAN,
-   KK_LIB_COUNT,
-};
 
 struct kk_residency_set {
    simple_mtx_t mutex;
@@ -46,6 +42,7 @@ struct mtl_sampler_packed {
    enum mtl_sampler_min_mag_filter min_filter;
    enum mtl_sampler_min_mag_filter mag_filter;
    enum mtl_sampler_mip_filter mip_filter;
+   enum mtl_sampler_reduction_mode reduction_mode;
 
    enum mtl_compare_function compare_func;
    float min_lod;
@@ -75,10 +72,15 @@ struct kk_sampler_heap {
    struct hash_table *ht;
 };
 
+struct kk_precompiled_cache {
+   struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
+};
+
 struct kk_device {
    struct vk_device vk;
 
    mtl_device *mtl_handle;
+   mtl_compiler *mtl_compiler_handle;
 
    /* Dispatch table exposed to the user. Required since we need to record all
     * commands due to Metal limitations */
@@ -91,25 +93,19 @@ struct kk_device {
     * recording as required by Metal. */
    struct kk_residency_set residency_set;
 
-   mtl_compute_pipeline_state *lib_pipelines[KK_LIB_COUNT];
+   struct kk_precompiled_cache precompiled_cache;
 
+   bool has_queue;
    struct kk_queue queue;
 
    struct vk_meta_device meta;
 
-   uint64_t disabled_workarounds;
-   bool gpu_capture_enabled;
+   /* Geomtry heap */
+   struct kk_bo *heap;
+   util_once_flag heap_init_once;
 };
 
 VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
-
-static inline mtl_compute_pipeline_state *
-kk_device_lib_pipeline(const struct kk_device *dev,
-                       enum kk_device_lib_pipeline pipeline)
-{
-   assert(pipeline < KK_LIB_COUNT);
-   return dev->lib_pipelines[pipeline];
-}
 
 static inline struct kk_physical_device *
 kk_device_physical(const struct kk_device *dev)
@@ -124,6 +120,10 @@ void kk_device_finish_lib(struct kk_device *dev);
 void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
 void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
                                               mtl_heap *heap);
+void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
+                                           mtl_buffer *buffer);
+void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+                                                mtl_buffer *buffer);
 void kk_device_make_resources_resident(struct kk_device *dev);
 
 /* Required to create a sampler */

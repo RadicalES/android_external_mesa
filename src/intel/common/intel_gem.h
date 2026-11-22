@@ -71,6 +71,10 @@ intel_48b_address(uint64_t v)
    return (uint64_t)(v << shift) >> shift;
 }
 
+#ifdef HAVE_INTEL_VIRTIO
+extern int intel_virtio_ioctl(int fd, unsigned long request, void *arg);
+#endif
+
 /**
  * Call ioctl, restarting if it is interrupted
  */
@@ -80,7 +84,11 @@ intel_ioctl(int fd, unsigned long request, void *arg)
     int ret;
 
     do {
-        ret = ioctl(fd, request, arg);
+#ifdef HAVE_INTEL_VIRTIO
+      ret = intel_virtio_ioctl(fd, request, arg);
+#else
+      ret = ioctl(fd, request, arg);
+#endif
     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
     return ret;
 }
@@ -131,6 +139,7 @@ bool intel_gem_create_context_ext(int fd, enum intel_gem_create_context_flags fl
                                   uint32_t *ctx_id);
 bool intel_gem_supports_protected_context(int fd,
                                           enum intel_kmd_type kmd_type);
+bool intel_gem_supports_huc(int fd, enum intel_kmd_type kmd_type);
 
 /* Definitions used by the execbuf ioctl wrappers in the backends.
  * With the values below, after 80 retries we have slept ~16s, and the warning

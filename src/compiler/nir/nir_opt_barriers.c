@@ -40,6 +40,27 @@ combine_all_barriers(nir_intrinsic_instr *a, nir_intrinsic_instr *b, void *_)
 }
 
 static bool
+can_combine_control_barriers(nir_intrinsic_instr *prev, nir_intrinsic_instr *next)
+{
+   unsigned sem_prev = nir_intrinsic_memory_semantics(prev) & NIR_MEMORY_CONTROL_ARRIVE_WAIT;
+   unsigned sem_next = nir_intrinsic_memory_semantics(next) & NIR_MEMORY_CONTROL_ARRIVE_WAIT;
+   bool prev_acquire = nir_intrinsic_memory_semantics(prev) & (NIR_MEMORY_ACQUIRE | NIR_MEMORY_MAKE_VISIBLE);
+   bool next_release = nir_intrinsic_memory_semantics(next) & (NIR_MEMORY_RELEASE | NIR_MEMORY_MAKE_AVAILABLE);
+
+   if ((!sem_prev || sem_prev == NIR_MEMORY_CONTROL_ARRIVE_WAIT) &&
+       (!sem_next || sem_next == NIR_MEMORY_CONTROL_ARRIVE_WAIT))
+      return true;
+   if (sem_prev == NIR_MEMORY_CONTROL_ARRIVE && sem_next == NIR_MEMORY_CONTROL_WAIT)
+      return true;
+   if (!sem_prev && sem_next == NIR_MEMORY_CONTROL_ARRIVE && !prev_acquire)
+      return true;
+   if (sem_prev == NIR_MEMORY_CONTROL_WAIT && !sem_next && !next_release)
+      return true;
+
+   return false;
+}
+
+static bool
 nir_opt_combine_barriers_impl(nir_function_impl *impl,
                               nir_combine_barrier_cb combine_cb,
                               void *data)
@@ -61,7 +82,8 @@ nir_opt_combine_barriers_impl(nir_function_impl *impl,
             continue;
          }
 
-         if (prev && combine_cb(prev, current, data)) {
+         if (prev && can_combine_control_barriers(prev, current) &&
+             combine_cb(prev, current, data)) {
             nir_instr_remove(&current->instr);
             progress = true;
          } else {
@@ -210,8 +232,21 @@ nir_opt_acquire_release_barriers_impl(nir_function_impl *impl,
          nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
 
          switch (intrin->intrinsic) {
+         case nir_intrinsic_cmat_load:
+         case nir_intrinsic_cmat_store:
+            if (last_atomic) {
+               const unsigned ptr_src =
+                  intrin->intrinsic == nir_intrinsic_cmat_load ? 1 : 0;
+               nir_deref_instr *ref = nir_src_as_deref(intrin->src[ptr_src]);
+               nir_deref_instr *lastdr = nir_src_as_deref(last_atomic->src[0]);
+               if (nir_deref_mode_may_be(ref, lastdr->modes))
+                  last_atomic = NULL;
+            }
+            break;
+
          case nir_intrinsic_load_deref:
          case nir_intrinsic_load_deref_block_intel:
+         case nir_intrinsic_load_deref_transpose_amd:
          case nir_intrinsic_store_deref:
          case nir_intrinsic_store_deref_block_intel:
             if (last_atomic) {

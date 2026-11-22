@@ -340,6 +340,8 @@ static inline struct zink_vs_key_base *
 zink_set_last_vertex_key(struct zink_context *ctx)
 {
    ctx->last_vertex_stage_dirty = true;
+   /* the next draw selects the variant of the last vertex stage again */
+   zink_update_dirty_gfx_stages(ctx, BITFIELD_BIT(ctx->last_vertex_stage ? ctx->last_vertex_stage->info.stage : MESA_SHADER_VERTEX));
    return zink_screen(ctx->base.screen)->optimal_keys ?
           &ctx->gfx_pipeline_state.shader_keys_optimal.key.vs_base :
           &ctx->gfx_pipeline_state.shader_keys.last_vertex.key.vs_base;
@@ -509,6 +511,11 @@ zink_sanitize_optimal_key_mesh(struct zink_shader **shaders, uint32_t val)
       k.fs.force_dual_color_blend = false;
    return k.val;
 }
+
+uint32_t
+zink_get_subgroup_size_for_block(struct zink_screen *screen, struct zink_compute_program *comp,
+                                 const uint32_t block[3]);
+
 #ifdef __cplusplus
 }
 #endif

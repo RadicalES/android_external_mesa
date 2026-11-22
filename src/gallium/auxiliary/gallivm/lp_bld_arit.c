@@ -135,11 +135,10 @@ lp_build_min_simple(struct lp_build_context *bld,
       }
    }
    else if (type.floating && util_get_cpu_caps()->has_altivec) {
-      if (nan_behavior == GALLIVM_NAN_RETURN_NAN_FIRST_NONNAN) {
-         debug_printf("%s: altivec doesn't support nan return nan behavior\n",
-                      __func__);
-      }
-      if (type.width == 32 && type.length == 4) {
+      /* vminfp returns NaN if either operand is NaN, and honors VSCR[NJ]. */
+      if (type.width == 32 && !util_get_cpu_caps()->has_vsx &&
+          (nan_behavior == GALLIVM_NAN_BEHAVIOR_UNDEFINED ||
+           nan_behavior == GALLIVM_NAN_RETURN_NAN_FIRST_NONNAN)) {
          intrinsic = "llvm.ppc.altivec.vminfp";
          intr_size = 128;
       }
@@ -289,11 +288,10 @@ lp_build_max_simple(struct lp_build_context *bld,
       }
    }
    else if (type.floating && util_get_cpu_caps()->has_altivec) {
-      if (nan_behavior == GALLIVM_NAN_RETURN_NAN_FIRST_NONNAN) {
-         debug_printf("%s: altivec doesn't support nan return nan behavior\n",
-                      __func__);
-      }
-      if (type.width == 32 || type.length == 4) {
+      /* vmaxfp returns NaN if either operand is NaN, and honors VSCR[NJ]. */
+      if (type.width == 32 && !util_get_cpu_caps()->has_vsx &&
+          (nan_behavior == GALLIVM_NAN_BEHAVIOR_UNDEFINED ||
+           nan_behavior == GALLIVM_NAN_RETURN_NAN_FIRST_NONNAN)) {
          intrinsic = "llvm.ppc.altivec.vmaxfp";
          intr_size = 128;
       }
@@ -413,46 +411,24 @@ lp_build_add(struct lp_build_context *bld,
    assert(lp_check_value(type, a));
    assert(lp_check_value(type, b));
 
-   if (a == bld->zero)
-      return b;
-   if (b == bld->zero)
-      return a;
+   if (!type.floating || !type.signed_zero_preserve) {
+      if (a == bld->zero)
+         return b;
+      if (b == bld->zero)
+         return a;
+   }
    if (a == bld->undef || b == bld->undef)
       return bld->undef;
 
    if (type.norm) {
-      const char *intrinsic = NULL;
-
       if (!type.sign && (a == bld->one || b == bld->one))
         return bld->one;
 
       if (!type.floating && !type.fixed) {
          char intrin[32];
-         intrinsic = type.sign ? "llvm.sadd.sat" : "llvm.uadd.sat";
+         const char *intrinsic = type.sign ? "llvm.sadd.sat" : "llvm.uadd.sat";
          lp_format_intrinsic(intrin, sizeof intrin, intrinsic, bld->vec_type);
          return lp_build_intrinsic_binary(builder, intrin, bld->vec_type, a, b);
-      }
-
-      if (intrinsic)
-         return lp_build_intrinsic_binary(builder, intrinsic,
-                       lp_build_vec_type(bld->gallivm, bld->type), a, b);
-   }
-
-   if (type.norm && !type.floating && !type.fixed) {
-      if (type.sign) {
-         uint64_t sign = (uint64_t)1 << (type.width - 1);
-         LLVMValueRef max_val = lp_build_const_int_vec(bld->gallivm, type, sign - 1);
-         LLVMValueRef min_val = lp_build_const_int_vec(bld->gallivm, type, sign);
-         /* a_clamp_max is the maximum a for positive b,
-            a_clamp_min is the minimum a for negative b. */
-         LLVMValueRef a_clamp_max =
-            lp_build_min_simple(bld, a, LLVMBuildSub(builder, max_val, b, ""),
-                                GALLIVM_NAN_BEHAVIOR_UNDEFINED);
-         LLVMValueRef a_clamp_min =
-            lp_build_max_simple(bld, a, LLVMBuildSub(builder, min_val, b, ""),
-                                GALLIVM_NAN_BEHAVIOR_UNDEFINED);
-         a = lp_build_select(bld, lp_build_cmp(bld, PIPE_FUNC_GREATER, b,
-                                     bld->zero), a_clamp_max, a_clamp_min);
       }
    }
 
@@ -464,25 +440,6 @@ lp_build_add(struct lp_build_context *bld,
    /* clamp to ceiling of 1.0 */
    if (bld->type.norm && (bld->type.floating || bld->type.fixed))
       res = lp_build_min_simple(bld, res, bld->one, GALLIVM_NAN_RETURN_OTHER_SECOND_NONNAN);
-
-   if (type.norm && !type.floating && !type.fixed) {
-      if (!type.sign) {
-         /*
-          * newer llvm versions no longer support the intrinsics, but recognize
-          * the pattern. Since auto-upgrade of intrinsics doesn't work for jit
-          * code, it is important we match the pattern llvm uses (and pray llvm
-          * doesn't change it - and hope they decide on the same pattern for
-          * all backends supporting it...).
-          * NOTE: cmp/select does sext/trunc of the mask. Does not seem to
-          * interfere with llvm's ability to recognize the pattern but seems
-          * a bit brittle.
-          * NOTE: llvm 9+ always uses (non arch specific) intrinsic.
-          */
-         LLVMValueRef overflowed = lp_build_cmp(bld, PIPE_FUNC_GREATER, a, res);
-         res = lp_build_select(bld, overflowed,
-                               LLVMConstAllOnes(bld->int_vec_type), res);
-      }
-   }
 
    /* XXX clamp to floor of -1 or 0??? */
 
@@ -1827,8 +1784,9 @@ lp_build_round_arch(struct lp_build_context *bld,
                     LLVMValueRef a,
                     enum lp_build_round_mode mode)
 {
+   /* VMX vrfi* honor VSCR[NJ]; VSX follows IEEE for denormals. */
    if (util_get_cpu_caps()->has_sse4_1 || util_get_cpu_caps()->has_neon ||
-       DETECT_ARCH_S390 == true) {
+       util_get_cpu_caps()->has_vsx || DETECT_ARCH_S390 == true) {
       LLVMBuilderRef builder = bld->gallivm->builder;
       const struct lp_type type = bld->type;
       const char *intrinsic_root;
@@ -1960,6 +1918,18 @@ lp_build_round(struct lp_build_context *bld,
       LLVMValueRef res, anosign, mask;
       LLVMTypeRef int_vec_type = bld->int_vec_type;
       LLVMTypeRef vec_type = bld->vec_type;
+
+      /* On altivec/VSX, llvm.nearbyint lowers to vrfin/xvrspic (1 instruction,
+       * round-to-nearest-even) for any vector width. A scalar llvm.nearbyint
+       * is a libcall; only llvm.rint is inline, and only with VSX. */
+      if (util_get_cpu_caps()->has_altivec &&
+          (type.length > 1 || util_get_cpu_caps()->has_vsx)) {
+         char intrinsic[64];
+         lp_format_intrinsic(intrinsic, sizeof(intrinsic),
+                             type.length > 1 ? "llvm.nearbyint" : "llvm.rint",
+                             bld->vec_type);
+         return lp_build_intrinsic_unary(builder, intrinsic, bld->vec_type, a);
+      }
 
       inttype = type;
       inttype.floating = 0;
@@ -3621,7 +3591,7 @@ lp_build_fpstate_set_denorms_zero(struct gallivm_state *gallivm,
                              LLVMConstInt(LLVMTypeOf(mxcsr), daz_ftz, 0), "");
       } else {
          mxcsr = LLVMBuildAnd(builder, mxcsr,
-                              LLVMConstInt(LLVMTypeOf(mxcsr), ~daz_ftz, 0), "");
+                              lp_build_const_int_trunc(LLVMTypeOf(mxcsr), ~daz_ftz), "");
       }
 
       LLVMBuildStore(builder, mxcsr, mxcsr_ptr);

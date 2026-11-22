@@ -259,9 +259,12 @@ typedef enum {
    OPC_QUAD_SHUFFLE_VERT   = _OPC(5, 31),
    OPC_QUAD_SHUFFLE_DIAG   = _OPC(5, 32),
    OPC_TCINV               = _OPC(5, 33),
+   OPC_IMG_BINDLESS_HOF  = _OPC(5, 34),
+   OPC_IMG_BINDLESS_PCMN = _OPC(5, 35),
+   OPC_IMG_BINDLESS      = _OPC(5, 36),
    /* cat5 meta instructions, placed above the cat5 opc field's size */
-   OPC_DSXPP_MACRO     = _OPC(5, 35),
-   OPC_DSYPP_MACRO     = _OPC(5, 36),
+   OPC_DSXPP_MACRO     = _OPC(5, 37),
+   OPC_DSYPP_MACRO     = _OPC(5, 38),
 
    /* category 6: */
    OPC_LDG             = _OPC(6, 0),        /* load-global */
@@ -524,6 +527,7 @@ regid(int num, int comp)
 
 /* special registers: */
 #define REG_A0 61 /* address register */
+#define REG_A0_X regid(REG_A0, 0)
 #define REG_P0 62 /* predicate register */
 #define REG_P0_X regid(REG_P0, 0) /* p0.x */
 
@@ -606,27 +610,48 @@ typedef enum {
 } cat6_desc_mode_t;
 
 static inline bool
+is_cat2_float(opc_t opc)
+{
+   switch (opc) {
+   case OPC_ADD_F:
+   case OPC_MIN_F:
+   case OPC_MAX_F:
+   case OPC_MUL_F:
+   case OPC_SIGN_F:
+   case OPC_CMPS_F:
+   case OPC_ABSNEG_F:
+   case OPC_CMPV_F:
+   case OPC_FLOOR_F:
+   case OPC_CEIL_F:
+   case OPC_RNDNE_F:
+   case OPC_RNDAZ_F:
+   case OPC_TRUNC_F:
+      return true;
+
+   default:
+      return false;
+   }
+}
+
+static inline bool
+is_cat3_float(opc_t opc)
+{
+   switch (opc) {
+   case OPC_MAD_F16:
+   case OPC_MAD_F32:
+   case OPC_SEL_F16:
+   case OPC_SEL_F32:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
 is_sat_compatible(opc_t opc)
 {
    /* On a6xx saturation doesn't work on cat4 */
-   if (opc_cat(opc) != 2 && opc_cat(opc) != 3)
-      return false;
-
-   switch (opc) {
-   /* On a3xx and a6xx saturation doesn't work on bary.f/flat.b */
-   case OPC_BARY_F:
-   case OPC_FLAT_B:
-   /* On a6xx saturation doesn't work on sel.* */
-   case OPC_SEL_B16:
-   case OPC_SEL_B32:
-   case OPC_SEL_S16:
-   case OPC_SEL_S32:
-   case OPC_SEL_F16:
-   case OPC_SEL_F32:
-      return false;
-   default:
-      return true;
-   }
+   return is_cat2_float(opc) || is_cat3_float(opc);
 }
 
 static inline bool
@@ -782,44 +807,6 @@ is_isam(opc_t opc)
    case OPC_ISAM:
    case OPC_ISAML:
    case OPC_ISAMM:
-      return true;
-   default:
-      return false;
-   }
-}
-
-static inline bool
-is_cat2_float(opc_t opc)
-{
-   switch (opc) {
-   case OPC_ADD_F:
-   case OPC_MIN_F:
-   case OPC_MAX_F:
-   case OPC_MUL_F:
-   case OPC_SIGN_F:
-   case OPC_CMPS_F:
-   case OPC_ABSNEG_F:
-   case OPC_CMPV_F:
-   case OPC_FLOOR_F:
-   case OPC_CEIL_F:
-   case OPC_RNDNE_F:
-   case OPC_RNDAZ_F:
-   case OPC_TRUNC_F:
-      return true;
-
-   default:
-      return false;
-   }
-}
-
-static inline bool
-is_cat3_float(opc_t opc)
-{
-   switch (opc) {
-   case OPC_MAD_F16:
-   case OPC_MAD_F32:
-   case OPC_SEL_F16:
-   case OPC_SEL_F32:
       return true;
    default:
       return false;

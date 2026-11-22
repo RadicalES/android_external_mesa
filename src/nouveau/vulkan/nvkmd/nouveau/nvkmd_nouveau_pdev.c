@@ -17,6 +17,7 @@
 #include <xf86drm.h>
 
 #include "clc597.h"
+#include "clc697.h"
 
 static bool
 drm_device_is_nouveau(const char *path)
@@ -81,7 +82,7 @@ nvkmd_nouveau_try_create_pdev(struct _drmDevice *drm_device,
    if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
       nouveau_ws_device_destroy(ws_dev);
       return vk_errorf(log_obj, VK_ERROR_INITIALIZATION_FAILED,
-                       "fstat() failed on %s: %m",
+                       "stat() failed on %s: %m",
                        drm_device->nodes[DRM_NODE_RENDER]);
    }
    const dev_t render_dev = st.st_rdev;
@@ -101,8 +102,10 @@ nvkmd_nouveau_try_create_pdev(struct _drmDevice *drm_device,
       .has_alloc_tiled = nouveau_ws_device_has_tiled_bo(ws_dev),
       .has_map_fixed = true,
       .has_overmap = true,
-      .has_compression = ws_dev->nouveau_version >= 0x01000402 &&
-                         ws_dev->info.cls_eng3d >= TURING_A,
+      .has_compression = (ws_dev->nouveau_version >= 0x01000403 &&
+                          ws_dev->info.cls_eng3d >= TURING_A) ||
+                         (ws_dev->nouveau_version >= 0x01000402 &&
+                          ws_dev->info.cls_eng3d >= AMPERE_A),
    };
 
    /* We get this ourselves */

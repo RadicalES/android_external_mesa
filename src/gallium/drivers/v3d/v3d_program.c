@@ -181,7 +181,7 @@ v3d_set_transform_feedback_outputs(struct v3d_uncompiled_shader *so,
         memcpy(so->tf_outputs, slots, sizeof(*slots) * slot_count);
 }
 
-static int
+static unsigned
 type_size(const struct glsl_type *type, bool bindless)
 {
         return glsl_count_attribute_slots(type, false);
@@ -347,10 +347,8 @@ v3d_uncompiled_shader_create(struct pipe_context *pctx,
                 assert(type == PIPE_SHADER_IR_TGSI);
 
                 if (V3D_DBG(TGSI)) {
-                        fprintf(stderr, "prog %d TGSI:\n",
-                                so->program_id);
+                        mesa_logd("prog %d TGSI:", so->program_id);
                         tgsi_dump(ir, 0);
-                        fprintf(stderr, "\n");
                 }
                 s = tgsi_to_nir(ir, pctx->screen, false);
         }
@@ -395,8 +393,6 @@ v3d_uncompiled_shader_create(struct pipe_context *pctx,
 
         NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp, NULL);
 
-        NIR_PASS(_, s, nir_lower_frexp);
-
         /* Since we can't expose pipe_caps.packed_uniforms the state tracker
          * will produce uniform intrinsics with offsets in vec4 units but
          * our compiler expects to work in units of bytes.
@@ -411,20 +407,19 @@ v3d_uncompiled_shader_create(struct pipe_context *pctx,
         so->base.type = PIPE_SHADER_IR_NIR;
         so->base.ir.nir = s;
 
-        /* Generate sha1 from NIR for caching */
+        /* Generate blake3 from NIR for caching */
         struct blob blob;
         blob_init(&blob);
         nir_serialize(&blob, s, true);
         assert(!blob.out_of_memory);
-        _mesa_sha1_compute(blob.data, blob.size, so->sha1);
+        _mesa_blake3_compute(blob.data, blob.size, so->blake3);
         blob_finish(&blob);
 
         if (V3D_DBG(NIR) || v3d_debug_flag_for_shader_stage(s->info.stage)) {
-                fprintf(stderr, "%s prog %d NIR:\n",
-                        mesa_shader_stage_name(s->info.stage),
-                        so->program_id);
-                nir_print_shader(s, stderr);
-                fprintf(stderr, "\n");
+                mesa_logi("%s prog %d NIR:",
+                          mesa_shader_stage_name(s->info.stage),
+                          so->program_id);
+                nir_log_shaderi(s);
         }
 
         if (V3D_DBG(PRECOMPILE))
@@ -460,8 +455,25 @@ v3d_shader_state_create(struct pipe_context *pctx,
 /* Key ued with the RAM cache */
 struct v3d_cache_key {
         struct v3d_key *key;
-        unsigned char sha1[SHA1_DIGEST_LENGTH];
+        unsigned char blake3[BLAKE3_KEY_LEN];
 };
+
+/* Shaders are suballocated from the state uploader, so one can end exactly
+ * at the end of the upload buffer: leave room for the QPU prefetch.
+ */
+void
+v3d_upload_shader_code(struct v3d_context *v3d,
+                       struct v3d_compiled_shader *shader,
+                       const uint64_t *qpu_insts, uint32_t qpu_size)
+{
+        void *map = NULL;
+
+        u_upload_alloc_ref(v3d->state_uploader, 0,
+                           qpu_size + V3D_QPU_PREFETCH_PAD, 8,
+                           &shader->offset, &shader->resource, &map);
+        if (map)
+                memcpy(map, qpu_insts, qpu_size);
+}
 
 struct v3d_compiled_shader *
 v3d_get_compiled_shader(struct v3d_context *v3d,
@@ -473,7 +485,7 @@ v3d_get_compiled_shader(struct v3d_context *v3d,
         struct hash_table *ht = v3d->prog.cache[s->info.stage];
         struct v3d_cache_key cache_key;
         cache_key.key = key;
-        memcpy(cache_key.sha1, uncompiled->sha1, sizeof(cache_key.sha1));
+        memcpy(cache_key.blake3, uncompiled->blake3, sizeof(cache_key.blake3));
         struct hash_entry *entry = _mesa_hash_table_search(ht, &cache_key);
         if (entry)
                 return entry->data;
@@ -509,8 +521,8 @@ v3d_get_compiled_shader(struct v3d_context *v3d,
                 ralloc_steal(shader, shader->prog_data.base);
 
                 if (shader->qpu_size) {
-                        u_upload_data_ref(v3d->state_uploader, 0, shader->qpu_size, 8,
-                                      qpu_insts, &shader->offset, &shader->resource);
+                        v3d_upload_shader_code(v3d, shader, qpu_insts,
+                                               shader->qpu_size);
                 }
 
 #ifdef ENABLE_SHADER_CACHE
@@ -528,7 +540,7 @@ v3d_get_compiled_shader(struct v3d_context *v3d,
                         ralloc_size(shader, sizeof(struct v3d_cache_key));
                 dup_cache_key->key = ralloc_memdup(shader, cache_key.key,
                                                    key_size);
-                memcpy(dup_cache_key->sha1, cache_key.sha1 ,sizeof(dup_cache_key->sha1));
+                memcpy(dup_cache_key->blake3, cache_key.blake3 ,sizeof(dup_cache_key->blake3));
                 _mesa_hash_table_insert(ht, dup_cache_key, shader);
         }
 
@@ -583,8 +595,41 @@ v3d_setup_shared_key(struct v3d_context *v3d, struct v3d_key *key,
         key->robust_storage_access = v3d->robust_buffer;
 }
 
+/* Returns the polygon mode the primitive will be rasterized with.
+ *
+ * The hardware only supports a single polygon mode for both faces, and
+ * v3dX(emit_state) uses the front one unless front faces are culled, so do
+ * the same here.
+ */
+static unsigned
+v3d_polygon_mode(struct v3d_context *v3d, uint8_t prim_mode)
+{
+        if (u_reduced_prim(prim_mode) != MESA_PRIM_TRIANGLES)
+                return PIPE_POLYGON_MODE_FILL;
+
+        const struct pipe_rasterizer_state *rast = &v3d->rasterizer->base;
+
+        return (rast->cull_face & PIPE_FACE_FRONT) ? rast->fill_back
+                                                   : rast->fill_front;
+}
+
+static bool
+v3d_rasterizes_points(struct v3d_context *v3d, uint8_t prim_mode)
+{
+        return prim_mode == MESA_PRIM_POINTS ||
+               v3d_polygon_mode(v3d, prim_mode) == PIPE_POLYGON_MODE_POINT;
+}
+
+static bool
+v3d_rasterizes_lines(struct v3d_context *v3d, uint8_t prim_mode)
+{
+        return (prim_mode >= MESA_PRIM_LINES &&
+                prim_mode <= MESA_PRIM_LINE_STRIP) ||
+               v3d_polygon_mode(v3d, prim_mode) == PIPE_POLYGON_MODE_LINE;
+}
+
 static void
-v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
+v3d_update_compiled_fs(struct v3d_context *v3d, enum mesa_prim prim_mode)
 {
         struct v3d_job *job = v3d->job;
         struct v3d_fs_key local_key;
@@ -606,9 +651,8 @@ v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
         memset(key, 0, sizeof(*key));
         v3d_setup_shared_key(v3d, &key->base, &v3d->tex[MESA_SHADER_FRAGMENT]);
         key->ucp_enables = v3d->rasterizer->base.clip_plane_enable;
-        key->is_points = (prim_mode == MESA_PRIM_POINTS);
-        key->is_lines = (prim_mode >= MESA_PRIM_LINES &&
-                         prim_mode <= MESA_PRIM_LINE_STRIP);
+        key->is_points = v3d_rasterizes_points(v3d, prim_mode);
+        key->is_lines = v3d_rasterizes_lines(v3d, prim_mode);
         key->line_smoothing = (key->is_lines &&
                                v3d_line_smoothing_enabled(v3d));
         key->has_gs = v3d->prog.bind_gs != NULL;
@@ -621,6 +665,11 @@ v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
                 key->msaa = v3d->rasterizer->base.multisample;
                 key->sample_alpha_to_coverage = v3d->blend->base.alpha_to_coverage;
                 key->sample_alpha_to_one = v3d->blend->base.alpha_to_one;
+        } else {
+                /* Unlike Vulkan, OpenGL CTS tests require that SampleMask is
+                 * ignored when MSAA is disabled.
+                 */
+                key->ignore_sample_mask =  true;
         }
 
         key->swap_color_rb = v3d->swap_color_rb;
@@ -707,8 +756,12 @@ v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
         if (key->is_points) {
                 key->point_sprite_mask =
                         v3d->rasterizer->base.sprite_coord_enable;
-                /* this is handled by lower_wpos_pntc */
-                key->point_coord_upper_left = false;
+                /* For PNTC this is handled by lower_wpos_pntc, but varyings
+                 * replaced through GL_COORD_REPLACE need the compiler to do
+                 * the flip.*/
+                key->point_coord_upper_left =
+                        (v3d->rasterizer->base.sprite_coord_mode ==
+                         PIPE_SPRITE_COORD_UPPER_LEFT);
         }
 
         struct v3d_compiled_shader *old_fs = v3d->prog.fs;
@@ -748,7 +801,7 @@ v3d_update_compiled_fs(struct v3d_context *v3d, uint8_t prim_mode)
 }
 
 static void
-v3d_update_compiled_gs(struct v3d_context *v3d, uint8_t prim_mode)
+v3d_update_compiled_gs(struct v3d_context *v3d, enum mesa_prim prim_mode)
 {
         struct v3d_gs_key local_key;
         struct v3d_gs_key *key = &local_key;
@@ -824,7 +877,7 @@ v3d_update_compiled_gs(struct v3d_context *v3d, uint8_t prim_mode)
 }
 
 static void
-v3d_update_compiled_vs(struct v3d_context *v3d, uint8_t prim_mode)
+v3d_update_compiled_vs(struct v3d_context *v3d, enum mesa_prim prim_mode)
 {
         struct v3d_vs_key local_key;
         struct v3d_vs_key *key = &local_key;
@@ -934,7 +987,7 @@ v3d_update_compiled_vs(struct v3d_context *v3d, uint8_t prim_mode)
 }
 
 void
-v3d_update_compiled_shaders(struct v3d_context *v3d, uint8_t prim_mode)
+v3d_update_compiled_shaders(struct v3d_context *v3d, enum mesa_prim prim_mode)
 {
         v3d_update_compiled_fs(v3d, prim_mode);
         v3d_update_compiled_gs(v3d, prim_mode);
@@ -969,13 +1022,13 @@ cache_hash(const void *_key, uint32_t key_size)
 {
         const struct v3d_cache_key *key = (struct v3d_cache_key *) _key;
 
-        struct mesa_sha1 ctx;
-        unsigned char sha1[SHA1_DIGEST_LENGTH];
-        _mesa_sha1_init(&ctx);
-        _mesa_sha1_update(&ctx, key->key, key_size);
-        _mesa_sha1_update(&ctx, key->sha1, SHA1_DIGEST_LENGTH);
-        _mesa_sha1_final(&ctx, sha1);
-        return _mesa_hash_data(sha1, SHA1_DIGEST_LENGTH);
+        blake3_hasher ctx;
+        unsigned char blake3[BLAKE3_KEY_LEN];
+        _mesa_blake3_init(&ctx);
+        _mesa_blake3_update(&ctx, key->key, key_size);
+        _mesa_blake3_update(&ctx, key->blake3, BLAKE3_KEY_LEN);
+        _mesa_blake3_final(&ctx, blake3);
+        return _mesa_hash_data(blake3, BLAKE3_KEY_LEN);
 }
 
 static inline bool
@@ -987,7 +1040,7 @@ cache_compare(const void *_key1, const void *_key2, uint32_t key_size)
         if (memcmp(key1->key, key2->key, key_size) != 0)
             return false;
 
-        return memcmp(key1->sha1, key2->sha1, 20) == 0;
+        return memcmp(key1->blake3, key2->blake3, BLAKE3_KEY_LEN) == 0;
 }
 
 static uint32_t
@@ -1049,7 +1102,7 @@ v3d_shader_state_delete(struct pipe_context *pctx, void *hwcso)
                 const struct v3d_cache_key *cache_key = entry->key;
                 struct v3d_compiled_shader *shader = entry->data;
 
-                if (memcmp(cache_key->sha1, so->sha1, 20) != 0)
+                if (memcmp(cache_key->blake3, so->blake3, BLAKE3_KEY_LEN) != 0)
                         continue;
 
                 if (v3d->prog.fs == shader)

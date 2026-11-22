@@ -168,6 +168,7 @@ void
 VertexShader::do_get_shader_info(r600_shader *sh_info)
 {
    sh_info->processor_type = MESA_SHADER_VERTEX;
+   sh_info->dynamic = get_dynamic_offset();
    sh_info->vs_draw_parameters_enabled =
       m_vertex_id != nullptr || m_draw_parameters_enabled;
    m_export_stage->get_shader_info(sh_info);
@@ -231,7 +232,7 @@ VertexExportForFs::emit_varying_pos(const store_loc& store_info,
                         << (4 * (store_info.location - VARYING_SLOT_CLIP_DIST0));
       m_clip_dist_write |= write_mask
                            << (4 * (store_info.location - VARYING_SLOT_CLIP_DIST0));
-      export_slot = m_cur_clip_pos++;
+      export_slot = m_cur_clip_pos++ + (m_out_point_size ? 1 : 0);
       break;
    default:
       sfn_log << SfnLog::err << __func__ << "Unsupported location " << store_info.location
@@ -391,7 +392,8 @@ VertexExportForFs::output_register(int loc) const
 VertexShader::VertexShader(const pipe_stream_output_info *so_info,
                            r600_shader *gs_shader,
                            const r600_shader_key& key):
-    VertexStageShader("VS", key.vs.first_atomic_counter),
+    VertexStageShader("VS",
+                      {(uint8_t)key.vs.nr_cbufs, 0, (uint8_t)key.vs.dynamic_ssbo_offset}),
     m_vs_as_gs_a(key.vs.as_gs_a)
 {
    if (key.vs.as_es)

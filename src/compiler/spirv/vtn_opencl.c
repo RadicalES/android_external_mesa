@@ -1,27 +1,6 @@
 /*
  * Copyright © 2018 Red Hat
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
- *
- * Authors:
- *    Rob Clark (robdclark@gmail.com)
+ * SPDX-License-Identifier: MIT
  */
 
 #include "math.h"
@@ -152,15 +131,18 @@ static nir_function *mangle_and_find(struct vtn_builder *b,
    /* try and find in current shader first. */
    nir_function *found = nir_shader_get_function_for_name(b->shader, mname);
 
-   /* if not found here find in clc shader and create a decl mirroring it */
-   if (!found && b->options->clc_shader && b->options->clc_shader != b->shader) {
-      found = nir_shader_get_function_for_name(b->options->clc_shader, mname);
+   if (!found) {
+      /* if not found here find in clc shader and create a decl mirroring it */
+      if (b->options->clc_shader)
+         found = nir_shader_get_function_for_name(b->options->clc_shader, mname);
 
       /* try upcasting fp16 */
       if (!found && try_fp16_lowering) {
+         /* We might actually be inside libclc in which case clc_shader is NULL */
+         const nir_shader *libclc = b->options->clc_shader ? b->options->clc_shader : b->shader;
          fp16_name = mname;
          vtn_opencl_mangle(name, const_mask, num_srcs, src_types, true, &mname);
-         found = nir_shader_get_function_for_name(b->options->clc_shader, mname);
+         found = nir_shader_get_function_for_name(libclc, mname);
       }
 
       if (found) {
@@ -278,6 +260,19 @@ handle_instr(struct vtn_builder *b, uint32_t opcode,
    } else {
       vtn_assert(dest_type == NULL);
    }
+}
+
+static void
+handle_alu_instr(struct vtn_builder *b, uint32_t opcode,
+                 const uint32_t *w_src, unsigned num_srcs, const uint32_t *w_dest, nir_handler handler)
+{
+   assert(w_dest);
+
+   vtn_handle_fp_fast_math(b, vtn_untyped_value(b, w_dest[2]), vtn_untyped_value(b, w_src[0]));
+
+   handle_instr(b, opcode, w_src, num_srcs, w_dest, handler);
+
+   b->nb.fp_math_ctrl = nir_fp_fast_math;
 }
 
 static nir_op
@@ -538,10 +533,12 @@ static uint8_t fp16_lowering_supported(enum OpenCLstd_Entrypoints opcode)
    case OpenCLstd_Ldexp:
    case OpenCLstd_Lgamma_r:
    case OpenCLstd_Pown:
-   case OpenCLstd_Remquo:
    case OpenCLstd_Rootn:
       /* second argument shouldn't be touched at all */
       return 0xff ^ (1 << 2);
+   case OpenCLstd_Remquo:
+      /* third argument is the integer quotient pointer. */
+      return 0xff ^ (1 << 3);
    /* the second argument is a pointer to a float
     * a new enough libclc supports it though
     */
@@ -647,24 +644,11 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
        *
        *    Implemented either as a correctly rounded fma or as a multiply
        *    followed by an add both of which are correctly rounded
-       *
-       * So lower to fmul+fadd if we have to, but fuse to an ffma if the backend
-       * supports that. This can be significantly faster.
        */
-      bool lower =
-         ((nb->shader->options->lower_ffma16 && srcs[0]->bit_size == 16) ||
-          (nb->shader->options->lower_ffma32 && srcs[0]->bit_size == 32) ||
-          (nb->shader->options->lower_ffma64 && srcs[0]->bit_size == 64));
 
       const unsigned save_math_ctrl = nb->fp_math_ctrl;
-      nir_def *res;
-
-      nb->fp_math_ctrl |= nir_fp_exact;
-      if (lower)
-         res = nir_fmad(nb, srcs[0], srcs[1], srcs[2]);
-      else
-         res = nir_ffma(nb, srcs[0], srcs[1], srcs[2]);
-
+      nb->fp_math_ctrl |= nir_fp_no_contract | nir_fp_no_transform;
+      nir_def *res = nir_ffma_weak(nb, srcs[0], srcs[1], srcs[2]);
       nb->fp_math_ctrl = save_math_ctrl;
       return res;
    }
@@ -699,17 +683,16 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
    case OpenCLstd_Native_tan:
       return nir_ftan(nb, srcs[0]);
    case OpenCLstd_Ldexp:
-      if (nb->shader->options->lower_ldexp)
+      if (!nb->shader->options->has_ldexp)
          break;
       return nir_ldexp(nb, srcs[0], srcs[1]);
    case OpenCLstd_Fma: {
       /* FIXME: the software implementation only supports fp32 for now. */
-      if ((nb->shader->options->lower_ffma32 && srcs[0]->bit_size == 32) ||
-          (nb->shader->options->lower_ffma16 && srcs[0]->bit_size == 16))
+      if (srcs[0]->bit_size != 64 && !nir_has_ffma(nb->shader, srcs[0]->bit_size))
          break;
 
       /* OpenCL FMA is not allowed to be split. */
-      const bool save_math_ctrl = nb->fp_math_ctrl;
+      const unsigned save_math_ctrl = nb->fp_math_ctrl;
       nb->fp_math_ctrl |= nir_fp_exact;
       nir_def *res = nir_ffma(nb, srcs[0], srcs[1], srcs[2]);
       nb->fp_math_ctrl = save_math_ctrl;
@@ -717,6 +700,25 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
    }
    case OpenCLstd_Rotate:
       return nir_urol(nb, srcs[0], nir_u2u32(nb, srcs[1]));
+   case OpenCLstd_Log2:
+   case OpenCLstd_Log:
+   case OpenCLstd_Exp2:
+      /* Emit precise log2/log/exp2 as hardware transcendentals when the
+       * driver's hardware units meet the CL ULP budget. fp32 only; exp/pow
+       * are intentionally excluded (change-of-base exceeds ULP budget). */
+      if (b->shader->options->has_cl_log2_exp2 && srcs[0]->bit_size == 32) {
+         switch (cl_opcode) {
+         case OpenCLstd_Log2:
+            return nir_flog2(nb, srcs[0]);
+         case OpenCLstd_Log:
+            return nir_fmul_imm(nb, nir_flog2(nb, srcs[0]), log(2.0));
+         case OpenCLstd_Exp2:
+            return nir_fexp2(nb, srcs[0]);
+         default:
+            break;
+         }
+      }
+      break;
    default:
       break;
    }
@@ -725,11 +727,46 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
    if (!ret)
       vtn_fail("No NIR equivalent");
 
+   switch (opcode) {
    /* libclc's cbrt() implementation fails to flush subnormal numbers to zero
     * even when flush-to-zero is required. Manually flush its output.
     */
-   if (opcode == OpenCLstd_Cbrt) {
+   case OpenCLstd_Cbrt:
       ret = nir_fcanonicalize(nb, ret);
+      break;
+
+   /* Cospi is always expected to return +0.0 instead of -0.0 */
+   case OpenCLstd_Cospi: {
+      if (nb->fp_math_ctrl & nir_fp_preserve_signed_zero)
+         ret = nir_fadd_imm(nb, ret, 0.0);
+      break;
+   }
+
+   /* Sinpi expects a resulting zero to be of the same sign as the input */
+   case OpenCLstd_Sinpi: {
+      if (nb->fp_math_ctrl & nir_fp_preserve_signed_zero) {
+         ret = nir_bcsel(nb, nir_feq_imm(nb, ret, 0.0), nir_copysign(nb, ret, srcs[0]), ret);
+      }
+      break;
+   }
+
+   case OpenCLstd_Tanpi: {
+      if (nb->fp_math_ctrl & nir_fp_preserve_signed_zero) {
+         nir_def *remainder = nir_fmod(nb, nir_fabs(nb, srcs[0]), nir_imm_floatN_t(nb, 2.0, ret->bit_size));
+         nir_def *is_odd = nir_feq_imm(nb, remainder, 1.0);
+         nir_def *is_even = nir_feq_imm(nb, remainder, 0.0);
+
+         /* tanpi(n) is copysign(0.0, - n) for odd integers n. */
+         ret = nir_bcsel(nb, is_odd, nir_copysign(nb, ret, nir_fneg(nb, srcs[0])), ret);
+
+         /* tanpi(n) is copysign(0.0, n) for even integers n. */
+         ret = nir_bcsel(nb, is_even, nir_copysign(nb, ret, srcs[0]), ret);
+      }
+      break;
+   }
+
+   default:
+      break;
    }
 
    return ret;
@@ -770,7 +807,7 @@ handle_core(struct vtn_builder *b, uint32_t opcode,
        * pointers.  Fortunately, the whole function is just a barrier.
        */
       nir_barrier(&b->nb, .execution_scope = SCOPE_WORKGROUP,
-                          .memory_scope = SCOPE_WORKGROUP,
+                          .memory_scope = SCOPE_DEVICE,
                           .memory_semantics = NIR_MEMORY_ACQUIRE |
                                               NIR_MEMORY_RELEASE,
                           .memory_modes = nir_var_mem_shared |
@@ -1124,7 +1161,7 @@ vtn_handle_opencl_instruction(struct vtn_builder *b, SpvOp ext_opcode,
    case OpenCLstd_Half_recip:
    case OpenCLstd_FMin_common:
    case OpenCLstd_FMax_common:
-      handle_instr(b, ext_opcode, w + 5, count - 5, w + 1, handle_alu);
+      handle_alu_instr(b, ext_opcode, w + 5, count - 5, w + 1, handle_alu);
       return true;
    case OpenCLstd_SAbs_diff:
    case OpenCLstd_UAbs_diff:
@@ -1231,7 +1268,7 @@ vtn_handle_opencl_instruction(struct vtn_builder *b, SpvOp ext_opcode,
    case OpenCLstd_Half_powr:
    case OpenCLstd_Half_sin:
    case OpenCLstd_Half_tan:
-      handle_instr(b, ext_opcode, w + 5, count - 5, w + 1, handle_special);
+      handle_alu_instr(b, ext_opcode, w + 5, count - 5, w + 1, handle_special);
       return true;
    case OpenCLstd_Vloadn:
    case OpenCLstd_Vload_half:

@@ -14,6 +14,23 @@ enum ENUM_PACKED nv_device_type {
    NV_DEVICE_TYPE_SOC,
 };
 
+/* Matches drm_nouveau_get_zcull_info */
+struct nv_zcull_device_info {
+   uint32_t width_align_pixels;
+   uint32_t height_align_pixels;
+   uint32_t pixel_squares_by_aliquots;
+   uint32_t aliquot_total;
+   uint32_t zcull_region_byte_multiplier;
+   uint32_t zcull_region_header_size;
+   uint32_t zcull_subregion_header_size;
+   uint32_t subregion_count;
+   uint32_t subregion_width_align_pixels;
+   uint32_t subregion_height_align_pixels;
+
+   uint32_t ctxsw_size;
+   uint32_t ctxsw_align;
+};
+
 struct nv_device_info {
    enum nv_device_type type;
 
@@ -38,8 +55,10 @@ struct nv_device_info {
    uint16_t tpc_count;
    uint8_t mp_per_tpc;
    uint8_t max_warps_per_mp;
+   uint8_t max_blocks_per_mp;
 
    bool has_transfer_queue;
+   bool has_video;
 
    /** Non-coherent memory map atom size */
    uint16_t nc_atom_size_B;
@@ -50,6 +69,7 @@ struct nv_device_info {
    uint16_t cls_m2mf;
    uint16_t cls_compute;
    uint16_t cls_gpfifo;
+   uint16_t cls_vdec;
 
    uint64_t vram_size_B;
    uint64_t bar_size_B;
@@ -63,6 +83,9 @@ struct nv_device_info {
     */
    uint16_t sm_smem_sizes_kB[10];
    uint8_t sm_smem_size_count;
+
+   struct nv_zcull_device_info zcull_info;
+   bool has_zcull_info;
 };
 
 static inline void

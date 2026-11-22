@@ -91,7 +91,8 @@ enum fd6_pipeline_type {
 
 struct fd6_state_group {
    struct fd_ringbuffer *stateobj;
-   enum fd6_state_id group_id;
+   enum fd6_state_id group_id : 7;
+   bool unref : 1;
    /* enable_mask controls which states the stateobj is evaluated in,
     * b0 is binning pass b1 and/or b2 is draw pass
     */
@@ -125,6 +126,9 @@ fd6_state_emit(struct fd6_state *state, fd_cs &cs)
             .dword = g->enable_mask,
          ));
          pkt.add(g->stateobj, 0, NULL);
+
+         if (g->unref)
+            fd_ringbuffer_del(g->stateobj);
       } else {
          pkt.add(CP_SET_DRAW_STATE__0(i,
             .disable = true,
@@ -133,9 +137,6 @@ fd6_state_emit(struct fd6_state *state, fd_cs &cs)
          ));
          pkt.add(CP_SET_DRAW_STATE__ADDR(i));
       }
-
-      if (g->stateobj)
-         fd_ringbuffer_del(g->stateobj);
    }
 }
 
@@ -155,21 +156,29 @@ enable_mask(enum fd6_state_id group_id)
 }
 
 static inline void
-fd6_state_take_group(struct fd6_state *state, struct fd_ringbuffer *stateobj,
-                     enum fd6_state_id group_id)
+__append_state_group(struct fd6_state *state, struct fd_ringbuffer *stateobj,
+                     enum fd6_state_id group_id, bool unref)
 {
    assert(state->num_groups < ARRAY_SIZE(state->groups));
    struct fd6_state_group *g = &state->groups[state->num_groups++];
    g->stateobj = stateobj;
    g->group_id = group_id;
+   g->unref = unref;
    g->enable_mask = enable_mask(group_id);
+}
+
+static inline void
+fd6_state_take_group(struct fd6_state *state, struct fd_ringbuffer *stateobj,
+                     enum fd6_state_id group_id)
+{
+   __append_state_group(state, stateobj, group_id, true);
 }
 
 static inline void
 fd6_state_add_group(struct fd6_state *state, struct fd_ringbuffer *stateobj,
                     enum fd6_state_id group_id)
 {
-   fd6_state_take_group(state, fd_ringbuffer_ref(stateobj), group_id);
+   __append_state_group(state, stateobj, group_id, false);
 }
 
 /* grouped together emit-state for prog/vertex/state emit: */
@@ -213,6 +222,8 @@ __event_write(fd_cs &cs, enum fd_gpu_event event,
 {
    struct fd_gpu_event_info info = fd_gpu_events<CHIP>[event];
    unsigned len = info.needs_seqno ? 4 : 1;
+
+   assert(info.raw_event);
 
    if ((CHIP >= A7XX) && (event == FD_RB_DONE))
       len--;
@@ -317,15 +328,18 @@ fd6_set_rb_dbg_eco_mode(struct fd_context *ctx, fd_cs &cs, bool blit)
 
    const struct fd_dev_info *info = ctx->screen->info;
 
-   if (info->magic.RB_DBG_ECO_CNTL == info->magic.RB_DBG_ECO_CNTL_blit)
+   if (!FD_QUIRK(info, QCTDD04536579))
       return;
 
-   uint32_t dword = blit ? info->magic.RB_DBG_ECO_CNTL_blit :
-                           info->magic.RB_DBG_ECO_CNTL;
-
    fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
-   fd_pkt4(cs, 1)
-      .add(A6XX_RB_DBG_ECO_CNTL(.dword = dword));
+
+   /* Set RB_DBG_ECO_CNTL b24 for 2d blits, clear after: */
+   fd_pkt7(cs, CP_REG_RMW, 3)
+      .add(CP_REG_RMW_0(
+         .dst_reg = A6XX_RB_DBG_ECO_CNTL().reg,
+      ))
+      .add(CP_REG_RMW_1(~BITFIELD_BIT(24)))
+      .add(CP_REG_RMW_2(blit ? BITFIELD_BIT(24) : 0));
 }
 
 struct fd6_set_render_mode {

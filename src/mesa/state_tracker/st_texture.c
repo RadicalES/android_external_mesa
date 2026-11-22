@@ -509,7 +509,7 @@ st_destroy_bound_image_handles_per_stage(struct st_context *st,
    for (i = 0; i < bound_handles->num_handles; i++) {
       uint64_t handle = bound_handles->handles[i];
 
-      pipe->make_image_handle_resident(pipe, handle, GL_READ_WRITE, false);
+      pipe->make_image_handle_resident(pipe, handle, PIPE_IMAGE_ACCESS_READ_WRITE, false);
       pipe->delete_image_handle(pipe, handle);
    }
    free(bound_handles->handles);
@@ -546,7 +546,7 @@ st_create_texture_handle_from_unit(struct st_context *st,
       (prog->shader_program ? prog->shader_program->GLSL_Version : 0) >= 130;
 
    /* TODO: Clarify the interaction of ARB_bindless_texture and EXT_texture_sRGB_decode */
-   view = st_update_single_texture(st, texUnit, glsl130, true);
+   view = st_update_single_texture(st, texUnit, glsl130, true, 0, NULL);
    if (!view)
       return 0;
 
@@ -652,7 +652,7 @@ st_make_bound_images_resident(struct st_context *st,
       if (!handle)
          continue;
 
-      pipe->make_image_handle_resident(st->pipe, handle, GL_READ_WRITE, true);
+      pipe->make_image_handle_resident(st->pipe, handle, PIPE_IMAGE_ACCESS_READ_WRITE, true);
 
       /* Overwrite the image unit value by the resident handle before uploading
        * the constant buffer.

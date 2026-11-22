@@ -44,59 +44,11 @@
 #include "nir_format_convert.h"
 #include "nir_loop_analyze.h"
 
+#include "util/u_ycbcr.h"
+
 typedef struct nir_const_value_3_4 {
    nir_const_value v[3][4];
 } nir_const_value_3_4;
-
-static const nir_const_value_3_4 bt601_limited_range_csc_coeffs = { {
-   { { .f32 = 1.16438356f }, { .f32 = 1.16438356f }, { .f32 = 1.16438356f } },
-   { { .f32 = 0.0f }, { .f32 = -0.39176229f }, { .f32 = 2.01723214f } },
-   { { .f32 = 1.59602678f }, { .f32 = -0.81296764f }, { .f32 = 0.0f } },
-} };
-static const nir_const_value_3_4 bt601_full_range_csc_coeffs = { {
-   { { .f32 = 1.0f }, { .f32 = 1.0f }, { .f32 = 1.0f } },
-   { { .f32 = 0.0f }, { .f32 = -0.34413629f }, { .f32 = 1.772f } },
-   { { .f32 = 1.402f }, { .f32 = -0.71413629f }, { .f32 = 0.0f } },
-} };
-static const nir_const_value_3_4 bt709_limited_range_csc_coeffs = { {
-   { { .f32 = 1.16438356f }, { .f32 = 1.16438356f }, { .f32 = 1.16438356f } },
-   { { .f32 = 0.0f }, { .f32 = -0.21324861f }, { .f32 = 2.11240179f } },
-   { { .f32 = 1.79274107f }, { .f32 = -0.53290933f }, { .f32 = 0.0f } },
-} };
-static const nir_const_value_3_4 bt709_full_range_csc_coeffs = { {
-   { { .f32 = 1.0f }, { .f32 = 1.0f }, { .f32 = 1.0f } },
-   { { .f32 = 0.0f }, { .f32 = -0.18732427f }, { .f32 = 1.8556f } },
-   { { .f32 = 1.5748f }, { .f32 = -0.46812427f }, { .f32 = 0.0f } },
-} };
-static const nir_const_value_3_4 bt2020_limited_range_csc_coeffs = { {
-   { { .f32 = 1.16438356f }, { .f32 = 1.16438356f }, { .f32 = 1.16438356f } },
-   { { .f32 = 0.0f }, { .f32 = -0.18732610f }, { .f32 = 2.14177232f } },
-   { { .f32 = 1.67878795f }, { .f32 = -0.65046843f }, { .f32 = 0.0f } },
-} };
-static const nir_const_value_3_4 bt2020_full_range_csc_coeffs = { {
-   { { .f32 = 1.0f }, { .f32 = 1.0f }, { .f32 = 1.0f } },
-   { { .f32 = 0.0f }, { .f32 = -0.16455313f }, { .f32 = 1.88140000f } },
-   { { .f32 = 1.4747f }, { .f32 = -0.57139187f }, { .f32 = 0.0f } },
-} };
-
-static const float bt601_limited_range_csc_offsets[3] = {
-   -0.874202218f, 0.531667823f, -1.085630789f
-};
-static const float bt601_full_range_csc_offsets[3] = {
-   -0.701000000f, 0.529136286f, -0.886000000f
-};
-static const float bt709_limited_range_csc_offsets[3] = {
-   -0.972945075f, 0.301482665f, -1.133402218f
-};
-static const float bt709_full_range_csc_offsets[3] = {
-   -0.787400000f, 0.327724273f, -0.927800000f
-};
-static const float bt2020_limited_range_csc_offsets[3] = {
-   -0.915745075f, 0.347480639f, -1.148145075f
-};
-static const float bt2020_full_range_csc_offsets[3] = {
-   -0.737350000f, 0.367972500f, -0.940700000f
-};
 
 static bool
 project_src(nir_builder *b, nir_tex_instr *tex)
@@ -156,8 +108,18 @@ project_src(nir_builder *b, nir_tex_instr *tex)
    return true;
 }
 
+static nir_def *
+build_texture_size(nir_builder *b, nir_tex_instr *tex,
+                   const nir_lower_tex_options *options)
+{
+   return options->build_txs_lod0 != NULL ?
+      options->build_txs_lod0(b, tex, options->callback_data) :
+      nir_get_texture_size(b, tex);
+}
+
 static bool
-lower_offset(nir_builder *b, nir_tex_instr *tex)
+lower_offset(nir_builder *b, nir_tex_instr *tex,
+             const nir_lower_tex_options *options)
 {
    nir_def *offset = nir_steal_tex_src(tex, nir_tex_src_offset);
    if (!offset)
@@ -181,7 +143,8 @@ lower_offset(nir_builder *b, nir_tex_instr *tex)
             nir_def *idx = nir_imm_int(b, tex->texture_index);
             scale = nir_load_texture_scale(b, 32, idx);
          } else {
-            nir_def *txs = nir_i2f32(b, nir_get_texture_size(b, tex));
+            nir_def *txs =
+               nir_i2f32(b, build_texture_size(b, tex, options));
             scale = nir_frcp(b, txs);
          }
 
@@ -207,14 +170,16 @@ lower_offset(nir_builder *b, nir_tex_instr *tex)
 }
 
 static void
-lower_rect(nir_builder *b, nir_tex_instr *tex)
+lower_rect(nir_builder *b, nir_tex_instr *tex,
+           const nir_lower_tex_options *options)
 {
    /* Set the sampler_dim to 2D here so that get_texture_size picks up the
     * right dimensionality.
     */
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
 
-   nir_def *txs = nir_i2f32(b, nir_get_texture_size(b, tex));
+   nir_def *txs = nir_i2f32(
+      b, build_texture_size(b, tex, options));
    nir_def *scale = nir_frcp(b, txs);
    int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
 
@@ -376,6 +341,7 @@ sample_plane(nir_builder *b, nir_tex_instr *tex, int plane,
    plane_tex->dest_type = nir_type_float | tex->def.bit_size;
    plane_tex->coord_components = 2;
 
+   plane_tex->embedded_sampler = tex->embedded_sampler;
    plane_tex->texture_index = tex->texture_index;
    plane_tex->sampler_index = tex->sampler_index;
    plane_tex->can_speculate = tex->can_speculate;
@@ -400,48 +366,63 @@ convert_yuv_to_rgb(nir_builder *b, nir_tex_instr *tex,
                    const nir_lower_tex_options *options,
                    unsigned texture_index)
 {
-
-   const float *offset_vals;
-   const nir_const_value_3_4 *m;
-   assert((options->bt709_external & options->bt2020_external) == 0);
-   if (options->yuv_full_range_external & (1u << texture_index)) {
-      if (options->bt709_external & (1u << texture_index)) {
-         m = &bt709_full_range_csc_coeffs;
-         offset_vals = bt709_full_range_csc_offsets;
-      } else if (options->bt2020_external & (1u << texture_index)) {
-         m = &bt2020_full_range_csc_coeffs;
-         offset_vals = bt2020_full_range_csc_offsets;
-      } else {
-         m = &bt601_full_range_csc_coeffs;
-         offset_vals = bt601_full_range_csc_offsets;
-      }
-   } else {
-      if (options->bt709_external & (1u << texture_index)) {
-         m = &bt709_limited_range_csc_coeffs;
-         offset_vals = bt709_limited_range_csc_offsets;
-      } else if (options->bt2020_external & (1u << texture_index)) {
-         m = &bt2020_limited_range_csc_coeffs;
-         offset_vals = bt2020_limited_range_csc_offsets;
-      } else {
-         m = &bt601_limited_range_csc_coeffs;
-         offset_vals = bt601_limited_range_csc_offsets;
-      }
+   /* GL_EXT_YUV_target: __samplerExternal2DY2YEXT outputs raw YUV directly */
+   if (options->bypass_csc_external & (1u << texture_index)) {
+      unsigned bit_size = tex->def.bit_size;
+      /* Most callers pass nir_imm_float(b, 1.0f) for a, which is always
+       * 32-bit regardless of the texture's bit_size, so convert it to
+       * match here.
+       */
+      if (a->bit_size != bit_size)
+         a = nir_f2fN(b, a, bit_size);
+      nir_def *result = nir_vec4(b, y, u, v, a);
+      nir_def_rewrite_uses(&tex->def, result);
+      return;
    }
+   unsigned bpc = 8;
+   if (options->lower_sx10_external & (1u << texture_index)) {
+      bpc = 10;
+   } else if (options->lower_sx12_external & (1u << texture_index)) {
+      bpc = 12;
+   }
+   unsigned bpcs[3] = { bpc, bpc, bpc };
+
+   float range[3][2];
+   if (options->yuv_full_range_external & (1u << texture_index))
+      util_get_full_range_coeffs(range, bpcs);
+   else
+      util_get_narrow_range_coeffs(range, bpcs);
+
+   float mat[3][4];
+   assert((options->bt709_external & options->bt2020_external) == 0);
+   if (options->bt709_external & (1u << texture_index))
+      util_get_ycbcr_to_rgb_matrix(mat, util_ycbcr_bt709_coeffs);
+   else if (options->bt2020_external & (1u << texture_index))
+      util_get_ycbcr_to_rgb_matrix(mat, util_ycbcr_bt2020_coeffs);
+   else
+      util_get_ycbcr_to_rgb_matrix(mat, util_ycbcr_bt601_coeffs);
+   util_ycbcr_adjust_from_range(mat, range);
+
+   const nir_const_value_3_4 m = { {
+      { { .f32 = mat[0][0] }, { .f32 = mat[1][0] }, { .f32 = mat[2][0] } },
+      { { .f32 = mat[0][1] }, { .f32 = mat[1][1] }, { .f32 = mat[2][1] } },
+      { { .f32 = mat[0][2] }, { .f32 = mat[1][2] }, { .f32 = mat[2][2] } },
+   } };
 
    unsigned bit_size = tex->def.bit_size;
 
    nir_def *offset =
       nir_vec4(b,
-               nir_imm_floatN_t(b, offset_vals[0], a->bit_size),
-               nir_imm_floatN_t(b, offset_vals[1], a->bit_size),
-               nir_imm_floatN_t(b, offset_vals[2], a->bit_size),
+               nir_imm_floatN_t(b, mat[0][3], a->bit_size),
+               nir_imm_floatN_t(b, mat[1][3], a->bit_size),
+               nir_imm_floatN_t(b, mat[2][3], a->bit_size),
                a);
 
    offset = nir_f2fN(b, offset, bit_size);
 
-   nir_def *m0 = nir_f2fN(b, nir_build_imm(b, 4, 32, m->v[0]), bit_size);
-   nir_def *m1 = nir_f2fN(b, nir_build_imm(b, 4, 32, m->v[1]), bit_size);
-   nir_def *m2 = nir_f2fN(b, nir_build_imm(b, 4, 32, m->v[2]), bit_size);
+   nir_def *m0 = nir_f2fN(b, nir_build_imm(b, 4, 32, m.v[0]), bit_size);
+   nir_def *m1 = nir_f2fN(b, nir_build_imm(b, 4, 32, m.v[1]), bit_size);
+   nir_def *m2 = nir_f2fN(b, nir_build_imm(b, 4, 32, m.v[2]), bit_size);
 
    if (options->lower_sx10_external & (1u << texture_index)) {
       m0 = nir_fmul_imm(b, m0, 65535.0f / 1023.0f);
@@ -454,7 +435,7 @@ convert_yuv_to_rgb(nir_builder *b, nir_tex_instr *tex,
    }
 
    nir_def *result =
-      nir_ffma(b, y, m0, nir_ffma(b, u, m1, nir_ffma(b, v, m2, offset)));
+      nir_ffma_weak(b, y, m0, nir_ffma_weak(b, u, m1, nir_ffma_weak(b, v, m2, offset)));
 
    nir_def_rewrite_uses(&tex->def, result);
 }
@@ -723,13 +704,15 @@ replace_gradient_with_lod(nir_builder *b, nir_def *lod, nir_tex_instr *tex)
 }
 
 static void
-lower_gradient_cube_map(nir_builder *b, nir_tex_instr *tex)
+lower_gradient_cube_map(nir_builder *b, nir_tex_instr *tex,
+                        const nir_lower_tex_options *options)
 {
    assert(tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE);
    assert(tex->op == nir_texop_txd);
 
    /* Use textureSize() to get the width and height of LOD 0 */
-   nir_def *size = nir_i2f32(b, nir_get_texture_size(b, tex));
+   nir_def *size = nir_i2f32(b,
+                             build_texture_size(b, tex, options));
 
    /* Cubemap texture lookups first generate a texture coordinate normalized
     * to [-1, 1] on the appropiate face. The appropiate face is determined
@@ -869,11 +852,12 @@ lower_gradient_cube_map(nir_builder *b, nir_tex_instr *tex)
 }
 
 static void
-lower_gradient(nir_builder *b, nir_tex_instr *tex)
+lower_gradient(nir_builder *b, nir_tex_instr *tex,
+               const nir_lower_tex_options *options)
 {
    /* Cubes are more complicated and have their own function */
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
-      lower_gradient_cube_map(b, tex);
+      lower_gradient_cube_map(b, tex, options);
       return;
    }
 
@@ -894,9 +878,10 @@ lower_gradient(nir_builder *b, nir_tex_instr *tex)
       break;
    }
 
-   nir_def *size =
-      nir_channels(b, nir_i2f32(b, nir_get_texture_size(b, tex)),
-                   component_mask);
+   nir_def *size = nir_channels(
+      b,
+      nir_i2f32(b, build_texture_size(b, tex, options)),
+      component_mask);
 
    /* Scale the gradients by width and height.  Effectively, the incoming
     * gradients are s'(x,y), t'(x,y), and r'(x,y) from equation 3.19 in the
@@ -937,6 +922,7 @@ lower_tex_to_txd(nir_builder *b, nir_tex_instr *tex)
    txd->sampler_dim = tex->sampler_dim;
    txd->dest_type = tex->dest_type;
    txd->coord_components = tex->coord_components;
+   txd->embedded_sampler = tex->embedded_sampler;
    txd->texture_index = tex->texture_index;
    txd->sampler_index = tex->sampler_index;
    txd->is_array = tex->is_array;
@@ -944,6 +930,8 @@ lower_tex_to_txd(nir_builder *b, nir_tex_instr *tex)
    txd->is_new_style_shadow = tex->is_new_style_shadow;
    txd->is_sparse = tex->is_sparse;
    txd->can_speculate = tex->can_speculate;
+   txd->texture_non_uniform = tex->texture_non_uniform;
+   txd->sampler_non_uniform = tex->sampler_non_uniform;
 
    /* reuse existing srcs */
    for (unsigned i = 0; i < tex->num_srcs; i++) {
@@ -980,6 +968,7 @@ lower_txb_to_txl(nir_builder *b, nir_tex_instr *tex)
    txl->sampler_dim = tex->sampler_dim;
    txl->dest_type = tex->dest_type;
    txl->coord_components = tex->coord_components;
+   txl->embedded_sampler = tex->embedded_sampler;
    txl->texture_index = tex->texture_index;
    txl->sampler_index = tex->sampler_index;
    txl->is_array = tex->is_array;
@@ -987,6 +976,8 @@ lower_txb_to_txl(nir_builder *b, nir_tex_instr *tex)
    txl->is_new_style_shadow = tex->is_new_style_shadow;
    txl->is_sparse = tex->is_sparse;
    txl->can_speculate = tex->can_speculate;
+   txl->texture_non_uniform = tex->texture_non_uniform;
+   txl->sampler_non_uniform = tex->sampler_non_uniform;
 
    /* reuse all but bias src */
    for (int i = 0; i < tex->num_srcs; i++) {
@@ -1011,12 +1002,23 @@ lower_txb_to_txl(nir_builder *b, nir_tex_instr *tex)
 }
 
 static nir_tex_instr *
-saturate_src(nir_builder *b, nir_tex_instr *tex, unsigned sat_mask)
+saturate_src(nir_builder *b, nir_tex_instr *tex, unsigned sat_mask,
+             bool lod_zero, const nir_lower_tex_options *options)
 {
-   if (tex->op == nir_texop_tex)
-      tex = lower_tex_to_txd(b, tex);
-   else if (tex->op == nir_texop_txb)
-      tex = lower_txb_to_txl(b, tex);
+   if (!lod_zero) {
+      if (tex->op == nir_texop_tex)
+         tex = lower_tex_to_txd(b, tex);
+      else if (tex->op == nir_texop_txb)
+         tex = lower_txb_to_txl(b, tex);
+   } else if (tex->sampler_dim != GLSL_SAMPLER_DIM_RECT &&
+              (tex->op == nir_texop_tex || tex->op == nir_texop_txb)) {
+      int bias_idx = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+      if (bias_idx >= 0)
+         nir_tex_instr_remove_src(tex, bias_idx);
+      b->cursor = nir_before_instr(&tex->instr);
+      tex->op = nir_texop_txl;
+      nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0));
+   }
 
    b->cursor = nir_before_instr(&tex->instr);
    int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
@@ -1044,7 +1046,8 @@ saturate_src(nir_builder *b, nir_tex_instr *tex, unsigned sat_mask)
                /* non-normalized texture coords, so clamp to texture
                 * size rather than [0.0, 1.0]
                 */
-               nir_def *txs = nir_i2f32(b, nir_get_texture_size(b, tex));
+               nir_def *txs = nir_i2f32(
+                  b, build_texture_size(b, tex, options));
                comp[j] = nir_fmax(b, comp[j], nir_imm_float(b, 0.0));
                comp[j] = nir_fmin(b, comp[j], nir_channel(b, txs, j));
             } else {
@@ -1180,33 +1183,15 @@ lower_tex_packing(nir_builder *b, nir_tex_instr *tex,
       static const unsigned bits[4] = { 16, 16, 16, 16 };
 
       switch (nir_alu_type_get_base_type(tex->dest_type)) {
-      case nir_type_float:
-         switch (nir_tex_instr_dest_size(tex)) {
-         case 1:
-            assert(tex->is_shadow && tex->is_new_style_shadow);
-            color = nir_unpack_half_2x16_split_x(b, nir_channel(b, color, 0));
-            break;
-         case 2: {
-            nir_def *rg = nir_channel(b, color, 0);
-            color = nir_vec2(b,
-                             nir_unpack_half_2x16_split_x(b, rg),
-                             nir_unpack_half_2x16_split_y(b, rg));
-            break;
-         }
-         case 4: {
-            nir_def *rg = nir_channel(b, color, 0);
-            nir_def *ba = nir_channel(b, color, 1);
-            color = nir_vec4(b,
-                             nir_unpack_half_2x16_split_x(b, rg),
-                             nir_unpack_half_2x16_split_y(b, rg),
-                             nir_unpack_half_2x16_split_x(b, ba),
-                             nir_unpack_half_2x16_split_y(b, ba));
-            break;
-         }
-         default:
-            UNREACHABLE("wrong dest_size");
-         }
+      case nir_type_float: {
+         unsigned num_comp = nir_tex_instr_dest_size(tex);
+
+         assert(num_comp != 1 || (tex->is_shadow && tex->is_new_style_shadow));
+
+         color = nir_extract_bits(b, &color, 1, 0, num_comp, 16);
+         color = nir_f2f32(b, color);
          break;
+      }
 
       case nir_type_int:
          color = nir_format_unpack_sint(b, color, bits, 4);
@@ -1255,10 +1240,13 @@ lower_tg4_offsets(nir_builder *b, nir_tex_instr *tex)
       tex_copy->is_gather_implicit_lod = tex->is_gather_implicit_lod;
       tex_copy->component = tex->component;
       tex_copy->dest_type = tex->dest_type;
+      tex_copy->embedded_sampler = tex->embedded_sampler;
       tex_copy->texture_index = tex->texture_index;
       tex_copy->sampler_index = tex->sampler_index;
       tex_copy->backend_flags = tex->backend_flags;
       tex_copy->can_speculate = tex->can_speculate;
+      tex_copy->texture_non_uniform = tex->texture_non_uniform;
+      tex_copy->sampler_non_uniform = tex->sampler_non_uniform;
 
       for (unsigned j = 0; j < tex->num_srcs; ++j) {
          tex_copy->src[j].src = nir_src_for_ssa(tex->src[j].src.ssa);
@@ -1271,7 +1259,7 @@ lower_tg4_offsets(nir_builder *b, nir_tex_instr *tex)
       tex_copy->src[tex_copy->num_srcs - 1] = src;
 
       nir_def_init(&tex_copy->instr, &tex_copy->def,
-                   nir_tex_instr_dest_size(tex), 32);
+                   nir_tex_instr_dest_size(tex), tex->def.bit_size);
 
       nir_builder_instr_insert(b, &tex_copy->instr);
 
@@ -1374,23 +1362,27 @@ nir_lower_txs_cube_array(nir_builder *b, nir_tex_instr *tex)
  * with all MSAA modes.
  */
 static void
-nir_lower_ms_txf_to_fragment_fetch(nir_builder *b, nir_tex_instr *tex)
+nir_lower_ms_txf_to_fragment_fetch(nir_builder *b, nir_tex_instr *tex,
+                                   const nir_lower_tex_options *options)
 {
-   lower_offset(b, tex);
+   lower_offset(b, tex, options);
 
    b->cursor = nir_before_instr(&tex->instr);
 
    /* Create FMASK fetch. */
-   assert(tex->texture_index == 0);
    nir_tex_instr *fmask_fetch = nir_tex_instr_create(b->shader, tex->num_srcs - 1);
    fmask_fetch->op = nir_texop_fragment_mask_fetch_amd;
    fmask_fetch->coord_components = tex->coord_components;
    fmask_fetch->sampler_dim = tex->sampler_dim;
    fmask_fetch->is_array = tex->is_array;
    fmask_fetch->texture_non_uniform = tex->texture_non_uniform;
-   fmask_fetch->offset_non_uniform = tex->offset_non_uniform;
    fmask_fetch->dest_type = nir_type_uint32;
    fmask_fetch->can_speculate = tex->can_speculate;
+   fmask_fetch->input_attachment_depth = tex->input_attachment_depth;
+   fmask_fetch->input_attachment_stencil = tex->input_attachment_stencil;
+   fmask_fetch->input_attachment_index = tex->input_attachment_index;
+   fmask_fetch->texture_index = tex->texture_index;
+   fmask_fetch->texture_array_size = tex->texture_array_size;
    nir_def_init(&fmask_fetch->instr, &fmask_fetch->def, 1, 32);
 
    fmask_fetch->num_srcs = 0;
@@ -1533,6 +1525,18 @@ lower_index_to_offset(nir_builder *b, nir_tex_instr *tex)
    return progress;
 }
 
+static void
+lower_tg4_shadow_to_16bit(nir_builder *b, nir_tex_instr *tex)
+{
+   tex->def.bit_size = 16;
+   tex->dest_type = nir_type_float16;
+
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *cvt = nir_f2f32(b, &tex->def);
+
+   nir_def_rewrite_uses_after(&tex->def, cvt);
+}
+
 unsigned
 nir_tex_parse_txd_coords(nir_shader *shader, nir_tex_instr *tex, nir_instr **ddxy_instrs)
 {
@@ -1626,7 +1630,8 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
          continue;
       } else if (instr->type == nir_instr_type_jump) {
          if (nir_instr_as_jump(instr)->type == nir_jump_halt ||
-             nir_instr_as_jump(instr)->type == nir_jump_return)
+             nir_instr_as_jump(instr)->type == nir_jump_return ||
+             nir_instr_as_jump(instr)->type == nir_jump_abort)
             *prev_terminate_return = instr->index;
          continue;
       } else if (instr->type != nir_instr_type_tex) {
@@ -1665,7 +1670,7 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
            options->lower_rect_offset) ||
           (options->lower_offset_filter &&
            options->lower_offset_filter(instr, options->callback_data))) {
-         progress = lower_offset(b, tex) || progress;
+         progress = lower_offset(b, tex, options) || progress;
       }
 
       if ((tex->sampler_dim == GLSL_SAMPLER_DIM_RECT) && options->lower_rect &&
@@ -1675,7 +1680,7 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
          else if (compiler_options->has_texture_scaling)
             lower_rect_tex_scale(b, tex);
          else
-            lower_rect(b, tex);
+            lower_rect(b, tex, options);
 
          progress = true;
       }
@@ -1697,73 +1702,77 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
       } else
          texture_mask = texture_index < 32 ? (1u << texture_index) : 0u;
 
-      if (texture_mask & options->lower_y_uv_external) {
-         lower_y_uv_external(b, tex, options, texture_index);
-         progress = true;
-      }
+      if (!nir_tex_instr_is_query(tex)) {
+         if (texture_mask & options->lower_y_uv_external) {
+            lower_y_uv_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_y_vu_external) {
-         lower_y_vu_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_y_vu_external) {
+            lower_y_vu_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_y_u_v_external) {
-         lower_y_u_v_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_y_u_v_external) {
+            lower_y_u_v_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_yx_xuxv_external) {
-         lower_yx_xuxv_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_yx_xuxv_external) {
+            lower_yx_xuxv_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_yx_xvxu_external) {
-         lower_yx_xvxu_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_yx_xvxu_external) {
+            lower_yx_xvxu_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_xy_uxvx_external) {
-         lower_xy_uxvx_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_xy_uxvx_external) {
+            lower_xy_uxvx_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_xy_vxux_external) {
-         lower_xy_vxux_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_xy_vxux_external) {
+            lower_xy_vxux_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_ayuv_external) {
-         lower_ayuv_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_ayuv_external) {
+            lower_ayuv_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_xyuv_external) {
-         lower_xyuv_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_xyuv_external) {
+            lower_xyuv_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_yuv_external) {
-         lower_yuv_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_yuv_external) {
+            lower_yuv_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_yu_yv_external) {
-         lower_yu_yv_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_yu_yv_external) {
+            lower_yu_yv_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_yv_yu_external) {
-         lower_yv_yu_external(b, tex, options, texture_index);
-         progress = true;
-      }
+         if (texture_mask & options->lower_yv_yu_external) {
+            lower_yv_yu_external(b, tex, options, texture_index);
+            progress = true;
+         }
 
-      if (texture_mask & options->lower_y41x_external) {
-         lower_y41x_external(b, tex, options, texture_index);
-         progress = true;
+         if (texture_mask & options->lower_y41x_external) {
+            lower_y41x_external(b, tex, options, texture_index);
+            progress = true;
+         }
       }
 
       if (sat_mask) {
-         tex = saturate_src(b, tex, sat_mask);
+         tex = saturate_src(b, tex, sat_mask,
+                            (options->saturate_lod_zero & (1u << tex->sampler_index)) != 0,
+                            options);
          progress = true;
       }
 
@@ -1815,6 +1824,12 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
          progress |= optimize_txd(b->shader, tex, *prev_terminate_return);
       }
 
+      if (options->lower_tg4_shadow_to_16bit && tex->op == nir_texop_tg4 &&
+          tex->is_shadow && tex->def.bit_size == 32 && !tex->is_sparse) {
+         lower_tg4_shadow_to_16bit(b, tex);
+         progress = true;
+      }
+
       if (tex->op == nir_texop_txd &&
           (options->lower_txd ||
            (options->lower_txd_clamp && has_min_lod) ||
@@ -1826,7 +1841,7 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
            (options->lower_txd_array && tex->is_array) ||
            (options->lower_txd_cb &&
             options->lower_txd_cb(tex, options->lower_txd_data)))) {
-         lower_gradient(b, tex);
+         lower_gradient(b, tex, options);
          progress = true;
          continue;
       }
@@ -1841,6 +1856,25 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
          nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_int(b, 0));
          progress = true;
          continue;
+      }
+
+      if (tex->op == nir_texop_txl && tex->sampler_index < 32 &&
+          ((1u << tex->sampler_index) & options->lower_txl_mag_switchover)) {
+         int lod_index = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+         assert(lod_index >= 0);
+
+         b->cursor = nir_before_instr(&tex->instr);
+
+         nir_def *lod = tex->src[lod_index].src.ssa;
+
+         /* Magnification reads the base level with the magnification filter,
+          * so the replacement LOD is only used to pick that path.
+          */
+         nir_src_rewrite(&tex->src[lod_index].src,
+                         nir_bcsel(b, nir_fle_imm(b, lod, 0.5),
+                                   nir_imm_floatN_t(b, 0.0, lod->bit_size),
+                                   lod));
+         progress = true;
       }
 
       /* Only fragment and compute (in some cases) support implicit
@@ -1879,7 +1913,7 @@ nir_lower_tex_block(nir_block *block, nir_builder *b,
       }
 
       if (options->lower_to_fragment_fetch_amd && tex->op == nir_texop_txf_ms) {
-         nir_lower_ms_txf_to_fragment_fetch(b, tex);
+         nir_lower_ms_txf_to_fragment_fetch(b, tex, options);
          progress = true;
          continue;
       }

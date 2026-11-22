@@ -1,7 +1,7 @@
 /*
 ************************************************************************************************************************
 *
-*  Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.
+*  Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
 *  SPDX-License-Identifier: MIT
 *
 ***********************************************************************************************************************/
@@ -117,6 +117,10 @@ Gfx11Lib::Gfx11Lib(const Client* pClient)
 {
     memset(&m_settings, 0, sizeof(m_settings));
     memcpy(m_swizzleModeTable, SwizzleModeTable, sizeof(SwizzleModeTable));
+
+    m_maxDims.extent.width  = (1u << MaxMipLevels);
+    m_maxDims.extent.height = (1u << MaxMipLevels);
+    m_maxDims.mipLevels     = MaxMipLevels;
 }
 
 /**
@@ -758,6 +762,15 @@ ChipFamily Gfx11Lib::HwlConvertChipFamily(
         case FAMILY_PHX:
             m_settings.isPhoenix = 1;
             break;
+        case FAMILY_GFX1170:
+        {
+            if (ASICREV_IS_GFX1170(chipRevision))
+            {
+                m_settings.isGfx1170 = 1;
+            }
+        }
+        break;
+
         default:
             ADDR_ASSERT(!"Unknown chip family");
             break;
@@ -1152,8 +1165,8 @@ VOID Gfx11Lib::ConvertSwizzlePatternToEquation(
         Dim3d dim;
         ComputeThinBlockDimension(&dim.w, &dim.h, &dim.d, 8u << elemLog2, 0, rsrcType, swMode);
 
-        const UINT_32 blkXLog2 = Log2(dim.w);
-        const UINT_32 blkYLog2 = Log2(dim.h);
+        [[maybe_unused]] const UINT_32 blkXLog2 = Log2(dim.w);
+        [[maybe_unused]] const UINT_32 blkYLog2 = Log2(dim.h);
         const UINT_32 blkXMask = dim.w - 1;
         const UINT_32 blkYMask = dim.h - 1;
 
@@ -1257,7 +1270,7 @@ VOID Gfx11Lib::ConvertSwizzlePatternToEquation(
             }
         }
 
-        const UINT_32 pipeIntMask = (1 << m_pipeInterleaveLog2) - 1;
+        [[maybe_unused]] const UINT_32 pipeIntMask = (1 << m_pipeInterleaveLog2) - 1;
         const UINT_32 blockMask   = (1 << blockSizeLog2) - 1;
 
         ADDR_ASSERT((bMask & pipeIntMask) == pipeIntMask);
@@ -1490,7 +1503,7 @@ VOID Gfx11Lib::ConvertSwizzlePatternToEquation(
             }
         }
 
-        const UINT_32 pipeIntMask = (1 << m_pipeInterleaveLog2) - 1;
+        [[maybe_unused]] const UINT_32 pipeIntMask = (1 << m_pipeInterleaveLog2) - 1;
         const UINT_32 blockMask   = (1 << blockSizeLog2) - 1;
 
         ADDR_ASSERT((bMask & pipeIntMask) == pipeIntMask);
@@ -1737,8 +1750,6 @@ UINT_32 Gfx11Lib::GetValidDisplaySwizzleModes(
 
     if (bpp <= 64)
     {
-        const ChipFamily  family = GetChipFamily();
-
         swModeMask = Dcn32SwModeMask;
 
         if (false
@@ -2228,7 +2239,6 @@ BOOL_32 Gfx11Lib::ValidateSwModeParams(
     const BOOL_32             thin3d      = flags.view3dAs2dArray;
     const BOOL_32             linear      = IsLinear(swizzle);
     const BOOL_32             blk256B     = IsBlock256b(swizzle);
-    const BOOL_32             isNonPrtXor = IsNonPrtXor(swizzle);
     const BOOL_32             prt         = flags.prt;
 
     // Misc check
@@ -2615,11 +2625,12 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlGetPreferredSurfaceSetting(
                 {
                     const BOOL_32 computeMinSize = (pIn->flags.minimizeAlign == 1) || (pIn->memoryBudget >= 1.0);
 
-                    if ((height > 1) && (computeMinSize == FALSE))
+                    if ((height > 1) && (computeMinSize == FALSE) && (pIn->useBlockBasedHeuristic == 0))
                     {
                         // Always ignore linear swizzle mode if:
                         // 1. This is a (2D/3D) resource with height > 1
                         // 2. Client doesn't require computing minimize size
+                        // 3. Client doesn't require using block-based heuristic
                         allowedSwModeSet.swLinear = 0;
                     }
 
@@ -2651,10 +2662,12 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlGetPreferredSurfaceSetting(
 
                         UINT_64 padSize[AddrBlockMaxTiledType] = {};
 
-                        const UINT_32 ratioLow           = computeMinSize ? 1 : (pIn->flags.opt4space ? 3 : 2);
-                        const UINT_32 ratioHi            = computeMinSize ? 1 : (pIn->flags.opt4space ? 2 : 1);
-                        const UINT_64 sizeAlignInElement = Max(NextPow2(pIn->minSizeAlign) / (bpp >> 3), 1u);
+                        UINT_32 ratioLow;
+                        UINT_32 ratioHi;
+                        GetSwizzleModePreferenceRatio(pIn, &ratioLow, &ratioHi);
+
                         UINT_32       minSizeBlk         = AddrBlockMicro;
+                        UINT_32       selectedBlk        = AddrBlockMaxTiledType;
                         UINT_64       minSize            = 0;
 
                         ADDR2_COMPUTE_SURFACE_INFO_OUTPUT localOut = {};
@@ -2678,11 +2691,62 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlGetPreferredSurfaceSetting(
                                 {
                                     padSize[i] = localOut.surfSize;
 
-                                    if ((minSize == 0) ||
-                                        Addr2BlockTypeWithinMemoryBudget(minSize, padSize[i], ratioLow, ratioHi))
+                                    if (pIn->useBlockBasedHeuristic)
                                     {
-                                        minSize    = padSize[i];
-                                        minSizeBlk = i;
+                                        UINT_32 requiredImageSizeX = 1;
+                                        UINT_32 requiredImageSizeY = 1;
+                                        UINT_32 requiredImageSizeZ = 1;
+
+                                        switch (pIn->resourceType)
+                                        {
+                                        case ADDR_RSRC_TEX_1D:
+                                            requiredImageSizeX = localOut.blockWidth;
+                                            break;
+                                        case ADDR_RSRC_TEX_2D:
+                                            requiredImageSizeX = localOut.blockWidth;
+                                            requiredImageSizeY = localOut.blockHeight;
+                                            break;
+                                        case ADDR_RSRC_TEX_3D:
+                                            requiredImageSizeX = localOut.blockWidth;
+                                            requiredImageSizeY = localOut.blockHeight;
+                                            if (IsThick(pIn->resourceType, localIn.swizzleMode))
+                                            {
+                                                requiredImageSizeZ = localOut.blockSlices;
+                                            }
+                                            break;
+                                        default:
+                                            ADDR_ASSERT_ALWAYS();
+                                        }
+
+                                        // If the image is large enough, select this block type. Otherwise, track the block type with minimum size to
+                                        // fall back to it, in case no block type can satisfy the image size requirement.
+                                        if ((localOut.pitch      >= requiredImageSizeX) &&
+                                            (localOut.height     >= requiredImageSizeY) &&
+                                            (localOut.numSlices  >= requiredImageSizeZ) &&
+                                            (localIn.swizzleMode != ADDR_SW_LINEAR))
+                                        {
+                                            selectedBlk = i;
+                                        }
+                                        else
+                                        {
+                                            const bool has3DThick = (allowedSwModeSet.value & Gfx11Rsrc3dThickSwModeMask) != 0;
+                                            const bool is3DThin = (pOut->resourceType == ADDR_RSRC_TEX_3D) &&
+                                                                   IsThin(pOut->resourceType, swMode[i]);
+                                            if (((has3DThick && is3DThin) == FALSE) && (minSize == 0 || (padSize[i] < minSize)))
+                                            {
+                                                minSize = padSize[i];
+                                                minSizeBlk = i;
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if ((minSize == 0) ||
+                                            Addr2BlockTypeWithinMemoryBudget(minSize, padSize[i], ratioLow, ratioHi))
+                                        {
+                                            minSize = padSize[i];
+                                            minSizeBlk = i;
+                                        }
                                     }
                                 }
                                 else
@@ -2693,63 +2757,77 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlGetPreferredSurfaceSetting(
                             }
                         }
 
-                        if (pIn->memoryBudget > 1.0)
+                        if (pIn->useBlockBasedHeuristic)
                         {
-                            // If minimum size is given by swizzle mode with bigger-block type, then don't ever check
-                            // smaller-block type again in coming loop
-                            switch (minSizeBlk)
+                            // If there was no block size that would satisfy block based heuristic, fall back to the budget-based heuristic.
+                            if (selectedBlk == AddrBlockMaxTiledType)
                             {
-                                case AddrBlockThick256KB:
-                                    allowedBlockSet.gfx11.thin256KB = 0;
-                                case AddrBlockThin256KB:
-                                    allowedBlockSet.macroThick64KB = 0;
-                                case AddrBlockThick64KB:
-                                    allowedBlockSet.macroThin64KB = 0;
-                                case AddrBlockThin64KB:
-                                    allowedBlockSet.macroThick4KB = 0;
-                                case AddrBlockThick4KB:
-                                    allowedBlockSet.macroThin4KB = 0;
-                                case AddrBlockThin4KB:
-                                    allowedBlockSet.micro  = 0;
-                                case AddrBlockMicro:
-                                    allowedBlockSet.linear = 0;
-                                case AddrBlockLinear:
-                                    break;
-
-                                default:
-                                    ADDR_ASSERT_ALWAYS();
-                                    break;
+                                selectedBlk = minSizeBlk;
                             }
-
-                            for (UINT_32 i = AddrBlockMicro; i < AddrBlockMaxTiledType; i++)
+                        }
+                        else
+                        {
+                            if (pIn->memoryBudget > 1.0)
                             {
-                                if ((i != minSizeBlk) &&
-                                    Addr2IsBlockTypeAvailable(allowedBlockSet, static_cast<::AddrBlockType>(i)))
+                                // If minimum size is given by swizzle mode with bigger-block type, then don't ever check
+                                // smaller-block type again in coming loop
+                                switch (minSizeBlk)
                                 {
-                                    if (Addr2BlockTypeWithinMemoryBudget(minSize, padSize[i], 0, 0, pIn->memoryBudget) == FALSE)
+                                    case AddrBlockThick256KB:
+                                        allowedBlockSet.gfx11.thin256KB = 0;
+                                    case AddrBlockThin256KB:
+                                        allowedBlockSet.macroThick64KB = 0;
+                                    case AddrBlockThick64KB:
+                                        allowedBlockSet.macroThin64KB = 0;
+                                    case AddrBlockThin64KB:
+                                        allowedBlockSet.macroThick4KB = 0;
+                                    case AddrBlockThick4KB:
+                                        allowedBlockSet.macroThin4KB = 0;
+                                    case AddrBlockThin4KB:
+                                        allowedBlockSet.micro  = 0;
+                                    case AddrBlockMicro:
+                                        allowedBlockSet.linear = 0;
+                                    case AddrBlockLinear:
+                                        break;
+
+                                    default:
+                                        ADDR_ASSERT_ALWAYS();
+                                        break;
+                                }
+
+                                for (UINT_32 i = AddrBlockMicro; i < AddrBlockMaxTiledType; i++)
+                                {
+                                    if ((i != minSizeBlk) &&
+                                        Addr2IsBlockTypeAvailable(allowedBlockSet, static_cast<AddrBlockType>(i)))
                                     {
-                                        // Clear the block type if the memory waste is unacceptable
-                                        allowedBlockSet.value &= ~(1u << (i - 1));
+                                        if (Addr2BlockTypeWithinMemoryBudget(minSize, padSize[i], 0, 0, pIn->memoryBudget) == FALSE)
+                                        {
+                                            // Clear the block type if the memory waste is unacceptable
+                                            allowedBlockSet.value &= ~(1u << (i - 1));
+                                        }
                                     }
+                                }
+
+                                // Remove linear block type if 2 or more block types are allowed
+                                if (IsPow2(allowedBlockSet.value) == FALSE)
+                                {
+                                    allowedBlockSet.linear = 0;
+                                }
+
+                                // Select the biggest allowed block type
+                                minSizeBlk = Log2(allowedBlockSet.value) + 1;
+
+                                if (minSizeBlk == static_cast<UINT_32>(AddrBlockMaxTiledType))
+                                {
+                                    minSizeBlk = AddrBlockLinear;
                                 }
                             }
 
-                            // Remove linear block type if 2 or more block types are allowed
-                            if (IsPow2(allowedBlockSet.value) == FALSE)
-                            {
-                                allowedBlockSet.linear = 0;
-                            }
-
-                            // Select the biggest allowed block type
-                            minSizeBlk = Log2(allowedBlockSet.value) + 1;
-
-                            if (minSizeBlk == static_cast<UINT_32>(AddrBlockMaxTiledType))
-                            {
-                                minSizeBlk = AddrBlockLinear;
-                            }
+                            selectedBlk = minSizeBlk;
                         }
 
-                        switch (minSizeBlk)
+
+                        switch (selectedBlk)
                         {
                             case AddrBlockLinear:
                                 allowedSwModeSet.value &= Gfx11LinearSwModeMask;
@@ -3024,7 +3102,6 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlGetPossibleSwizzleModes(
                 break;
             }
 
-            // TODO: figure out if following restrictions are correct on GFX11...
             if (ElemLib::IsBlockCompressed(pIn->format) ||
                 ElemLib::IsMacroPixelPacked(pIn->format) ||
                 (bpp > 64) ||
@@ -3391,7 +3468,7 @@ ADDR_E_RETURNCODE Gfx11Lib::ComputeSurfaceInfoMicroTiled(
                     pOut->pMipInfo[i].macroBlockOffset = mipSliceSize;
                 }
 
-                mipSliceSize += mipActualWidth * mipActualHeight * (pIn->bpp >> 3);
+                mipSliceSize += static_cast<UINT_64>(mipActualWidth) * mipActualHeight * (pIn->bpp >> 3);
             }
 
             pOut->sliceSize = mipSliceSize;
@@ -3569,7 +3646,7 @@ ADDR_E_RETURNCODE Gfx11Lib::ComputeSurfaceInfoMacroTiled(
                         const UINT_32 m         = maxMipsInTail - 1 - (i - firstMipInTail);
                         const UINT_32 mipOffset = (m > 6) ? (16 << m) : (m << 8);
 
-                        pOut->pMipInfo[i].offset           = mipOffset * tailMaxDepth;
+                        pOut->pMipInfo[i].offset           = static_cast<UINT_64>(mipOffset) * tailMaxDepth;
                         pOut->pMipInfo[i].mipTailOffset    = mipOffset;
                         pOut->pMipInfo[i].macroBlockOffset = 0;
 
@@ -3685,7 +3762,7 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlComputeSurfaceAddrFromCoordTiled(
 *   Gfx11Lib::HwlCopyMemToSurface
 *
 *   @brief
-*       Copy multiple regions from memory to a non-linear surface. 
+*       Copy multiple regions from memory to a non-linear surface.
 *
 *   @return
 *       Error or success.
@@ -3707,12 +3784,10 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlCopyMemToSurface(
 
     if (pIn->numSamples > 1)
     {
-        // TODO: MSAA
         returnCode = ADDR_NOTIMPLEMENTED;
     }
     if (IsBlockVariable(pIn->swizzleMode))
     {
-        // TODO: larger LUTs for worst-case 256KB swizzle.
         returnCode = ADDR_NOTIMPLEMENTED;
     }
 
@@ -3751,7 +3826,7 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlCopyMemToSurface(
 
     LutAddresser addresser = LutAddresser();
     addresser.Init(fullSwizzlePattern, ADDR_MAX_EQUATION_BIT, blockExtent, blkSizeLog2);
-    UnalignedCopyMemImgFunc pfnCopyUnaligned = addresser.GetCopyMemImgFunc();
+    UnalignedCopyMemImgFunc pfnCopyUnaligned = addresser.GetCopyMemImgFunc(pIn->copyFlags);
     if (pfnCopyUnaligned == nullptr)
     {
         ADDR_ASSERT_ALWAYS();
@@ -3766,35 +3841,28 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlCopyMemToSurface(
             const ADDR2_MIP_INFO* pMipInfo = &mipInfo[pCurRegion->mipId];
             UINT_64 mipOffset = pIn->singleSubres ? 0 : pMipInfo->macroBlockOffset;
             UINT_32 yBlks = pMipInfo->pitch / localOut.blockWidth;
+            UINT_32 zBlks = static_cast<UINT_32>(localOut.sliceSize >>
+                                                 (addresser.GetBlockBits() - addresser.GetBlockZBits()));
 
-            UINT_32 xStart = pCurRegion->x + pMipInfo->mipTailCoordX;
-            UINT_32 yStart = pCurRegion->y + pMipInfo->mipTailCoordY;
-            UINT_32 sliceStart = pCurRegion->slice + pMipInfo->mipTailCoordZ;
+            ADDR_COORD3D rawOrigin = {
+                pCurRegion->x + pMipInfo->mipTailCoordX,
+                pCurRegion->y + pMipInfo->mipTailCoordY,
+                pCurRegion->slice + pMipInfo->mipTailCoordZ
+            };
 
-            for (UINT_32 slice = sliceStart; slice < (sliceStart + pCurRegion->copyDims.depth); slice++)
-            {
-                // The copy functions take the base address of the hardware slice, not the logical slice. Those are
-                // not the same thing in 3D swizzles. Logical slices within 3D swizzles are handled by sliceXor
-                // for unaligned copies.
-                UINT_32 sliceBlkStart = PowTwoAlignDown(slice, localOut.blockSlices);
-                UINT_32 sliceXor = pIn->pbXor ^ addresser.GetAddressZ(slice);
-
-                UINT_64 memOffset = ((slice - pCurRegion->slice) * pCurRegion->memSlicePitch);
-                UINT_64 imgOffset = mipOffset + (sliceBlkStart * localOut.sliceSize);
-
-                ADDR_COORD2D sliceOrigin = { xStart, yStart };
-                ADDR_EXTENT2D sliceExtent = { pCurRegion->copyDims.width, pCurRegion->copyDims.height };
-
-                pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, imgOffset),
-                                 VoidPtrInc(pCurRegion->pMem, memOffset),
-                                 pCurRegion->memRowPitch,
-                                 yBlks,
-                                 sliceOrigin,
-                                 sliceExtent,
-                                 sliceXor,
-                                 addresser);
-            }
+            pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, mipOffset),
+                             pCurRegion->pMem,
+                             pCurRegion->memRowPitch,
+                             pCurRegion->memSlicePitch,
+                             yBlks,
+                             zBlks,
+                             rawOrigin,
+                             pCurRegion->copyDims,
+                             pIn->pbXor,
+                             (pCurRegion->mipId >= localOut.firstMipIdInTail),
+                             addresser);
         }
+        addresser.DoCopyMemImgPostFlushes(pIn->copyFlags);
     }
     return returnCode;
 }
@@ -3804,7 +3872,7 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlCopyMemToSurface(
 *   Gfx11Lib::HwlCopySurfaceToMem
 *
 *   @brief
-*       Copy multiple regions from a non-linear surface to memory. 
+*       Copy multiple regions from a non-linear surface to memory.
 *
 *   @return
 *       Error or success.
@@ -3826,12 +3894,10 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlCopySurfaceToMem(
 
     if (pIn->numSamples > 1)
     {
-        // TODO: MSAA
         returnCode = ADDR_NOTIMPLEMENTED;
     }
     if (IsBlockVariable(pIn->swizzleMode))
     {
-        // TODO: larger LUTs for worst-case 256KB swizzle.
         returnCode = ADDR_NOTIMPLEMENTED;
     }
 
@@ -3870,7 +3936,7 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlCopySurfaceToMem(
 
     LutAddresser addresser = LutAddresser();
     addresser.Init(fullSwizzlePattern, ADDR_MAX_EQUATION_BIT, blockExtent, blkSizeLog2);
-    UnalignedCopyMemImgFunc pfnCopyUnaligned = addresser.GetCopyImgMemFunc();
+    UnalignedCopyMemImgFunc pfnCopyUnaligned = addresser.GetCopyImgMemFunc(pIn->copyFlags);
     if (pfnCopyUnaligned == nullptr)
     {
         ADDR_ASSERT_ALWAYS();
@@ -3879,40 +3945,33 @@ ADDR_E_RETURNCODE Gfx11Lib::HwlCopySurfaceToMem(
 
     if (returnCode == ADDR_OK)
     {
+        addresser.DoCopyImgMemPreFlushes(pIn->copyFlags);
         for (UINT_32  regionIdx = 0; regionIdx < regionCount; regionIdx++)
         {
             const ADDR2_COPY_MEMSURFACE_REGION* pCurRegion = &pRegions[regionIdx];
             const ADDR2_MIP_INFO* pMipInfo = &mipInfo[pCurRegion->mipId];
             UINT_64 mipOffset = pIn->singleSubres ? 0 : pMipInfo->macroBlockOffset;
             UINT_32 yBlks = pMipInfo->pitch / localOut.blockWidth;
+            UINT_32 zBlks = static_cast<UINT_32>(localOut.sliceSize >>
+                                                 (addresser.GetBlockBits() - addresser.GetBlockZBits()));
 
-            UINT_32 xStart = pCurRegion->x + pMipInfo->mipTailCoordX;
-            UINT_32 yStart = pCurRegion->y + pMipInfo->mipTailCoordY;
-            UINT_32 sliceStart = pCurRegion->slice + pMipInfo->mipTailCoordZ;
+            ADDR_COORD3D rawOrigin = {
+                pCurRegion->x + pMipInfo->mipTailCoordX,
+                pCurRegion->y + pMipInfo->mipTailCoordY,
+                pCurRegion->slice + pMipInfo->mipTailCoordZ
+            };
 
-            for (UINT_32 slice = sliceStart; slice < (sliceStart + pCurRegion->copyDims.depth); slice++)
-            {
-                // The copy functions take the base address of the hardware slice, not the logical slice. Those are
-                // not the same thing in 3D swizzles. Logical slices within 3D swizzles are handled by sliceXor
-                // for unaligned copies.
-                UINT_32 sliceBlkStart = PowTwoAlignDown(slice, localOut.blockSlices);
-                UINT_32 sliceXor = pIn->pbXor ^ addresser.GetAddressZ(slice);
-
-                UINT_64 memOffset = ((slice - pCurRegion->slice) * pCurRegion->memSlicePitch);
-                UINT_64 imgOffset = mipOffset + (sliceBlkStart * localOut.sliceSize);
-
-                ADDR_COORD2D sliceOrigin = { xStart, yStart };
-                ADDR_EXTENT2D sliceExtent = { pCurRegion->copyDims.width, pCurRegion->copyDims.height };
-
-                pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, imgOffset),
-                                 VoidPtrInc(pCurRegion->pMem, memOffset),
-                                 pCurRegion->memRowPitch,
-                                 yBlks,
-                                 sliceOrigin,
-                                 sliceExtent,
-                                 sliceXor,
-                                 addresser);
-            }
+            pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, mipOffset),
+                             pCurRegion->pMem,
+                             pCurRegion->memRowPitch,
+                             pCurRegion->memSlicePitch,
+                             yBlks,
+                             zBlks,
+                             rawOrigin,
+                             pCurRegion->copyDims,
+                             pIn->pbXor,
+                             (pCurRegion->mipId >= localOut.firstMipIdInTail),
+                             addresser);
         }
     }
     return returnCode;
@@ -4444,7 +4503,6 @@ UINT_32 Gfx11Lib::HwlComputeMaxMetaBaseAlignments() const
     }
 
     // Max base alignment for 2D Dcc
-    // swizzle mode support DCC...
     const AddrSwizzleMode ValidSwizzleModeForDcc2D[] =
     {
         ADDR_SW_64KB_R_X,

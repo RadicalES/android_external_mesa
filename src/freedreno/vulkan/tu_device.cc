@@ -10,27 +10,28 @@
 #include "tu_device.h"
 
 #include "drm-uapi/drm_fourcc.h"
-#include "fdl/freedreno_layout.h"
-#include <fcntl.h>
-#include <poll.h>
-
 #include "git_sha1.h"
+#include "perfcntrs/freedreno_perfcntr.h"
+
+#include "common/freedreno_stompable_regs.h"
+/* for fd_get_driver/device_uuid() */
 #include "util/cache_ops.h"
-#include "util/u_debug.h"
 #include "util/disk_cache.h"
-#include "util/hex.h"
 #include "util/driconf.h"
+#include "util/hex.h"
 #include "util/os_misc.h"
+#include "util/u_atomic.h"
+#include "util/u_debug.h"
 #include "util/u_process.h"
 #include "vk_android.h"
+#include "vk_debug_utils.h"
+#include "vk_physical_device.h"
 #include "vk_shader_module.h"
-#include "vk_sampler.h"
 #include "vk_util.h"
+#include "vk_sampler.h"
 
-/* for fd_get_driver/device_uuid() */
-#include "freedreno/common/freedreno_uuid.h"
-#include "freedreno/common/freedreno_stompable_regs.h"
-
+#include "common/freedreno_uuid.h"
+#include "fdl/freedreno_layout.h"
 #include "tu_acceleration_structure.h"
 #include "tu_clear_blit.h"
 #include "tu_cmd_buffer.h"
@@ -39,11 +40,15 @@
 #include "tu_dynamic_rendering.h"
 #include "tu_image.h"
 #include "tu_pass.h"
-#include "tu_queue.h"
 #include "tu_query_pool.h"
+#include "tu_queue.h"
 #include "tu_rmv.h"
 #include "tu_tracepoints.h"
 #include "tu_wsi.h"
+
+#ifdef TU_WSI_PLATFORM
+#include "wsi_common.h"
+#endif
 
 #if DETECT_OS_ANDROID
 #include <vndk/hardware_buffer.h>
@@ -51,31 +56,78 @@
 
 uint64_t os_page_size = 4096;
 
-static int
-tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
+static bool
+tu_device_get_build_id(blake3_hasher *ctx)
 {
-   struct mesa_sha1 ctx;
-   unsigned char sha1[SHA1_DIGEST_LENGTH];
+#ifdef TU_BUILD_ID_OVERRIDE
+   {
+      assert(strlen(TU_BUILD_ID_OVERRIDE) % 2 == 0);
+      unsigned size = strlen(TU_BUILD_ID_OVERRIDE) / 2;
+      auto data = static_cast<unsigned char *>(ralloc_size(NULL, size));
+      mesa_hex_to_bytes(data, TU_BUILD_ID_OVERRIDE, size);
+      _mesa_blake3_update(ctx, data, size);
+      ralloc_free(data);
+      return true;
+   }
+#else
+   return disk_cache_get_function_identifier(reinterpret_cast<void *>(tu_device_get_build_id), ctx);
+#endif
+}
+
+static void
+tu_physical_device_compiler_options_init(struct tu_physical_device *device,
+                                         struct tu_instance *instance)
+{
+   /* D3D12 texel buffer range emulation requires the resbase instruction, which appeared in 7xx. */
+   if (fd_dev_gen(&device->dev_id) >= 7) {
+      if (device->info->props.max_texel_buffer_range_elements < TU_D3D12_MAX_TEXEL_BUFFER_ELEMENTS) {
+         assert(fd_dev_gen(&device->dev_id) == 7);
+         device->compiler_options.enable_texel_buffer_emulation =
+            instance->drirc.misc.enable_texel_buffer_emulation;
+      }
+      if (device->info->props.max_storage_buffer_range_bytes < TU_D3D12_MAX_STORAGE_BUFFER_RANGE_BYTES) {
+         assert(fd_dev_gen(&device->dev_id) == 7);
+         device->compiler_options.enable_ssbo_emulation =
+            instance->drirc.misc.enable_ssbo_emulation;
+      }
+   }
+
+   device->compiler_options.allow_oob_indirect_ubo_loads =
+      device->instance->drirc.misc.allow_oob_indirect_ubo_loads;
+
    /* Note: IR3_SHADER_DEBUG also affects compilation, but it's not
     * initialized until after compiler creation so we have to add it to the
     * shader hash instead, since the compiler is only created with the logical
     * device.
     */
-   uint64_t driver_flags = TU_DEBUG(NOMULTIPOS);
-   uint16_t family = fd_dev_gpu_id(&device->dev_id);
+   device->compiler_options.no_multi_pos = TU_DEBUG(NOMULTIPOS);
+   device->compiler_options.compute_round_robin = TU_DEBUG(COMPUTE_ROUND_ROBIN);
+}
+
+static int
+tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
+{
+   blake3_hasher ctx;
+   unsigned char blake3[BLAKE3_KEY_LEN];
+
+   /* Note: we intentionally drop the upper 32 bits since they contain fuse
+    * values that don't affect compilation.
+    */
+   uint32_t chip_id = device->dev_id.chip_id;
 
    memset(uuid, 0, VK_UUID_SIZE);
-   _mesa_sha1_init(&ctx);
+   _mesa_blake3_init(&ctx);
 
-   if (!disk_cache_get_function_identifier((void *)tu_device_get_cache_uuid, &ctx))
+   if (!tu_device_get_build_id(&ctx))
       return -1;
 
-   _mesa_sha1_update(&ctx, &family, sizeof(family));
-   _mesa_sha1_update(&ctx, &driver_flags, sizeof(driver_flags));
-   _mesa_sha1_update(&ctx, &device->uche_trap_base, sizeof(device->uche_trap_base));
-   _mesa_sha1_final(&ctx, sha1);
+   _mesa_blake3_update(&ctx, &chip_id, sizeof(chip_id));
+   _mesa_blake3_update(&ctx, &device->uche_trap_base, sizeof(device->uche_trap_base));
+   _mesa_blake3_update(&ctx, &device->compiler_options,
+                       sizeof(device->compiler_options));
+   _mesa_blake3_final(&ctx, blake3);
 
-   memcpy(uuid, sha1, VK_UUID_SIZE);
+   memcpy(uuid, blake3, VK_UUID_SIZE);
    return 0;
 }
 
@@ -142,21 +194,18 @@ is_kgsl(struct tu_instance *instance)
    return strcmp(instance->knl->name, "kgsl") == 0;
 }
 
-static bool tu_has_multiview(const struct tu_physical_device *device)
+static uint32_t
+tu_subgroup_size(const struct tu_physical_device *device)
 {
-   return device->info->props.has_hw_multiview || TU_DEBUG(NOCONFORM);
-}
-
-/* We are generally VK 1.1 except A702, which has no multiview */
-static bool tu_is_vk_1_1(const struct tu_physical_device *device)
-{
-   return tu_has_multiview(device);
+   return device->info->threadsize_base *
+          (device->expose_double_threadsize ? 2 : 1);
 }
 
 static void
 get_device_extensions(const struct tu_physical_device *device,
                       struct vk_device_extension_table *ext)
 {
+   bool has_gralloc = vk_android_get_ugralloc() != NULL;
    /* device->has_raytracing contains the value of the SW fuse. If the
     * device doesn't have a fuse (i.e. a740), we have to ignore it because
     * kgsl returns false. If it does have a fuse, enable raytracing if the
@@ -173,12 +222,12 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_calibrated_timestamps = device->info->props.has_persistent_counter,
-      .KHR_compute_shader_derivatives = device->info->chip >= 7,
+      .KHR_compute_shader_derivatives = true,
       .KHR_copy_commands2 = true,
-      // TODO workaround for https://github.com/KhronosGroup/VK-GL-CTS/issues/525
-      .KHR_create_renderpass2 = true, // tu_has_multiview(device),
+      .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
       .KHR_deferred_host_operations = true,
+      .KHR_depth_clamp_zero_one = true,
       .KHR_depth_stencil_resolve = true,
       .KHR_descriptor_update_template = true,
       .KHR_device_group = true,
@@ -195,26 +244,28 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_format_feature_flags2 = true,
       .KHR_fragment_shading_rate = device->info->props.has_attachment_shading_rate,
       .KHR_get_memory_requirements2 = true,
-      .KHR_global_priority = tu_is_vk_1_1(device),
+      .KHR_global_priority = true,
       .KHR_image_format_list = true,
       .KHR_imageless_framebuffer = true,
 #ifdef TU_USE_WSI_PLATFORM
       .KHR_incremental_present = true,
 #endif
       .KHR_index_type_uint8 = true,
+      .KHR_internally_synchronized_queues = true,
       .KHR_line_rasterization = !device->info->props.is_a702,
       .KHR_load_store_op_none = true,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
-      .KHR_maintenance4 = tu_is_vk_1_1(device),
-      .KHR_maintenance5 = tu_is_vk_1_1(device),
-      .KHR_maintenance6 = tu_is_vk_1_1(device),
-      .KHR_maintenance7 = tu_is_vk_1_1(device),
-      .KHR_maintenance8 = tu_is_vk_1_1(device),
+      .KHR_maintenance4 = true,
+      .KHR_maintenance5 = true,
+      .KHR_maintenance6 = true,
+      .KHR_maintenance7 = true,
+      .KHR_maintenance8 = true,
+      .KHR_maintenance9 = true,
       .KHR_map_memory2 = true,
-      .KHR_multiview = tu_has_multiview(device),
-      .KHR_performance_query = TU_DEBUG(PERFC) || TU_DEBUG(PERFCRAW),
+      .KHR_multiview = true,
+      .KHR_performance_query = (TU_DEBUG(PERFC) || TU_DEBUG(PERFCRAW)) && device->is_perf_cntr_selectable,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
 #ifdef TU_USE_WSI_PLATFORM
@@ -237,15 +288,17 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_shader_expect_assume = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_float_controls = true,
-      .KHR_shader_float_controls2 = tu_is_vk_1_1(device),
+      .KHR_shader_float_controls2 = true,
       .KHR_shader_integer_dot_product = true,
+      .KHR_shader_maximal_reconvergence = device->info->props.has_getfiberid,
       .KHR_shader_non_semantic_info = true,
+      .KHR_shader_quad_control = device->info->props.has_getfiberid,
       .KHR_shader_relaxed_extended_instruction = true,
-      .KHR_shader_subgroup_extended_types = tu_is_vk_1_1(device),
+      .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = true,
-      .KHR_shader_subgroup_uniform_control_flow = tu_is_vk_1_1(device),
+      .KHR_shader_subgroup_uniform_control_flow = true,
       .KHR_shader_terminate_invocation = true,
-      .KHR_spirv_1_4 = tu_is_vk_1_1(device),
+      .KHR_spirv_1_4 = true,
       .KHR_storage_buffer_storage_class = true,
 #ifdef TU_USE_WSI_PLATFORM
       .KHR_swapchain = true,
@@ -272,12 +325,15 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_conservative_rasterization = device->info->chip >= 7,
       .EXT_custom_border_color = true,
       .EXT_custom_resolve = true,
+      .EXT_debug_marker = true,
+      .EXT_depth_clamp_control = true,
       .EXT_depth_clamp_zero_one = true,
       .EXT_depth_clip_control = true,
       .EXT_depth_clip_enable = true,
       .EXT_descriptor_buffer = true,
       .EXT_descriptor_indexing = true,
       .EXT_device_address_binding_report = true,
+      .EXT_device_memory_report = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
@@ -289,13 +345,17 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
       .EXT_fragment_density_map = true,
       .EXT_fragment_density_map_offset = true,
-      .EXT_global_priority = tu_is_vk_1_1(device),
-      .EXT_global_priority_query = tu_is_vk_1_1(device),
+      .EXT_global_priority = true,
+      .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
       .EXT_hdr_metadata = true,
       .EXT_host_image_copy = true,
       .EXT_host_query_reset = true,
       .EXT_image_2d_view_of_3d = true,
+      .EXT_image_compression_control = true,
+#ifdef TU_USE_WSI_PLATFORM
+      .EXT_image_compression_control_swapchain = true,
+#endif
       .EXT_image_drm_format_modifier = true,
       .EXT_image_robustness = true,
       .EXT_image_view_min_lod = true,
@@ -315,6 +375,10 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_physical_device_drm = !is_kgsl(device->instance),
       .EXT_pipeline_creation_cache_control = true,
       .EXT_pipeline_creation_feedback = true,
+#ifdef TU_USE_WSI_PLATFORM
+      .EXT_present_timing = device->info->props.has_persistent_counter,
+#endif
+      .EXT_primitive_restart_index = true,
       .EXT_primitive_topology_list_restart = true,
       .EXT_primitives_generated_query = true,
       .EXT_private_data = true,
@@ -328,11 +392,16 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_separate_stencil_usage = true,
       .EXT_shader_atomic_float = true,
       .EXT_shader_demote_to_helper_invocation = true,
+      .EXT_shader_image_atomic_int64 = device->info->props.has_64b_image_atomics,
       .EXT_shader_module_identifier = true,
       .EXT_shader_replicated_composites = true,
       .EXT_shader_stencil_export = true,
-      .EXT_shader_viewport_index_layer = tu_has_multiview(device),
-      .EXT_subgroup_size_control = tu_is_vk_1_1(device),
+      .EXT_shader_subgroup_ballot =
+         device->info->props.has_getfiberid && tu_subgroup_size(device) <= 64,
+      .EXT_shader_subgroup_vote = device->info->props.has_getfiberid,
+      .EXT_shader_uniform_buffer_unsized_array = true,
+      .EXT_shader_viewport_index_layer = device->info->props.has_hw_multiview,
+      .EXT_subgroup_size_control = true,
 #ifdef TU_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
 #endif
@@ -346,24 +415,29 @@ get_device_extensions(const struct tu_physical_device *device,
 
       /* For Graphics Flight Recorder (GFR) */
       .AMD_buffer_marker = true,
+      .ANDROID_external_memory_android_hardware_buffer = has_gralloc,
+      .ANDROID_native_buffer = has_gralloc,
       .ARM_rasterization_order_attachment_access = true,
       .GOOGLE_decorate_string = true,
+#ifdef TU_USE_WSI_PLATFORM
+      .GOOGLE_display_timing = wsi_instance_supports_google_display_timing(&device->instance->vk, &device->instance->drirc.options),
+#endif
       .GOOGLE_hlsl_functionality1 = true,
       .GOOGLE_user_type = true,
       .IMG_filter_cubic = device->info->props.has_tex_filter_cubic,
-      .NV_compute_shader_derivatives = device->info->chip >= 7,
+      .NV_compute_shader_derivatives = true,
       .QCOM_fragment_density_map_offset = true,
+      .QCOM_image_processing = device->info->props.has_image_processing,
+      .QCOM_multiview_per_view_render_areas = true,
+      .QCOM_multiview_per_view_viewports =
+         device->info->props.has_per_view_viewport,
       .QCOM_render_pass_shader_resolve = true,
+      .QCOM_rotated_copy_commands = true,
+      .VALVE_buffer_device_address_allocation_alignment =
+         device->has_iova_align,
       .VALVE_fragment_density_map_layered = true,
       .VALVE_mutable_descriptor_type = true,
    } };
-
-#if DETECT_OS_ANDROID
-   if (vk_android_get_ugralloc() != NULL) {
-      ext->ANDROID_external_memory_android_hardware_buffer = true,
-      ext->ANDROID_native_buffer = true;
-   }
-#endif
 }
 
 static void
@@ -391,7 +465,7 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->wideLines = pdevice->info->props.line_width_max > 1.0;
    features->largePoints = true;
    features->alphaToOne = true;
-   features->multiViewport = tu_has_multiview(pdevice);
+   features->multiViewport = pdevice->info->props.has_hw_multiview;
    features->samplerAnisotropy = true;
    features->textureCompressionETC2 = true;
    features->textureCompressionASTC_LDR = true;
@@ -435,7 +509,12 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->storagePushConstant16               = false;
    features->storageInputOutput16                = false;
    features->multiview                           = true;
-   features->multiviewGeometryShader             = false;
+   /* Multiview + GS seems to hang on a6xx. We also don't yet support the
+    * required emulation of multiview masks with geometry shaders on early
+    * a6xx.
+    */
+   features->multiviewGeometryShader             =
+      pdevice->info->chip >= 7;
    features->multiviewTessellationShader         = false;
    features->variablePointersStorageBuffer       = true;
    features->variablePointers                    = true;
@@ -523,7 +602,7 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_KHR_compute_shader_derivatives */
    features->computeDerivativeGroupQuads = pdevice->info->chip >= 7;
-   features->computeDerivativeGroupLinear = pdevice->info->chip >= 7;
+   features->computeDerivativeGroupLinear = true;
 
    /* VK_KHR_dynamic_rendering_local_read */
    features->dynamicRenderingLocalRead = true;
@@ -535,6 +614,9 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_KHR_index_type_uint8 */
    features->indexTypeUint8 = true;
+
+   /* VK_KHR_internally_synchronized_queues */
+   features->internallySynchronizedQueues = true;
 
    /* VK_KHR_line_rasterization */
    features->rectangularLines = !pdevice->info->props.is_a702;
@@ -555,6 +637,9 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_KHR_maintenance8 */
    features->maintenance8 = true;
+
+   /* VK_KHR_maintenance9 */
+   features->maintenance9 = true;
 
    /* VK_KHR_performance_query */
    features->performanceCounterQueryPools = true;
@@ -580,6 +665,12 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_KHR_shader_float_controls2 */
    features->shaderFloatControls2 = true;
+
+   /* VK_KHR_shader_maximal_reconvergence */
+   features->shaderMaximalReconvergence = pdevice->info->props.has_getfiberid;
+
+   /* VK_KHR_shader_quad_control */
+   features->shaderQuadControl = pdevice->info->props.has_getfiberid;
 
    /* VK_KHR_shader_subgroup_uniform_control_flow */
    features->shaderSubgroupUniformControlFlow = true;
@@ -619,7 +710,10 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->customBorderColors = true;
    features->customBorderColorWithoutFormat = true;
 
-   /* VK_EXT_depth_clamp_zero_one */
+   /* VK_EXT_depth_clamp_control */
+   features->depthClampControl = true;
+
+   /* VK_KHR_depth_clamp_zero_one */
    features->depthClampZeroOne = true;
 
    /* VK_EXT_depth_clip_control */
@@ -637,13 +731,16 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_EXT_device_address_binding_report */
    features->reportAddressBinding = true;
 
+   /* VK_EXT_device_memory_report */
+   features->deviceMemoryReport = true;
+
    /* VK_EXT_extended_dynamic_state */
    features->extendedDynamicState = true;
 
    /* VK_EXT_extended_dynamic_state2 */
    features->extendedDynamicState2 = true;
    features->extendedDynamicState2LogicOp = true;
-   features->extendedDynamicState2PatchControlPoints = true;
+   features->extendedDynamicState2PatchControlPoints = !pdevice->info->props.is_a702;
 
    /* VK_EXT_extended_dynamic_state3 */
    features->extendedDynamicState3PolygonMode = true;
@@ -695,9 +792,21 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_EXT_host_image_copy */
    features->hostImageCopy = true;
 
+   /* VK_EXT_shader_image_atomic_int64 */
+   features->shaderImageInt64Atomics = pdevice->info->props.has_64b_image_atomics;
+   features->sparseImageInt64Atomics = false;
+
    /* VK_EXT_image_2d_view_of_3d  */
    features->image2DViewOf3D = true;
    features->sampler2DViewOf3D = true;
+
+   /* VK_EXT_image_compression_control */
+   features->imageCompressionControl = true;
+
+#ifdef TU_USE_WSI_PLATFORM
+   /* VK_EXT_image_compression_control_swapchain */
+   features->imageCompressionControlSwapchain = true;
+#endif
 
    /* VK_EXT_image_view_min_lod */
    features->minLod = true;
@@ -729,6 +838,9 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_EXT_pipeline_robustness */
    features->pipelineRobustness = true;
+
+   /* VK_EXT_primitive_restart_index */
+   features->primitiveRestartIndex = true;
 
    /* VK_EXT_primitive_topology_list_restart */
    features->primitiveTopologyListRestart = true;
@@ -778,6 +890,9 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_EXT_shader_replicated_composites */
    features->shaderReplicatedComposites = true;
 
+   /* VK_EXT_shader_uniform_buffer_unsized_array */
+   features->shaderUniformBufferUnsizedArray = true;
+
 #ifdef TU_USE_WSI_PLATFORM
    /* VK_KHR_swapchain_maintenance1 */
    features->swapchainMaintenance1 = true;
@@ -794,7 +909,7 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_EXT_transform_feedback */
    features->transformFeedback = true;
-   features->geometryStreams = !pdevice->info->props.is_a702;
+   features->geometryStreams = pdevice->info->props.num_xfb_streams > 1;
 
    /* VK_EXT_vertex_input_dynamic_state */
    features->vertexInputDynamicState = true;
@@ -816,6 +931,11 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_EXT_zero_initialize_device_memory */
    features->zeroInitializeDeviceMemory = true;
 
+   /* VK_QCOM_image_processing */
+   features->textureSampleWeighted = pdevice->vk.supported_extensions.QCOM_image_processing;
+   features->textureBoxFilter = pdevice->vk.supported_extensions.QCOM_image_processing;
+   features->textureBlockMatch = pdevice->vk.supported_extensions.QCOM_image_processing;
+
    /* VK_VALVE_fragment_density_map_layered */
    features->fragmentDensityMapLayered = true;
 
@@ -827,6 +947,22 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_EXT_custom_resolve */
    features->customResolve = true;
+
+   /* QCOM_multiview_per_view_viewports */
+   features->multiviewPerViewViewports = true;
+
+   /* QCOM_multiview_per_view_render_areas */
+   features->multiviewPerViewRenderAreas = true;
+
+#ifdef TU_USE_WSI_PLATFORM
+   /* VK_EXT_present_timing */
+   features->presentTiming = true;
+   features->presentAtRelativeTime = true;
+   features->presentAtAbsoluteTime = true;
+#endif
+
+   /* VALVE_buffer_device_address_allocation_alignment */
+   features->bufferDeviceAddressAllocationAlignment = true;
 }
 
 static void
@@ -839,8 +975,7 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
    p->deviceNodeMask = 0;
    p->deviceLUIDValid = false;
 
-   p->subgroupSize = pdevice->info->props.supports_double_threadsize ?
-      pdevice->info->threadsize_base * 2 : pdevice->info->threadsize_base;
+   p->subgroupSize = tu_subgroup_size(pdevice);
    p->subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT;
    p->subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT |
                                     VK_SUBGROUP_FEATURE_VOTE_BIT |
@@ -855,12 +990,10 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
       p->subgroupSupportedStages |= VK_SHADER_STAGE_ALL_GRAPHICS;
       p->subgroupSupportedOperations |= VK_SUBGROUP_FEATURE_QUAD_BIT;
    }
-
-   p->subgroupQuadOperationsInAllStages = false;
+   p->subgroupQuadOperationsInAllStages = pdevice->info->props.has_getfiberid;
 
    p->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
-   p->maxMultiviewViewCount =
-      tu_has_multiview(pdevice) ? MAX_VIEWPORTS : 1;
+   p->maxMultiviewViewCount = MAX_VIEWS;
    p->maxMultiviewInstanceIndex = INT_MAX;
    p->protectedNoFault = false;
    /* Our largest descriptors are 2 texture descriptors, or a texture and
@@ -890,21 +1023,12 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
    memset(p->driverInfo, 0, sizeof(p->driverInfo));
    snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
-   if (pdevice->info->chip >= 7) {
-      p->conformanceVersion = (VkConformanceVersion) {
-         .major = 1,
-         .minor = 4,
-         .subminor = 0,
-         .patch = 0,
-      };
-   } else {
-      p->conformanceVersion = (VkConformanceVersion) {
-         .major = 1,
-         .minor = 2,
-         .subminor = 7,
-         .patch = 1,
-      };
-   }
+   p->conformanceVersion = (VkConformanceVersion) {
+      .major = 1,
+      .minor = 4,
+      .subminor = 6,
+      .patch = 1,
+   };
 
    p->denormBehaviorIndependence =
       VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
@@ -929,7 +1053,7 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
     * get people confused, but vkd3d-proton cannot emulate it itself so we
     * have to allow it to use our emulation.
     */
-   p->shaderDenormPreserveFloat32 = pdevice->instance->enable_softfloat32;
+   p->shaderDenormPreserveFloat32 = pdevice->instance->drirc.misc.enable_softfloat32;
 
    p->shaderRoundingModeRTEFloat32           = true;
    p->shaderRoundingModeRTZFloat32           = false;
@@ -988,10 +1112,17 @@ tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
                                       struct vk_properties *p)
 {
    p->minSubgroupSize = pdevice->info->threadsize_base;
-   p->maxSubgroupSize = pdevice->info->props.supports_double_threadsize ?
-      pdevice->info->threadsize_base * 2 : pdevice->info->threadsize_base;
+   p->maxSubgroupSize = tu_subgroup_size(pdevice);
    p->maxComputeWorkgroupSubgroups = pdevice->info->max_waves;
-   p->requiredSubgroupSizeStages = VK_SHADER_STAGE_ALL;
+   /* Only compute and fragment shaders can run with a doubled wave size, the
+    * geometry stages always run at threadsize_base.  So when we expose more
+    * than one possible subgroup size we can't honor a required subgroup size
+    * in those stages.
+    */
+   p->requiredSubgroupSizeStages =
+      p->minSubgroupSize == p->maxSubgroupSize
+         ? VK_SHADER_STAGE_ALL
+         : (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
 
    p->maxInlineUniformBlockSize = MAX_INLINE_UBO_RANGE;
    p->maxPerStageDescriptorInlineUniformBlocks = MAX_INLINE_UBOS;
@@ -1063,9 +1194,14 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxImageDimension3D = (1 << 11);
    props->maxImageDimensionCube = (1 << 14);
    props->maxImageArrayLayers = (1 << (pdevice->info->props.is_a702 ? 8 : 11));
-   props->maxTexelBufferElements = MAX_TEXEL_ELEMENTS;
+   props->maxTexelBufferElements = pdevice->compiler_options.enable_texel_buffer_emulation
+                                      ? TU_D3D12_MAX_TEXEL_BUFFER_ELEMENTS
+                                      : pdevice->info->props.max_texel_buffer_range_elements;
    props->maxUniformBufferRange = MAX_UNIFORM_BUFFER_RANGE;
-   props->maxStorageBufferRange = MAX_STORAGE_BUFFER_RANGE;
+   props->maxStorageBufferRange =
+      pdevice->compiler_options.enable_ssbo_emulation
+         ? TU_D3D12_MAX_STORAGE_BUFFER_RANGE_BYTES
+         : pdevice->info->props.max_storage_buffer_range_bytes;
    props->maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE;
    props->maxMemoryAllocationCount = UINT32_MAX;
    props->maxSamplerAllocationCount = 64 * 1024;
@@ -1107,28 +1243,21 @@ tu_get_properties(struct tu_physical_device *pdevice,
       props->maxGeometryOutputVertices = 256;
       props->maxGeometryTotalOutputComponents = 1024;
    }
-   // probably should be props->maxVertexOutputComponents - 4 but that is
-   // below the limit on a702
-   props->maxFragmentInputComponents = pdevice->info->props.is_a702 ? 112 : 124;
+   props->maxFragmentInputComponents = pdevice->info->props.is_a702 ? 64 : 128;
    props->maxFragmentOutputAttachments = 8;
    props->maxFragmentDualSrcAttachments = 1;
    props->maxFragmentCombinedOutputResources = MAX_RTS + max_descriptor_set_size * 2;
    props->maxComputeSharedMemorySize = pdevice->info->cs_shared_mem_size;
+   /* keep in sync with nir_shader_compiler_options */
    props->maxComputeWorkGroupCount[0] =
       props->maxComputeWorkGroupCount[1] =
       props->maxComputeWorkGroupCount[2] = 65535;
-   props->maxComputeWorkGroupInvocations = pdevice->info->props.supports_double_threadsize ?
-      pdevice->info->threadsize_base * 2 * pdevice->info->max_waves :
-      pdevice->info->threadsize_base * pdevice->info->max_waves;
-   if (pdevice->info->props.is_a702) {
-      props->maxComputeWorkGroupSize[0] =
-         props->maxComputeWorkGroupSize[1] = 512;
-      props->maxComputeWorkGroupSize[2] = 64;
-   } else {
-      props->maxComputeWorkGroupSize[0] =
-         props->maxComputeWorkGroupSize[1] =
-         props->maxComputeWorkGroupSize[2] = 1024;
-   }
+   props->maxComputeWorkGroupInvocations =
+      tu_subgroup_size(pdevice) * pdevice->info->max_waves;
+   props->maxComputeWorkGroupSize[0] =
+      props->maxComputeWorkGroupSize[1] =
+      props->maxComputeWorkGroupSize[2] =
+         MIN2(1024, props->maxComputeWorkGroupInvocations);
    props->subPixelPrecisionBits = 8;
    props->subTexelPrecisionBits = 8;
    props->mipmapPrecisionBits = 8;
@@ -1137,7 +1266,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxSamplerLodBias = 4095.0 / 256.0; /* [-16, 15.99609375] */
    props->maxSamplerAnisotropy = 16;
    props->maxViewports =
-         tu_has_multiview(pdevice) ? MAX_VIEWPORTS : 1;
+         pdevice->info->props.has_hw_multiview ? MAX_VIEWPORTS : 1;
    props->maxViewportDimensions[0] =
       props->maxViewportDimensions[1] = MAX_VIEWPORT_SIZE;
    props->viewportBoundsRange[0] = INT16_MIN;
@@ -1169,7 +1298,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
    props->maxSampleMaskWords = 1;
    props->timestampComputeAndGraphics = true;
-   props->timestampPeriod = 1000000000.0 / (float) ALWAYS_ON_FREQUENCY;
+   props->timestampPeriod = 1000000000.0 / static_cast<float>(ALWAYS_ON_FREQUENCY);
    props->maxClipDistances = 8;
    props->maxCullDistances = 8;
    props->maxCombinedClipAndCullDistances = 8;
@@ -1188,13 +1317,11 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->nonCoherentAtomSize = 64;
 
    props->apiVersion =
-      tu_has_multiview(pdevice) ?
-         ((pdevice->info->chip >= 7) ? TU_API_VERSION :
-            VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION))
-         : VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);
+      ((pdevice->info->chip >= 7) ? TU_API_VERSION :
+         VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION));
    props->driverVersion = vk_get_driver_version();
-   props->vendorID = pdevice->instance->force_vk_vendor != 0 ?
-                     pdevice->instance->force_vk_vendor : 0x5143;
+   props->vendorID = pdevice->instance->drirc.debug.force_vk_vendor != 0 ?
+                     pdevice->instance->drirc.debug.force_vk_vendor : 0x5143;
    props->deviceID = pdevice->dev_id.chip_id;
    props->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
 
@@ -1209,7 +1336,9 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->sparseResidencyAlignedMipSize = false;
    props->sparseResidencyNonResidentStrict = true;
 
-   strcpy(props->deviceName, pdevice->name);
+   snprintf(props->deviceName, sizeof(props->deviceName), "%s",
+            (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) ?
+            pdevice->instance->drirc.debug.force_vk_devicename : pdevice->name);
    memcpy(props->pipelineCacheUUID, pdevice->cache_uuid, VK_UUID_SIZE);
 
    tu_get_physical_device_properties_1_1(pdevice, props);
@@ -1251,12 +1380,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxPushDescriptors = MAX_PUSH_DESCRIPTORS;
 
    /* VK_EXT_transform_feedback */
-   if (pdevice->info->props.is_a702) {
-       /* a702 only 32 streamout ram entries.. 1 stream, 64 components */
-      props->maxTransformFeedbackStreams = 1;
-   } else {
-      props->maxTransformFeedbackStreams = IR3_MAX_SO_STREAMS;
-   }
+   props->maxTransformFeedbackStreams = pdevice->info->props.num_xfb_streams;
    props->maxTransformFeedbackBuffers = IR3_MAX_SO_BUFFERS;
    props->maxTransformFeedbackBufferSize = UINT32_MAX;
    props->maxTransformFeedbackStreamDataSize = 512;
@@ -1348,13 +1472,13 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxSamplerDescriptorBufferBindings = pdevice->usable_sets;
    props->maxEmbeddedImmutableSamplerBindings = pdevice->usable_sets;
    props->maxEmbeddedImmutableSamplers = max_descriptor_set_size;
-   props->bufferCaptureReplayDescriptorDataSize = 0;
+   props->bufferCaptureReplayDescriptorDataSize = sizeof(uint64_t);
    props->imageCaptureReplayDescriptorDataSize = sizeof(uint64_t);
    props->imageViewCaptureReplayDescriptorDataSize = 0;
-   props->samplerCaptureReplayDescriptorDataSize = 0;
+   props->samplerCaptureReplayDescriptorDataSize = sizeof(uint32_t);
    props->accelerationStructureCaptureReplayDescriptorDataSize = 0;
    /* Note: these sizes must match descriptor_size() */
-   props->samplerDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->EDBsamplerDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
    props->combinedImageSamplerDescriptorSize = 2 * FDL6_TEX_CONST_DWORDS * 4;
    props->sampledImageDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
    props->storageImageDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
@@ -1376,7 +1500,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->samplerDescriptorBufferAddressSpaceSize = ~0ull;
    props->resourceDescriptorBufferAddressSpaceSize = ~0ull;
    props->descriptorBufferAddressSpaceSize = ~0ull;
-   props->combinedImageSamplerDensityMapDescriptorSize = 2 * FDL6_TEX_CONST_DWORDS * 4;
+   props->combinedImageSamplerDensityMapDescriptorSize = 3 * FDL6_TEX_CONST_DWORDS * 4;
 
    /* VK_EXT_legacy_vertex_attributes */
    props->nativeUnalignedPerformance = true;
@@ -1389,7 +1513,8 @@ tu_get_properties(struct tu_physical_device *pdevice,
    /* VK_KHR_maintenance5 */
    props->earlyFragmentMultisampleCoverageAfterSampleCounting = true;
    props->earlyFragmentSampleMaskTestBeforeSampleCounting = true;
-   props->depthStencilSwizzleOneSupport = true;
+   props->depthStencilSwizzleOneSupport =
+      pdevice->info->props.has_z24uint_s8uint && pdevice->instance->drirc.misc.enable_d24s8_border_color_workaround;
    props->polygonModePointSize = true;
    props->nonStrictWideLinesUseParallelogram = false;
    props->nonStrictSinglePixelWideLinesUseParallelogram = false;
@@ -1421,6 +1546,12 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxDescriptorSetUpdateAfterBindTotalBuffersDynamic =
       MAX_DYNAMIC_UNIFORM_BUFFERS + MAX_DYNAMIC_STORAGE_BUFFERS;
 
+   /* VK_KHR_maintenance9 */
+   /* We don't support sparse 3D images */
+   props->image2DViewOf3DSparse = false;
+   props->defaultVertexAttributeValue =
+      VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ZERO_KHR;
+
    /* VK_EXT_host_image_copy */
 
    /* We don't use the layouts ATM so just report all layouts from
@@ -1444,38 +1575,40 @@ tu_get_properties(struct tu_physical_device *pdevice,
       VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
       VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
       VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+      VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR,
       VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+      VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ,
    };
 
-   props->pCopySrcLayouts = (VkImageLayout *)supported_layouts;
+   props->pCopySrcLayouts = const_cast<VkImageLayout *>(supported_layouts);
    props->copySrcLayoutCount = ARRAY_SIZE(supported_layouts);
-   props->pCopyDstLayouts = (VkImageLayout *)supported_layouts;
+   props->pCopyDstLayouts = const_cast<VkImageLayout *>(supported_layouts);
    props->copyDstLayoutCount = ARRAY_SIZE(supported_layouts);
 
    /* We're a UMR so we can always map every kind of memory */
    props->identicalMemoryTypeRequirements = true;
 
    {
-      struct mesa_sha1 sha1_ctx;
-      uint8_t sha1[SHA1_DIGEST_LENGTH];
+      blake3_hasher blake3_ctx;
+      uint8_t blake3[BLAKE3_KEY_LEN];
 
-      _mesa_sha1_init(&sha1_ctx);
+      _mesa_blake3_init(&blake3_ctx);
 
       /* Make sure we don't match with other vendors */
       const char *driver = "turnip-v1";
-      _mesa_sha1_update(&sha1_ctx, driver, strlen(driver));
+      _mesa_blake3_update(&blake3_ctx, driver, strlen(driver));
 
       /* Hash in UBWC configuration */
-      _mesa_sha1_update(&sha1_ctx, &pdevice->ubwc_config.highest_bank_bit,
+      _mesa_blake3_update(&blake3_ctx, &pdevice->ubwc_config.highest_bank_bit,
                         sizeof(pdevice->ubwc_config.highest_bank_bit));
-      _mesa_sha1_update(&sha1_ctx, &pdevice->ubwc_config.bank_swizzle_levels,
+      _mesa_blake3_update(&blake3_ctx, &pdevice->ubwc_config.bank_swizzle_levels,
                         sizeof(pdevice->ubwc_config.bank_swizzle_levels));
-      _mesa_sha1_update(&sha1_ctx, &pdevice->ubwc_config.macrotile_mode,
+      _mesa_blake3_update(&blake3_ctx, &pdevice->ubwc_config.macrotile_mode,
                         sizeof(pdevice->ubwc_config.macrotile_mode));
 
-      _mesa_sha1_final(&sha1_ctx, sha1);
+      _mesa_blake3_final(&blake3_ctx, blake3);
 
-      memcpy(props->optimalTilingLayoutUUID, sha1, VK_UUID_SIZE);
+      memcpy(props->optimalTilingLayoutUUID, blake3, VK_UUID_SIZE);
    }
 
    /* VK_KHR_acceleration_structure */
@@ -1499,13 +1632,37 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->fullyCoveredFragmentShaderInputVariable = false;
    props->conservativeRasterizationPostDepthCoverage = false;
 
-   /* VK_QCOM_fragment_density_map_offset */
+   /* VK_EXT_fragment_density_map_offset */
    props->fragmentDensityOffsetGranularity = (VkExtent2D) { 
       TU_FDM_OFFSET_GRANULARITY, TU_FDM_OFFSET_GRANULARITY
    };
 
    /* VK_VALVE_fragment_density_map_layered */
    props->maxFragmentDensityMapLayers = MAX_VIEWS;
+
+   /* VK_QCOM_image_processing */
+   props->maxWeightFilterPhases = 1024;
+   props->maxWeightFilterDimension =
+      pdevice->vk.supported_extensions.QCOM_image_processing
+         ? (VkExtent2D) { 64, 64 }
+         : (VkExtent2D) { 0, 0 };
+   props->maxBlockMatchRegion =
+      pdevice->vk.supported_extensions.QCOM_image_processing
+         ? (VkExtent2D) { 64, 64 }
+         : (VkExtent2D) { 0, 0 };
+   props->maxBoxFilterBlockSize =
+      pdevice->vk.supported_extensions.QCOM_image_processing
+         ? (VkExtent2D) { 64, 64 }
+         : (VkExtent2D) { 0, 0 };
+
+   /* VK_ANDROID_native_buffer */
+   props->sharedImage = vk_android_get_front_buffer_usage() != 0;
+
+   /* VALVE_buffer_device_address_allocation_alignment */
+   /* The limit is determined by kgsl, but there's not much point in exposing
+    * larger alignments anyway.
+    */
+   props->maxBufferDeviceAddressAllocationAlignment = 1 << 20;
 }
 
 static const struct vk_pipeline_cache_object_ops *const cache_import_ops[] = {
@@ -1594,7 +1751,7 @@ tu_physical_device_init(struct tu_physical_device *device,
                                      &device->config_gmem,
                                      &device->config_sysmem);
 
-      if (instance->reserve_descriptor_set) {
+      if (!instance->drirc.misc.dont_reserve_descriptor_set) {
          device->usable_sets = device->reserved_set_idx = device->info->props.max_sets - 1;
       } else {
          device->usable_sets = device->info->props.max_sets;
@@ -1607,15 +1764,21 @@ tu_physical_device_init(struct tu_physical_device *device,
                                  "device %s is unsupported", device->name);
       goto fail_free_name;
    }
+
+   tu_physical_device_compiler_options_init(device, instance);
+
    if (tu_device_get_cache_uuid(device, device->cache_uuid)) {
       result = vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                                  "cannot generate UUID");
       goto fail_free_name;
    }
 
+   device->expose_double_threadsize = info.props.supports_double_threadsize && !instance->drirc.misc.restrict_subgroup_size_64;
+
    device->level1_dcache_size = util_cache_granularity();
    device->has_cached_non_coherent_memory =
       device->level1_dcache_size > 0 && !DETECT_ARCH_ARM;
+   device->preferred_uncached_as_cached_index = -1;
 
    device->memory.type_count = 1;
    device->memory.types[0] =
@@ -1629,6 +1792,11 @@ tu_physical_device_init(struct tu_physical_device *device,
          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
          VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+      if (instance->drirc.misc.override_uncached_as_cache_coherent) {
+          /* Retain this memory type index to override later. */
+          device->preferred_uncached_as_cached_index = device->memory.type_count;
+      }
       device->memory.type_count++;
    }
 
@@ -1637,6 +1805,17 @@ tu_physical_device_init(struct tu_physical_device *device,
          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
          VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+      device->memory.type_count++;
+   }
+
+   /* We don't expose device local type by default to not be treated as
+    * non-UMA, e.g. vkd3d-proton considers GPU as UMA only when all memory
+    * types are HOST_VISIBLE. However, certain apps may unconditionally
+    * expect us having non-HOST_VISIBLE memory.
+    */
+   if (instance->drirc.misc.expose_device_local_only_memory_type) {
+      device->memory.types[device->memory.type_count] =
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
       device->memory.type_count++;
    }
 
@@ -1659,7 +1838,7 @@ tu_physical_device_init(struct tu_physical_device *device,
    }
    if (device->ubwc_config.macrotile_mode == FDL_MACROTILE_INVALID) {
       device->ubwc_config.macrotile_mode =
-         (enum fdl_macrotile_mode) info.macrotile_mode;
+         static_cast<enum fdl_macrotile_mode>(info.macrotile_mode);
    }
 
    fd_get_driver_uuid(device->driver_uuid);
@@ -1699,6 +1878,17 @@ tu_physical_device_init(struct tu_physical_device *device,
          };
    }
 
+   device->emulate_second_queue = -1;
+   if (instance->drirc.misc.emulate_second_queue) {
+      for (unsigned i = 0; i < device->num_queue_families; i++) {
+         if (device->queue_families[i].properties->queueFlags &
+             VK_QUEUE_GRAPHICS_BIT) {
+            device->emulate_second_queue = i;
+            break;
+         }
+      }
+   }
+
 #ifdef TU_USE_WSI_PLATFORM
    result = tu_wsi_init(device);
    if (result != VK_SUCCESS) {
@@ -1717,10 +1907,13 @@ tu_physical_device_init(struct tu_physical_device *device,
 
    device->vk.pipeline_cache_import_ops = cache_import_ops;
 
+   /* gen8 and onwards must use kernel UAPI for perfcntr management */
+   device->is_perf_cntr_selectable &= (device->info->chip <= 7);
+
    return VK_SUCCESS;
 
 fail_free_name:
-   vk_free(&instance->vk.alloc, (void *)device->name);
+   vk_free(&instance->vk.alloc, const_cast<char *>(device->name));
    return result;
 }
 
@@ -1739,7 +1932,7 @@ tu_physical_device_finish(struct tu_physical_device *device)
       close(device->kgsl_dma_fd);
 
    disk_cache_destroy(device->vk.disk_cache);
-   vk_free(&device->instance->vk.alloc, (void *)device->name);
+   vk_free(&device->instance->vk.alloc, const_cast<char *>(device->name));
 
    vk_physical_device_finish(&device->vk);
 }
@@ -1747,64 +1940,28 @@ tu_physical_device_finish(struct tu_physical_device *device)
 static void
 tu_destroy_physical_device(struct vk_physical_device *device)
 {
-   tu_physical_device_finish((struct tu_physical_device *) device);
+   tu_physical_device_finish(reinterpret_cast<struct tu_physical_device *>(device));
    vk_free(&device->instance->alloc, device);
 }
-
-static const driOptionDescription tu_dri_options[] = {
-   DRI_CONF_SECTION_PERFORMANCE
-      DRI_CONF_VK_X11_OVERRIDE_MIN_IMAGE_COUNT(0)
-      DRI_CONF_VK_X11_STRICT_IMAGE_COUNT(false)
-      DRI_CONF_VK_X11_ENSURE_MIN_IMAGE_COUNT(false)
-      DRI_CONF_VK_XWAYLAND_WAIT_READY(false)
-   DRI_CONF_SECTION_END
-
-   DRI_CONF_SECTION_DEBUG
-      DRI_CONF_FORCE_VK_VENDOR()
-      DRI_CONF_VK_WSI_FORCE_BGRA8_UNORM_FIRST(false)
-      DRI_CONF_VK_WSI_FORCE_SWAPCHAIN_TO_CURRENT_EXTENT(false)
-      DRI_CONF_VK_X11_IGNORE_SUBOPTIMAL(false)
-      DRI_CONF_VK_DONT_CARE_AS_LOAD(false)
-   DRI_CONF_SECTION_END
-
-   DRI_CONF_SECTION_MISCELLANEOUS
-      DRI_CONF_DISABLE_CONSERVATIVE_LRZ(false)
-      DRI_CONF_TU_DONT_RESERVE_DESCRIPTOR_SET(false)
-      DRI_CONF_TU_ALLOW_OOB_INDIRECT_UBO_LOADS(false)
-      DRI_CONF_TU_DISABLE_D24S8_BORDER_COLOR_WORKAROUND(false)
-      DRI_CONF_TU_USE_TEX_COORD_ROUND_NEAREST_EVEN_MODE(false)
-      DRI_CONF_TU_IGNORE_FRAG_DEPTH_DIRECTION(false)
-      DRI_CONF_TU_ENABLE_SOFTFLOAT32(false)
-   DRI_CONF_SECTION_END
-};
 
 static void
 tu_init_dri_options(struct tu_instance *instance)
 {
-   driParseOptionInfo(&instance->available_dri_options, tu_dri_options,
-                      ARRAY_SIZE(tu_dri_options));
-   driParseConfigFiles(&instance->dri_options, &instance->available_dri_options, 0, "turnip", NULL, NULL,
-                       instance->vk.app_info.app_name, instance->vk.app_info.app_version,
-                       instance->vk.app_info.engine_name, instance->vk.app_info.engine_version);
+   driConfigFileParseParams params = {
+      .driverName = "turnip",
+      .applicationName = instance->vk.app_info.app_name,
+      .applicationVersion = instance->vk.app_info.app_version,
+      .engineName = instance->vk.app_info.engine_name,
+      .engineVersion = instance->vk.app_info.engine_version,
+      .logNonDefaultOptions = TU_DEBUG(STARTUP),
+   };
 
-   instance->force_vk_vendor =
-         driQueryOptioni(&instance->dri_options, "force_vk_vendor");
-   instance->dont_care_as_load =
-         driQueryOptionb(&instance->dri_options, "vk_dont_care_as_load");
-   instance->conservative_lrz =
-         !driQueryOptionb(&instance->dri_options, "disable_conservative_lrz");
-   instance->reserve_descriptor_set =
-         !driQueryOptionb(&instance->dri_options, "tu_dont_reserve_descriptor_set");
-   instance->allow_oob_indirect_ubo_loads =
-         driQueryOptionb(&instance->dri_options, "tu_allow_oob_indirect_ubo_loads");
-   instance->disable_d24s8_border_color_workaround =
-         driQueryOptionb(&instance->dri_options, "tu_disable_d24s8_border_color_workaround");
-   instance->use_tex_coord_round_nearest_even_mode =
-         driQueryOptionb(&instance->dri_options, "tu_use_tex_coord_round_nearest_even_mode");
-   instance->ignore_frag_depth_direction =
-         driQueryOptionb(&instance->dri_options, "tu_ignore_frag_depth_direction");
-   instance->enable_softfloat32 =
-         driQueryOptionb(&instance->dri_options, "tu_enable_softfloat32");
+   turnip_parse_dri_options(&instance->drirc, &params);
+
+   if (TU_DEBUG(NO_CONCURRENT_BINNING))
+      instance->drirc.perf.allow_concurrent_binning = false;
+   if (TU_DEBUG(FORCE_CONCURRENT_BINNING))
+      instance->drirc.perf.allow_concurrent_binning = true;
 }
 
 static uint32_t instance_count = 0;
@@ -1824,8 +1981,8 @@ tu_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    if (pAllocator == NULL)
       pAllocator = vk_default_allocator();
 
-   instance = (struct tu_instance *) vk_zalloc(
-      pAllocator, sizeof(*instance), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   instance = static_cast<struct tu_instance *>(vk_zalloc(
+      pAllocator, sizeof(*instance), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE));
 
    if (!instance)
       return vk_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1880,8 +2037,8 @@ tu_DestroyInstance(VkInstance _instance,
 
    VG(VALGRIND_DESTROY_MEMPOOL(instance));
 
-   driDestroyOptionCache(&instance->dri_options);
-   driDestroyOptionInfo(&instance->available_dri_options);
+   driDestroyOptionCache(&instance->drirc.options);
+   driDestroyOptionInfo(&instance->drirc.available_options);
 
    vk_instance_finish(&instance->vk);
    vk_free(&instance->vk.alloc, instance);
@@ -1942,13 +2099,26 @@ tu_GetPhysicalDeviceQueueFamilyProperties2(
       vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
          p->queueFamilyProperties = *family->properties;
 
-         vk_foreach_struct(ext, p->pNext) {
-            switch (ext->sType) {
+         if (pdevice->emulate_second_queue == static_cast<int>(i))
+            p->queueFamilyProperties.queueCount = 2;
+
+         vk_foreach_struct(sType, ext, p->pNext) {
+            switch (sType) {
             case VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR: {
                VkQueueFamilyGlobalPriorityPropertiesKHR *props =
-                  (VkQueueFamilyGlobalPriorityPropertiesKHR *) ext;
+                  static_cast<VkQueueFamilyGlobalPriorityPropertiesKHR *>(ext);
                tu_physical_device_get_global_priority_properties(
                   pdevice, family->type, props);
+               break;
+            }
+            case VK_STRUCTURE_TYPE_QUEUE_FAMILY_OWNERSHIP_TRANSFER_PROPERTIES_KHR: {
+               VkQueueFamilyOwnershipTransferPropertiesKHR *props =
+                  static_cast<VkQueueFamilyOwnershipTransferPropertiesKHR *>(ext);
+               /* We don't do anything with queue family ownership, so we can
+                * trivially implictly transfer to everything.
+                */
+               props->optimalImageTransferToQueueFamilies =
+                  (1u << pdevice->num_queue_families) - 1;
                break;
             }
             default:
@@ -1962,19 +2132,10 @@ tu_GetPhysicalDeviceQueueFamilyProperties2(
 uint64_t
 tu_get_system_heap_size(struct tu_physical_device *physical_device)
 {
-   uint64_t total_ram = 0;
-   ASSERTED bool has_physical_memory =
-      os_get_total_physical_memory(&total_ram);
-   assert(has_physical_memory);
+   float *percent = &physical_device->instance->drirc.misc.heap_memory_percent;
 
-   /* We don't want to burn too much ram with the GPU.  If the user has 4GiB
-    * or less, we use at most half.  If they have more than 4GiB, we use 3/4.
-    */
-   uint64_t available_ram;
-   if (total_ram <= 4ull * 1024ull * 1024ull * 1024ull)
-      available_ram = total_ram / 2;
-   else
-      available_ram = total_ram * 3 / 4;
+   uint64_t available_ram = os_get_gpu_heap_size(*percent, percent);
+   assert(available_ram);
 
    if (physical_device->va_size)
       available_ram = MIN2(available_ram, physical_device->va_size);
@@ -1982,25 +2143,20 @@ tu_get_system_heap_size(struct tu_physical_device *physical_device)
    return available_ram;
 }
 
-static VkDeviceSize
-tu_get_budget_memory(struct tu_physical_device *physical_device)
+static inline VkDeviceSize
+tu_get_budget_memory(struct tu_physical_device *physical_device, uint64_t heap_used)
 {
    uint64_t heap_size = physical_device->heap.size;
-   uint64_t heap_used = physical_device->heap.used;
-   uint64_t sys_available;
-   ASSERTED bool has_available_memory =
-      os_get_available_system_memory(&sys_available);
-   assert(has_available_memory);
-
-   if (physical_device->va_size)
-      sys_available = MIN2(sys_available, physical_device->va_size);
 
    /*
     * Let's not incite the app to starve the system: report at most 90% of
     * available system memory.
     */
-   uint64_t heap_available = sys_available * 9 / 10;
-   return MIN2(heap_size, heap_used + heap_available);
+   const float percent = 0.9f;
+
+   return vk_physical_device_heap_budget_from_system(&physical_device->vk,
+                                                     percent, heap_size,
+                                                     heap_used);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2022,14 +2178,14 @@ tu_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pdev,
       };
    }
 
-   vk_foreach_struct(ext, props2->pNext)
+   vk_foreach_struct(sType, ext, props2->pNext)
    {
-      switch (ext->sType) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
          VkPhysicalDeviceMemoryBudgetPropertiesEXT *memory_budget_props =
-            (VkPhysicalDeviceMemoryBudgetPropertiesEXT *) ext;
-         memory_budget_props->heapUsage[0] = physical_device->heap.used;
-         memory_budget_props->heapBudget[0] = tu_get_budget_memory(physical_device);
+            static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT *>(ext);
+         memory_budget_props->heapUsage[0] = p_atomic_read(&physical_device->heap.used);
+         memory_budget_props->heapBudget[0] = tu_get_budget_memory(physical_device, memory_budget_props->heapUsage[0]);
 
          /* The heapBudget and heapUsage values must be zero for array elements
           * greater than or equal to VkPhysicalDeviceMemoryProperties::memoryHeapCount
@@ -2060,7 +2216,7 @@ tu_GetPhysicalDeviceFragmentShadingRatesKHR(
    {                                                                                \
       VkPhysicalDeviceFragmentShadingRateKHR rate = {                               \
          .sType =                                                                   \
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR, \
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR,            \
          .sampleCounts = s,                                                         \
          .fragmentSize = { .width = w, .height = h },                               \
       };                                                                            \
@@ -2086,11 +2242,7 @@ tu_GetPhysicalDeviceFragmentShadingRatesKHR(
 uint64_t
 tu_device_ticks_to_ns(struct tu_device *dev, uint64_t ts)
 {
-   /* This is based on the 19.2MHz always-on rbbm timer.
-    *
-    * TODO we should probably query this value from kernel..
-    */
-   return ts * (1000000000 / 19200000);
+   return fd_ticks_to_ns(ts);
 }
 
 struct u_trace_context *
@@ -2108,17 +2260,17 @@ tu_trace_create_buffer(struct u_trace_context *utctx, uint64_t size_B)
    mtx_lock(&device->trace_mutex);
 
    if (!device->trace_suballoc) {
-      device->trace_suballoc = (struct tu_suballocator *) vk_zalloc(
+      device->trace_suballoc = static_cast<struct tu_suballocator *>(vk_zalloc(
          &device->vk.alloc, sizeof(struct tu_suballocator), 8,
-         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
       tu_bo_suballocator_init(device->trace_suballoc, device, 512 * 1024,
                               TU_BO_ALLOC_INTERNAL_RESOURCE, "utrace");
    }
 
-   struct tu_suballoc_bo *suballoc_bo = (struct tu_suballoc_bo *) vk_zalloc(
+   struct tu_suballoc_bo *suballoc_bo = static_cast<struct tu_suballoc_bo *>(vk_zalloc(
       &device->vk.alloc, sizeof(struct tu_suballoc_bo), 8,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    VkResult result =
       tu_suballoc_bo_alloc(suballoc_bo, device->trace_suballoc, size_B, 1);
@@ -2133,7 +2285,7 @@ tu_trace_destroy_buffer(struct u_trace_context *utctx, void *timestamps)
 {
    struct tu_device *device =
       container_of(utctx, struct tu_device, trace_context);
-   struct tu_suballoc_bo *bo = (struct tu_suballoc_bo *) timestamps;
+   struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(timestamps);
 
    static_assert(U_TRACE_NO_TIMESTAMP == 0);
    /* Newly allocated timestamp buffers are expected to be filled with
@@ -2151,12 +2303,12 @@ tu_trace_destroy_buffer(struct u_trace_context *utctx, void *timestamps)
 }
 
 template <chip CHIP>
-static void
+static bool
 tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
                    uint64_t offset_B, uint32_t)
 {
-   struct tu_suballoc_bo *bo = (struct tu_suballoc_bo *) timestamps;
-   struct tu_cs *ts_cs = (struct tu_cs *) cs;
+   struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(timestamps);
+   struct tu_cs *ts_cs = static_cast<struct tu_cs *>(cs);
 
    if (CHIP == A6XX) {
       tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
@@ -2173,6 +2325,8 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
                            .value);
       tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
    }
+
+   return true;
 }
 
 static uint64_t
@@ -2182,9 +2336,9 @@ tu_trace_read_ts(struct u_trace_context *utctx,
 {
    struct tu_device *device =
       container_of(utctx, struct tu_device, trace_context);
-   struct tu_suballoc_bo *bo = (struct tu_suballoc_bo *) timestamps;
+   struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(timestamps);
    struct tu_u_trace_submission_data *submission_data =
-      (struct tu_u_trace_submission_data *) flush_data;
+      static_cast<struct tu_u_trace_submission_data *>(flush_data);
 
    /* Only need to stall on results for the first entry: */
    if (offset_B == 0) {
@@ -2192,7 +2346,8 @@ tu_trace_read_ts(struct u_trace_context *utctx,
                           1000000000);
    }
 
-   uint64_t *ts = (uint64_t *) ((char *) tu_suballoc_bo_map(bo) + offset_B);
+   uint64_t *ts = reinterpret_cast<uint64_t *>(
+      static_cast<char *>(tu_suballoc_bo_map(bo)) + offset_B);
 
    /* Don't translate the no-timestamp marker: */
    if (*ts == U_TRACE_NO_TIMESTAMP)
@@ -2207,7 +2362,7 @@ tu_trace_delete_flush_data(struct u_trace_context *utctx, void *flush_data)
    struct tu_device *device =
       container_of(utctx, struct tu_device, trace_context);
    struct tu_u_trace_submission_data *submission_data =
-      (struct tu_u_trace_submission_data *) flush_data;
+      static_cast<struct tu_u_trace_submission_data *>(flush_data);
 
    tu_u_trace_submission_data_finish(device, submission_data);
 }
@@ -2218,14 +2373,14 @@ tu_copy_buffer(struct u_trace_context *utctx, void *cmdstream,
                void *ts_to, uint64_t to_offset_B,
                uint64_t size_B)
 {
-   struct tu_cs *cs = (struct tu_cs *) cmdstream;
+   struct tu_cs *cs = static_cast<struct tu_cs *>(cmdstream);
    uint64_t src_iova = from_offset_B;
    if (ts_from) {
-      struct tu_suballoc_bo *bo_from = (struct tu_suballoc_bo *) ts_from;
+      struct tu_suballoc_bo *bo_from = static_cast<struct tu_suballoc_bo *>(ts_from);
       src_iova = bo_from->iova + from_offset_B;
    }
 
-   struct tu_suballoc_bo *bo_to = (struct tu_suballoc_bo *) ts_to;
+   struct tu_suballoc_bo *bo_to = static_cast<struct tu_suballoc_bo *>(ts_to);
 
    tu_cs_emit_pkt7(cs, CP_MEMCPY, 5);
    tu_cs_emit(cs, size_B / sizeof(uint32_t));
@@ -2254,8 +2409,8 @@ tu_trace_get_data(struct u_trace_context *utctx,
                   uint64_t offset_B,
                   uint32_t size_B)
 {
-   struct tu_suballoc_bo *bo = (struct tu_suballoc_bo *) buffer;
-   return (char *) tu_suballoc_bo_map(bo) + offset_B;
+   struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(buffer);
+   return static_cast<char *>(tu_suballoc_bo_map(bo)) + offset_B;
 }
 
 VkResult
@@ -2280,9 +2435,9 @@ tu_create_copy_timestamp_cs(struct tu_u_trace_submission_data *submission_data,
 
    if (!submission_data->timestamp_copy_data) {
       submission_data->timestamp_copy_data =
-         (struct tu_copy_timestamp_data *) vk_zalloc(
+         static_cast<struct tu_copy_timestamp_data *>(vk_zalloc(
             &device->vk.alloc, sizeof(struct tu_copy_timestamp_data), 8,
-            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
       tu_cs_init(&submission_data->timestamp_copy_data->cs, device,
                  TU_CS_MODE_GROW, cs_size, "trace copy timestamp cs");
@@ -2324,10 +2479,10 @@ tu_u_trace_submission_data_create(
    struct tu_u_trace_submission_data **submission_data)
 {
    MESA_TRACE_FUNC();
-   *submission_data = (struct tu_u_trace_submission_data *)
+   *submission_data = static_cast<struct tu_u_trace_submission_data *>(
       vk_zalloc(&device->vk.alloc,
                 sizeof(struct tu_u_trace_submission_data), 8,
-                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    if (!(*submission_data)) {
       return vk_error(device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -2336,10 +2491,10 @@ tu_u_trace_submission_data_create(
    struct tu_u_trace_submission_data *data = *submission_data;
    uint32_t trace_chunks_to_copy = 0;
 
-   data->trace_per_cmd_buffer = (struct u_trace **) vk_zalloc(
+   data->trace_per_cmd_buffer = static_cast<struct u_trace **>(vk_zalloc(
       &device->vk.alloc,
       cmd_buffer_count * sizeof(struct u_trace *), 8,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    if (!data->trace_per_cmd_buffer) {
       goto fail;
@@ -2362,7 +2517,8 @@ tu_u_trace_submission_data_create(
           * single-use. Therefor we have to copy trace points and create
           * a new timestamp buffer on every submit of reusable command buffer.
           */
-         trace_chunks_to_copy += list_length(&cmdbuf->trace.trace_chunks);
+         trace_chunks_to_copy += u_trace_clone_append_copy_count(
+            u_trace_begin_iterator(&cmdbuf->trace), u_trace_end_iterator(&cmdbuf->trace));
       } else {
          data->trace_per_cmd_buffer[i] = &cmdbuf->trace;
       }
@@ -2382,7 +2538,7 @@ fail:
    return vk_error(device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 }
 
-void
+static void
 tu_free_copy_timestamp_data(struct tu_device *device,
                             struct tu_copy_timestamp_data *data)
 {
@@ -2402,6 +2558,8 @@ tu_u_trace_submission_data_finish(
       if (u_trace_enabled(&device->trace_context)) {
          tu_cs_reset(&submission_data->timestamp_copy_data->cs);
          u_trace_fini(&submission_data->timestamp_copy_data->trace);
+         u_trace_init(&submission_data->timestamp_copy_data->trace,
+                      &device->trace_context);
 
          mtx_lock(&device->copy_timestamp_cs_pool_mutex);
          list_addtail(&submission_data->timestamp_copy_data->node,
@@ -2444,24 +2602,10 @@ static const struct debug_named_value tu_reg_stomper_options[] = {
 };
 
 template <chip CHIP>
-static inline void
-tu_cs_dbg_stomp_regs(struct tu_cs *cs,
-                     bool is_rp_blit,
-                     uint32_t first_reg,
-                     uint32_t last_reg,
-                     bool inverse)
+static void
+stomp_regs(struct tu_cs *cs, const uint16_t *regs, size_t count,
+           uint32_t first_reg, uint32_t last_reg, bool inverse)
 {
-   const uint16_t *regs = NULL;
-   size_t count = 0;
-
-   if (is_rp_blit) {
-      regs = &RP_BLIT_REGS<CHIP>[0];
-      count = ARRAY_SIZE(RP_BLIT_REGS<CHIP>);
-   } else {
-      regs = &CMD_REGS<CHIP>[0];
-      count = ARRAY_SIZE(CMD_REGS<CHIP>);
-   }
-
    for (size_t i = 0; i < count; i++) {
       if (inverse) {
          if (regs[i] >= first_reg && regs[i] <= last_reg)
@@ -2473,6 +2617,30 @@ tu_cs_dbg_stomp_regs(struct tu_cs *cs,
 
       if (fd_reg_stomp_allowed(CHIP, regs[i]))
          tu_cs_emit_write_reg(cs, regs[i], 0xffffffff);
+   }
+}
+
+template <chip CHIP>
+static inline void
+tu_cs_dbg_stomp_regs(struct tu_cs *cs,
+                     bool is_rp_blit,
+                     uint32_t first_reg,
+                     uint32_t last_reg,
+                     bool inverse)
+{
+   if (is_rp_blit) {
+      stomp_regs<CHIP>(cs, &DRAW_REGS<CHIP>[0], ARRAY_SIZE(DRAW_REGS<CHIP>),
+                       first_reg, last_reg, inverse);
+      stomp_regs<CHIP>(cs, &BLIT_REGS<CHIP>[0], ARRAY_SIZE(BLIT_REGS<CHIP>),
+                       first_reg, last_reg, inverse);
+      stomp_regs<CHIP>(cs, &COMPUTE_REGS<CHIP>[0], ARRAY_SIZE(COMPUTE_REGS<CHIP>),
+                       first_reg, last_reg, inverse);
+      tu_init_hw_rp<CHIP>(cs);
+   } else {
+      stomp_regs<CHIP>(cs, &CMD_REGS<CHIP>[0], ARRAY_SIZE(CMD_REGS<CHIP>),
+                       first_reg, last_reg, inverse);
+      stomp_regs<CHIP>(cs, &RESOLVE_REGS<CHIP>[0], ARRAY_SIZE(RESOLVE_REGS<CHIP>),
+                       first_reg, last_reg, inverse);
    }
 }
 
@@ -2499,7 +2667,7 @@ tu_init_dbg_reg_stomper(struct tu_device *device)
 
    if (debug_flags & TU_DEBUG_REG_STOMP_CMDBUF) {
       struct tu_cs *cmdbuf_cs =
-         (struct tu_cs *) calloc(1, sizeof(struct tu_cs));
+         static_cast<struct tu_cs *>(calloc(1, sizeof(struct tu_cs)));
       tu_cs_init(cmdbuf_cs, device, TU_CS_MODE_GROW, 4096,
                  "cmdbuf reg stomp cs");
       tu_cs_begin(cmdbuf_cs);
@@ -2510,7 +2678,7 @@ tu_init_dbg_reg_stomper(struct tu_device *device)
    }
 
    if (debug_flags & TU_DEBUG_REG_STOMP_RENDERPASS) {
-      struct tu_cs *rp_cs = (struct tu_cs *) calloc(1, sizeof(struct tu_cs));
+      struct tu_cs *rp_cs = static_cast<struct tu_cs *>(calloc(1, sizeof(struct tu_cs)));
       tu_cs_init(rp_cs, device, TU_CS_MODE_GROW, 4096, "rp reg stomp cs");
       tu_cs_begin(rp_cs);
 
@@ -2523,10 +2691,12 @@ tu_init_dbg_reg_stomper(struct tu_device *device)
 
 /* It is unknown what this workaround is for and what it fixes. */
 static VkResult
-tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+tu_init_cmdbuf_QCTDD09112208(struct tu_device *device)
 {
    struct tu_cs shader_cs;
-   tu_cs_begin_sub_stream(&device->sub_cs, 10, &shader_cs);
+   VkResult result = tu_cs_begin_sub_stream(&device->sub_cs, 10, &shader_cs);
+   if (result != VK_SUCCESS)
+      return result;
 
    uint32_t raw_shader[] = {
       0x00040000, 0x40600000, // mul.f hr0.x, hr0.x, hr1.x
@@ -2538,10 +2708,14 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
 
    tu_cs_emit_array(&shader_cs, raw_shader, ARRAY_SIZE(raw_shader));
    struct tu_cs_entry shader_entry = tu_cs_end_sub_stream(&device->sub_cs, &shader_cs);
+   if (!shader_entry.bo)
+      return tu_cs_get_status(&device->sub_cs);
    uint64_t shader_iova = shader_entry.bo->iova + shader_entry.offset;
 
    struct tu_cs sub_cs;
-   tu_cs_begin_sub_stream(&device->sub_cs, 47, &sub_cs);
+   result = tu_cs_begin_sub_stream(&device->sub_cs, 47, &sub_cs);
+   if (result != VK_SUCCESS)
+      return result;
 
    tu_cs_emit_regs(&sub_cs, SP_UPDATE_CNTL(A7XX,
             .vs_state = true, .hs_state = true, .ds_state = true,
@@ -2604,7 +2778,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
    tu_cs_emit(&sub_cs, CP_EXEC_CS_2_NGROUPS_Y(1));
    tu_cs_emit(&sub_cs, CP_EXEC_CS_3_NGROUPS_Z(1));
 
-   device->cmdbuf_start_a725_quirk_entry =
+   device->cmdbuf_QCTDD09112208_cmdbuf_start_cs_entry =
       tu_cs_end_sub_stream(&device->sub_cs, &sub_cs);
 
    return VK_SUCCESS;
@@ -2618,23 +2792,21 @@ tu_device_get_timestamp(struct vk_device *vk_device, uint64_t *timestamp)
    return ret == 0 ? VK_SUCCESS : VK_ERROR_UNKNOWN;
 }
 
-void
+static void
 tu_device_destroy_mutexes(struct tu_device *device)
 {
    mtx_destroy(&device->bo_mutex);
    mtx_destroy(&device->pipeline_mutex);
-   mtx_destroy(&device->autotune_mutex);
    mtx_destroy(&device->kgsl_profiling_mutex);
    mtx_destroy(&device->event_mutex);
    mtx_destroy(&device->trace_mutex);
-   mtx_destroy(&device->radix_sort_mutex);
    mtx_destroy(&device->fiber_pvtmem_bo.mtx);
    mtx_destroy(&device->wave_pvtmem_bo.mtx);
+   mtx_destroy(&device->vis_stream_mtx);
+   mtx_destroy(&device->vis_stream_suballocator_mtx);
    mtx_destroy(&device->mutex);
    mtx_destroy(&device->copy_timestamp_cs_pool_mutex);
-#ifdef HAVE_PERFETTO
-   mtx_destroy(&device->perfetto.pending_clocks_sync_mtx);
-#endif
+   mtx_destroy(&device->softfloat_mutex);
    for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos); i++)
       mtx_destroy(&device->scratch_bos[i].construct_mtx);
 
@@ -2657,12 +2829,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    VkResult result;
    struct tu_device *device;
    bool border_color_without_format = false;
+   bool autotune_disable_preempt_optimize = false;
 
-   vk_foreach_struct_const (ext, pCreateInfo->pNext) {
-      switch (ext->sType) {
+   vk_foreach_struct_const (sType, ext, pCreateInfo->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT:
          border_color_without_format =
-            ((const VkPhysicalDeviceCustomBorderColorFeaturesEXT *) ext)
+            static_cast<const VkPhysicalDeviceCustomBorderColorFeaturesEXT *>(ext)
                ->customBorderColorWithoutFormat;
          break;
       default:
@@ -2670,9 +2843,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
-   device = (struct tu_device *) vk_zalloc2(
+   device = static_cast<struct tu_device *>(vk_zalloc2(
       &physical_device->instance->vk.alloc, pAllocator, sizeof(*device), 8,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
    if (!device)
       return vk_startup_errorf(physical_device->instance, VK_ERROR_OUT_OF_HOST_MEMORY, "OOM");
 
@@ -2698,15 +2871,20 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
          &dispatch_table, &tu_device_entrypoints_a7xx, false);
       break;
    case 8:
-      /* gen8 TODO: */
-      tu_env.debug |= TU_DEBUG_NOLRZ;     /* WRITE iova faults from UCHE */
-      tu_env.debug |= TU_DEBUG_FLUSHALL;  /* dEQP-VK.draw.\*from_compute\* */
       vk_device_dispatch_table_from_entrypoints(
          &dispatch_table, &tu_device_entrypoints_a8xx, false);
    }
 
    vk_device_dispatch_table_from_entrypoints(
       &dispatch_table, &wsi_device_entrypoints, false);
+
+   /* Devices without HW multiview emulate it by replaying each draw once per
+    * view, which is done by wrapping the draw entrypoints.
+    */
+   if (!physical_device->info->props.has_hw_multiview) {
+      tu_install_sw_multiview_draw_entrypoints(&dispatch_table,
+                                               physical_device->info);
+   }
 
    const struct vk_device_entrypoint_table *knl_device_entrypoints =
          physical_device->instance->knl->device_entrypoints;
@@ -2740,11 +2918,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    mtx_init(&device->bo_mutex, mtx_plain);
    mtx_init(&device->pipeline_mutex, mtx_plain);
-   mtx_init(&device->autotune_mutex, mtx_plain);
    mtx_init(&device->kgsl_profiling_mutex, mtx_plain);
    mtx_init(&device->event_mutex, mtx_plain);
    mtx_init(&device->trace_mutex, mtx_plain);
-   mtx_init(&device->radix_sort_mutex, mtx_plain);
    mtx_init(&device->fiber_pvtmem_bo.mtx, mtx_plain);
    mtx_init(&device->wave_pvtmem_bo.mtx, mtx_plain);
    mtx_init(&device->vis_stream_mtx, mtx_plain);
@@ -2753,7 +2929,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    mtx_init(&device->copy_timestamp_cs_pool_mutex, mtx_plain);
    mtx_init(&device->softfloat_mutex, mtx_plain);
 #ifdef HAVE_PERFETTO
-   mtx_init(&device->perfetto.pending_clocks_sync_mtx, mtx_plain);
+   tu_perfetto_init_state(&device->perfetto);
 #endif
    for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos); i++)
       mtx_init(&device->scratch_bos[i].construct_mtx, mtx_plain);
@@ -2786,12 +2962,19 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       const VkDeviceQueueCreateInfo *queue_create =
          &pCreateInfo->pQueueCreateInfos[i];
+      const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
+         vk_find_struct_const(queue_create->pNext,
+               DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
+      const VkQueueGlobalPriorityKHR global_priority = priority_info ?
+         priority_info->globalPriority :
+         (TU_DEBUG(HIPRIO) ? VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR :
+          VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
       uint32_t qfi = queue_create->queueFamilyIndex;
       enum tu_queue_type type = physical_device->queue_families[qfi].type;
-      device->queues[qfi] = (struct tu_queue *) vk_alloc(
+      device->queues[qfi] = static_cast<struct tu_queue *>(vk_alloc(
          &device->vk.alloc,
          queue_create->queueCount * sizeof(struct tu_queue), 8,
-         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
       if (!device->queues[qfi]) {
          result = vk_startup_errorf(physical_device->instance,
                                     VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -2805,13 +2988,23 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       device->queue_count[qfi] = queue_create->queueCount;
 
       for (unsigned q = 0; q < queue_create->queueCount; q++) {
-         result = tu_queue_init(device, &device->queues[qfi][q], type, q,
-                                queue_create);
+         /* For the emulated second queue, share the first queue's kernel
+          * submitqueue rather than creating a new one.
+          */
+         bool emulated = (q > 0 &&
+                          static_cast<int>(qfi) == physical_device->emulate_second_queue);
+
+         result = tu_queue_init(device, &device->queues[qfi][q], type,
+                                global_priority, q, queue_create,
+                                emulated ? &device->queues[qfi][0] : NULL);
          if (result != VK_SUCCESS) {
             device->queue_count[qfi] = q;
             goto fail_queues;
          }
       }
+
+      autotune_disable_preempt_optimize |=
+         (global_priority == VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR);
    }
 
    result = vk_meta_device_init(&device->vk, &device->meta);
@@ -2852,22 +3045,28 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
-   /* initial sizes, these will increase if there is overflow */
-   device->vsc_draw_strm_pitch = 0x1000 + VSC_PAD;
-   device->vsc_prim_strm_pitch = 0x4000 + VSC_PAD;
+   /* initial sizes, these will increase if there is overflow.  If GMEM_WARMUP
+    * is set, we pre-allocate a large VSC space so that performance testing can
+    * get real data for GMEM without having to loop frames too many times.
+    */
+   if (TU_DEBUG(GMEM_WARMUP)) {
+      device->vsc_draw_strm_pitch = 0x4000  + VSC_PAD;
+      device->vsc_prim_strm_pitch = 0x80000 + VSC_PAD;
+   } else {
+      device->vsc_draw_strm_pitch = 0x1000 + VSC_PAD;
+      device->vsc_prim_strm_pitch = 0x4000 + VSC_PAD;
+   }
 
    if (device->vk.enabled_features.customBorderColors)
       global_size += TU_BORDER_COLOR_COUNT * sizeof(struct bcolor_entry);
 
    tu_bo_suballocator_init(
       &device->pipeline_suballoc, device, 128 * 1024,
-      (enum tu_bo_alloc_flags) (TU_BO_ALLOC_GPU_READ_ONLY |
-                                TU_BO_ALLOC_ALLOW_DUMP |
-                                TU_BO_ALLOC_INTERNAL_RESOURCE),
+      static_cast<enum tu_bo_alloc_flags>(TU_BO_ALLOC_GPU_READ_ONLY |
+                                          TU_BO_ALLOC_ALLOW_DUMP |
+                                          TU_BO_ALLOC_INTERNAL_RESOURCE |
+                                          tu_bo_ib_flags(device)),
       "pipeline_suballoc");
-   tu_bo_suballocator_init(&device->autotune_suballoc, device,
-                           128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,
-                           "autotune_suballoc");
    if (is_kgsl(physical_device->instance)) {
       tu_bo_suballocator_init(&device->kgsl_profiling_suballoc, device,
                               128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,
@@ -2881,14 +3080,14 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    tu_bo_suballocator_init(
       &device->vis_stream_suballocator, device,
       getpagesize(),
-      (enum tu_bo_alloc_flags)(TU_BO_ALLOC_INTERNAL_RESOURCE |
-                               TU_BO_ALLOC_ALLOW_DUMP),
+      static_cast<enum tu_bo_alloc_flags>(TU_BO_ALLOC_INTERNAL_RESOURCE |
+                                          TU_BO_ALLOC_ALLOW_DUMP),
       "vis_stream_suballoc");
 
    result = tu_bo_init_new(
       device, NULL, &device->global_bo, global_size,
-      (enum tu_bo_alloc_flags) (TU_BO_ALLOC_ALLOW_DUMP |
-                                TU_BO_ALLOC_INTERNAL_RESOURCE),
+      static_cast<enum tu_bo_alloc_flags>(TU_BO_ALLOC_ALLOW_DUMP |
+                                          TU_BO_ALLOC_INTERNAL_RESOURCE),
       "global");
    if (result != VK_SUCCESS) {
       vk_startup_errorf(device->instance, result, "BO init");
@@ -2901,7 +3100,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_global_bo_map;
    }
 
-   global = (struct tu6_global *)device->global_bo->map;
+   global = static_cast<struct tu6_global *>(device->global_bo->map);
    device->global_bo_map = global;
    tu_init_clear_blit_shaders(device);
 
@@ -2922,11 +3121,19 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    global->predicate = 0;
    global->vtx_stats_query_not_running = 1;
-   global->dbg_one = (uint32_t)-1;
+   global->dbg_one = static_cast<uint32_t>(-1);
    global->dbg_gmem_total_loads = 0;
    global->dbg_gmem_taken_loads = 0;
    global->dbg_gmem_total_stores = 0;
    global->dbg_gmem_taken_stores = 0;
+
+   global->zero_64b = 0;
+
+   for (int i = 0; i < TU_BORDER_COLOR_BUILTIN; i++) {
+      VkClearColorValue border_color = vk_border_color_value(static_cast<VkBorderColor>(i));
+      tu6_pack_border_color(&global->bcolor_builtin[i], &border_color,
+                            vk_border_color_is_int(static_cast<VkBorderColor>(i)));
+   }
 
    /* initialize to ones so ffs can be used to find unused slots */
    BITSET_ONES(device->custom_border_color);
@@ -2954,7 +3161,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
        */
 
       device->perfcntrs_pass_cs_entries =
-         (struct tu_cs_entry *) calloc(32, sizeof(struct tu_cs_entry));
+         static_cast<struct tu_cs_entry *>(calloc(32, sizeof(struct tu_cs_entry)));
       if (!device->perfcntrs_pass_cs_entries) {
          result = vk_startup_errorf(device->instance,
                VK_ERROR_OUT_OF_HOST_MEMORY, "OOM");
@@ -2979,14 +3186,29 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
+   device->perfcntrs = fd_perfcntr_state_alloc(
+      &physical_device->dev_id,
+      is_kgsl(physical_device->instance) ? -1 : device->fd);
+   if (!device->perfcntrs) {
+      result = vk_startup_errorf(device->instance, VK_ERROR_OUT_OF_HOST_MEMORY, "failed to allocate perfcounter state");
+      goto fail_autotune;
+   }
+
+   device->autotune = new tu_autotune(device, result);
+   if (result != VK_SUCCESS)
+      goto fail_autotune;
+
+   if (autotune_disable_preempt_optimize)
+      device->autotune->disable_preempt_optimize();
+
    result = tu_init_bin_preamble(device);
    if (result != VK_SUCCESS)
       goto fail_bin_preamble;
 
-   if (physical_device->info->props.cmdbuf_start_a725_quirk) {
-         result = tu_init_cmdbuf_start_a725_quirk(device);
+   if (FD_QUIRK(physical_device->info, QCTDD09112208_cmdbuf_start_cs)) {
+         result = tu_init_cmdbuf_QCTDD09112208(device);
          if (result != VK_SUCCESS)
-            goto fail_a725_workaround;
+            goto fail_QCTDD09112208_cmdbuf_start_cs;
    }
 
    tu_init_dbg_reg_stomper(device);
@@ -3015,15 +3237,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    }
    pthread_condattr_destroy(&condattr);
 
-   result = tu_autotune_init(&device->autotune, device);
-   if (result != VK_SUCCESS) {
-      goto fail_timeline_cond;
-   }
-
    device->use_z24uint_s8uint =
       physical_device->info->props.has_z24uint_s8uint &&
       (!border_color_without_format ||
-       physical_device->instance->disable_d24s8_border_color_workaround);
+       !physical_device->instance->drirc.misc.enable_d24s8_border_color_workaround);
    device->use_lrz = !TU_DEBUG_START(NOLRZ);
 
    tu_gpu_tracepoint_config_variable();
@@ -3075,8 +3292,11 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    return VK_SUCCESS;
 
 fail_timeline_cond:
-fail_a725_workaround:
+fail_QCTDD09112208_cmdbuf_start_cs:
 fail_bin_preamble:
+fail_autotune:
+   delete device->autotune;
+   fd_perfcntr_state_free(device->perfcntrs);
 fail_prepare_perfcntrs_pass_cs:
    free(device->perfcntrs_pass_cs_entries);
 fail_perfcntrs_pass_entries_alloc:
@@ -3107,12 +3327,15 @@ fail_compiler:
    vk_meta_device_finish(&device->vk, &device->meta);
 fail_queues:
    for (unsigned i = 0; i < TU_MAX_QUEUE_FAMILIES; i++) {
-      for (unsigned q = 0; q < device->queue_count[i]; q++)
+      for (int q = device->queue_count[i] - 1; q >= 0; q--)
          tu_queue_finish(&device->queues[i][q]);
       if (device->queues[i])
          vk_free(&device->vk.alloc, device->queues[i]);
    }
 
+#ifdef HAVE_PERFETTO
+   tu_perfetto_destroy_state(&device->perfetto);
+#endif
    tu_device_destroy_mutexes(device);
    tu_drm_device_finish(device);
    vk_device_finish(&device->vk);
@@ -3176,10 +3399,11 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       free(device->dbg_renderpass_stomp_cs);
    }
 
-   tu_autotune_fini(&device->autotune, device);
+   delete device->autotune;
+
+   fd_perfcntr_state_free(device->perfcntrs);
 
    tu_bo_suballocator_finish(&device->pipeline_suballoc);
-   tu_bo_suballocator_finish(&device->autotune_suballoc);
    tu_bo_suballocator_finish(&device->kgsl_profiling_suballoc);
    tu_bo_suballocator_finish(&device->event_suballoc);
    tu_bo_suballocator_finish(&device->vis_stream_suballocator);
@@ -3212,7 +3436,7 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       tu_destroy_memory(device, device->msrtss_depth_temporary);
 
    for (unsigned i = 0; i < TU_MAX_QUEUE_FAMILIES; i++) {
-      for (unsigned q = 0; q < device->queue_count[i]; q++)
+      for (int q = device->queue_count[i] - 1; q >= 0; q--)
          tu_queue_finish(&device->queues[i][q]);
       if (device->queue_count[i])
          vk_free(&device->vk.alloc, device->queues[i]);
@@ -3341,6 +3565,7 @@ _tu_init_memory(struct tu_device *device,
                 VkMemoryPropertyFlags mem_property,
                 enum tu_bo_alloc_flags alloc_flags,
                 VkDeviceSize size,
+                VkDeviceSize align,
                 VkDeviceAddress client_address,
                 const char *name)
 {
@@ -3355,11 +3580,11 @@ _tu_init_memory(struct tu_device *device,
       result = tu_sparse_vma_init(device, &mem->vk.base,
                                   &mem->lazy_vma, &mem->iova,
                                   sparse_flags,
-                                  size,
+                                  size, align,
                                   client_address);
    } else {
       result = tu_bo_init_new_explicit_iova(
-         device, &mem->vk.base, &mem->bo, size,
+         device, &mem->vk.base, &mem->bo, size, align,
          client_address, mem_property, alloc_flags, NULL, name);
    }
 
@@ -3375,8 +3600,8 @@ tu_create_memory(struct tu_device *device,
                  const char *name)
 {
    struct tu_device_memory *mem =
-      (struct tu_device_memory *) vk_object_zalloc(
-         &device->vk, NULL, sizeof(*mem), VK_OBJECT_TYPE_DEVICE_MEMORY);
+      static_cast<struct tu_device_memory *>(vk_object_zalloc(
+         &device->vk, NULL, sizeof(*mem), VK_OBJECT_TYPE_DEVICE_MEMORY));
 
    if (!mem)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3386,7 +3611,7 @@ tu_create_memory(struct tu_device *device,
    mem->refcnt = 1;
 
    VkResult result = _tu_init_memory(device, mem, mem_property, alloc_flags,
-                                     size, 0, name);
+                                     size, 0, 0, name);
 
    if (result != VK_SUCCESS) {
       vk_object_free(&device->vk, NULL, mem);
@@ -3441,6 +3666,40 @@ tu_destroy_memory(struct tu_device *device,
    vk_object_free(&device->vk, NULL, mem);
 }
 
+static void
+tu_memory_emit_report(struct tu_device *device,
+                      const struct tu_device_memory *mem,
+                      const VkMemoryAllocateInfo *alloc_info,
+                      VkResult result)
+{
+   const bool is_alloc = alloc_info != NULL;
+
+   if (result != VK_SUCCESS) {
+      vk_device_memory_report_emit(
+         &device->vk, result, is_alloc,
+         false, /* is_import */
+         0, /* mem_obj_id */
+         alloc_info->allocationSize,
+         VK_OBJECT_TYPE_DEVICE_MEMORY,
+         0, /* obj_handle */
+         0 /* heap_index */);
+      return;
+   }
+
+   /* Lazy memory may or may not have a BO at any given time, so it must
+    * not depend on mem->bo. Use the memory object itself for the id and
+    * the requested size, so the alloc and free reports always match.
+    */
+   const uint64_t mem_obj_id =
+      mem->lazy ? reinterpret_cast<uintptr_t>(mem) : mem->bo->unique_id;
+   const VkDeviceSize size = mem->lazy ? mem->vk.size : mem->bo->size;
+
+   vk_device_memory_report_emit(
+      &device->vk, result, is_alloc, mem->vk.import_handle_type != 0,
+      mem_obj_id, size, VK_OBJECT_TYPE_DEVICE_MEMORY,
+      reinterpret_cast<uintptr_t>(mem), 0 /* heap_index */);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_AllocateMemory(VkDevice _device,
                   const VkMemoryAllocateInfo *pAllocateInfo,
@@ -3458,8 +3717,8 @@ tu_AllocateMemory(VkDevice _device,
    if (mem_heap_used > mem_heap->size)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-   mem = (struct tu_device_memory *) vk_device_memory_create(
-      &device->vk, pAllocateInfo, pAllocator, sizeof(*mem));
+   mem = static_cast<struct tu_device_memory *>(vk_device_memory_create(
+      &device->vk, pAllocateInfo, pAllocator, sizeof(*mem)));
    if (mem == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -3473,8 +3732,23 @@ tu_AllocateMemory(VkDevice _device,
    mem->size = pAllocateInfo->allocationSize;
    mem->refcnt = 1;
 
+   BITMASK_ENUM(tu_bo_alloc_flags) alloc_flags = TU_BO_ALLOC_NO_FLAGS;
+
+   const VkMemoryAllocateFlagsInfo *flags_info = vk_find_struct_const(
+      pAllocateInfo->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
+   if (flags_info &&
+       (flags_info->flags &
+        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT)) {
+      alloc_flags |= TU_BO_ALLOC_REPLAYABLE;
+   }
+
    const VkImportMemoryFdInfoKHR *fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+
+   const VkBufferDeviceAddressAlignmentAllocateInfoVALVE *align_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           BUFFER_DEVICE_ADDRESS_ALIGNMENT_ALLOCATE_INFO_VALVE);
+   uint64_t alignment = align_info ? align_info->alignment : 0;
 
    if (fd_info && fd_info->handleType) {
       assert(fd_info->handleType ==
@@ -3487,8 +3761,9 @@ tu_AllocateMemory(VkDevice _device,
        * reference counting.  We need to maintain a per-instance handle-to-bo
        * table and add reference count to tu_bo.
        */
-      result = tu_bo_init_dmabuf(device, &mem->bo,
-                                 pAllocateInfo->allocationSize, fd_info->fd);
+      result =
+         tu_bo_init_dmabuf(device, &mem->bo, pAllocateInfo->allocationSize,
+                           alignment, alloc_flags, fd_info->fd);
       if (result == VK_SUCCESS) {
          /* take ownership and close the fd */
          close(fd_info->fd);
@@ -3498,27 +3773,19 @@ tu_AllocateMemory(VkDevice _device,
       const native_handle_t *handle = AHardwareBuffer_getNativeHandle(mem->vk.ahardware_buffer);
       assert(handle->numFds > 0);
       size_t size = lseek(handle->data[0], 0, SEEK_END);
-      result = tu_bo_init_dmabuf(device, &mem->bo, size, handle->data[0]);
+      result = tu_bo_init_dmabuf(device, &mem->bo, size, alignment, alloc_flags,
+                                 handle->data[0]);
 #else
       result = VK_ERROR_FEATURE_NOT_PRESENT;
 #endif
    } else {
       uint64_t client_address = 0;
-      BITMASK_ENUM(tu_bo_alloc_flags) alloc_flags = TU_BO_ALLOC_NO_FLAGS;
 
       const VkMemoryOpaqueCaptureAddressAllocateInfo *replay_info =
          vk_find_struct_const(pAllocateInfo->pNext,
                               MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
       if (replay_info && replay_info->opaqueCaptureAddress) {
          client_address = replay_info->opaqueCaptureAddress;
-         alloc_flags |= TU_BO_ALLOC_REPLAYABLE;
-      }
-
-      const VkMemoryAllocateFlagsInfo *flags_info = vk_find_struct_const(
-         pAllocateInfo->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
-      if (flags_info &&
-          (flags_info->flags &
-           VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT)) {
          alloc_flags |= TU_BO_ALLOC_REPLAYABLE;
       }
 
@@ -3534,15 +3801,16 @@ tu_AllocateMemory(VkDevice _device,
       if (wsi_info && wsi_info->implicit_sync)
          alloc_flags |= TU_BO_ALLOC_IMPLICIT_SYNC;
 
-      char name[64] = "vkAllocateMemory()";
+      char name[64] = "vkAlloc()";
       if (device->bo_sizes)
-         snprintf(name, ARRAY_SIZE(name), "vkAllocateMemory(%ldkb)",
-                  (long)DIV_ROUND_UP(pAllocateInfo->allocationSize, 1024));
+         snprintf(name, ARRAY_SIZE(name), "vkAlloc(%ldkb)",
+                  static_cast<long>(DIV_ROUND_UP(pAllocateInfo->allocationSize, 1024)));
       VkMemoryPropertyFlags mem_property =
          device->physical_device->memory.types[pAllocateInfo->memoryTypeIndex];
 
       result = _tu_init_memory(device, mem, mem_property, alloc_flags,
-                               pAllocateInfo->allocationSize, client_address,
+                               pAllocateInfo->allocationSize, alignment,
+                               client_address,
                                name);
    }
 
@@ -3553,6 +3821,7 @@ tu_AllocateMemory(VkDevice _device,
 
    if (result != VK_SUCCESS) {
       vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
+      tu_memory_emit_report(device, /* mem */ NULL, pAllocateInfo, result);
       return result;
    }
 
@@ -3564,7 +3833,42 @@ tu_AllocateMemory(VkDevice _device,
       mem->image = NULL;
    }
 
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   if (mem->vk.ahardware_buffer && mem->image &&
+       vk_image_is_android_hardware_buffer(&mem->image->vk)) {
+      VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
+      VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
+      result = vk_android_get_ahb_layout(mem->vk.ahardware_buffer, &eci,
+                                         a_plane_layouts, TU_MAX_PLANE_COUNT);
+      if (result != VK_SUCCESS) {
+         vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
+         return result;
+      }
+
+      assert(mem->image->vk.android_deferred_create_info);
+
+      __vk_append_struct(mem->image->vk.android_deferred_create_info, &eci);
+
+      VkExternalMemoryImageCreateInfo external_info = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      };
+      __vk_append_struct(mem->image->vk.android_deferred_create_info,
+                         &external_info);
+
+      result = TU_CALLX(device, tu_image_init)(
+         device, mem->image, mem->image->vk.android_deferred_create_info,
+         eci.drmFormatModifier, a_plane_layouts, TU_IMAGE_ID_ASSIGN);
+      if (result != VK_SUCCESS) {
+         vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
+         return result;
+      }
+   }
+#endif
+
    TU_RMV(heap_create, device, pAllocateInfo, mem);
+
+   tu_memory_emit_report(device, mem, pAllocateInfo, VK_SUCCESS);
 
    *pMem = tu_device_memory_to_handle(mem);
 
@@ -3587,13 +3891,13 @@ tu_allocate_lazy_memory(struct tu_device *dev,
    VkResult result = VK_SUCCESS;
    mtx_lock(&mem->lazy_mutex);
    if (!mem->lazy_initialized) {
-      char name[64] = "lazy vkAllocateMemory()";
+      char name[64] = "lazy vkAlloc()";
       if (dev->bo_sizes)
-         snprintf(name, ARRAY_SIZE(name), "lazy vkAllocateMemory(%ldkb)",
-                  (long)DIV_ROUND_UP(mem->size, 1024));
+         snprintf(name, ARRAY_SIZE(name), "lazy vkAlloc(%ldkb)",
+                  static_cast<long>(DIV_ROUND_UP(mem->size, 1024)));
       result =
          tu_bo_init_new_explicit_iova(dev, &mem->vk.base,
-                                      &mem->bo, mem->size, 0, 0,
+                                      &mem->bo, mem->size, 0, 0, 0,
                                       TU_BO_ALLOC_NO_FLAGS,
                                       &mem->lazy_vma, name);
       mem->lazy_initialized = true;
@@ -3631,6 +3935,8 @@ tu_FreeMemory(VkDevice _device,
 
    TU_RMV(resource_destroy, device, mem);
 
+   tu_memory_emit_report(device, mem, /* alloc_info */ NULL, VK_SUCCESS);
+
    _tu_destroy_memory(device, mem);
 
    vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
@@ -3660,7 +3966,7 @@ tu_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo, voi
    if (result != VK_SUCCESS)
       return result;
 
-   *ppData = (char *) mem->bo->map + pMemoryMapInfo->offset;
+   *ppData = static_cast<char *>(mem->bo->map) + pMemoryMapInfo->offset;
    return VK_SUCCESS;
 }
 
@@ -3747,7 +4053,8 @@ tu_get_msrtss_temporary(struct tu_device *dev,
    struct tu_device_memory *mem;
    VkResult result =
       tu_create_memory(dev, &mem,
-                       depth ? (VkMemoryPropertyFlags)0 :
+                       (depth || !dev->physical_device->has_lazy_bos) ?
+                       static_cast<VkMemoryPropertyFlags>(0) :
                        VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT,
                        TU_BO_ALLOC_INTERNAL_RESOURCE,
                        size, depth ? "MSRTSS depth" : "MSRTSS color");
@@ -3768,7 +4075,7 @@ tu_get_msrtss_temporary(struct tu_device *dev,
  * framebuffer with render passes or the command buffer with dynamic
  * rendering.
  */
-VkResult
+static VkResult
 tu_init_msrtss_attachments(struct tu_device *device,
                            const struct tu_render_pass *pass,
                            const struct tu_framebuffer *fb,
@@ -3818,8 +4125,8 @@ tu_init_msrtss_attachments(struct tu_device *device,
        */
       vk_image_init(&device->vk, &images[i].vk, &image_info);
 
-      tu_image_init(device, &images[i], &image_info);
-      TU_CALLX(device, tu_image_update_layout)(device, &images[i], DRM_FORMAT_MOD_INVALID, NULL);
+      TU_CALLX(device, tu_image_init)(device, &images[i], &image_info, DRM_FORMAT_MOD_INVALID, NULL,
+                                      TU_IMAGE_ID_INTERNAL);
 
       if (is_ds) {
          depth_size = align64(depth_size, images[i].layout[0].base_align);
@@ -4005,7 +4312,7 @@ tu_CreateFramebuffer(VkDevice _device,
       }
    }
 
-   tu_framebuffer_tiling_config(framebuffer, device, pass);
+   tu_framebuffer_init_tiling_config(framebuffer, device, pass);
 
    /* For MSRTSS, allocate extra images that are tied to the VkFramebuffer */
    if (msrtss_attachment_count > 0) {
@@ -4067,7 +4374,7 @@ tu_setup_dynamic_framebuffer(struct tu_cmd_buffer *cmd_buffer,
          view->image->max_tile_h_constraint_fdm;
    }
 
-   tu_framebuffer_tiling_config(framebuffer, cmd_buffer->device, pass);
+   tu_framebuffer_init_tiling_config(framebuffer, cmd_buffer->device, pass);
 }
 
 VkResult
@@ -4211,7 +4518,7 @@ uint64_t tu_GetDeviceMemoryOpaqueCaptureAddress(
     const VkDeviceMemoryOpaqueCaptureAddressInfo* pInfo)
 {
    VK_FROM_HANDLE(tu_device_memory, mem, pInfo->memory);
-   return mem->bo->iova;
+   return mem->iova;
 }
 
 struct tu_debug_bos_entry {
@@ -4233,12 +4540,12 @@ tu_debug_bos_add(struct tu_device *dev, uint64_t size, const char *name)
    struct tu_debug_bos_entry *debug_bos;
 
    if (!entry) {
-      debug_bos = (struct tu_debug_bos_entry *) calloc(
-         1, sizeof(struct tu_debug_bos_entry));
+      debug_bos = static_cast<struct tu_debug_bos_entry *>(calloc(
+         1, sizeof(struct tu_debug_bos_entry)));
       debug_bos->name = strdup(name);
       _mesa_hash_table_insert(dev->bo_sizes, debug_bos->name, debug_bos);
    } else {
-      debug_bos = (struct tu_debug_bos_entry *) entry->data;
+      debug_bos = static_cast<struct tu_debug_bos_entry *>(entry->data);
    }
 
    debug_bos->count++;
@@ -4261,12 +4568,12 @@ tu_debug_bos_del(struct tu_device *dev, struct tu_bo *bo)
    assert(entry);
 
    struct tu_debug_bos_entry *debug_bos =
-      (struct tu_debug_bos_entry *) entry->data;
+      static_cast<struct tu_debug_bos_entry *>(entry->data);
    debug_bos->count--;
    debug_bos->size -= align(bo->size, 4096);
    if (!debug_bos->count) {
       _mesa_hash_table_remove(dev->bo_sizes, entry);
-      free((void *) debug_bos->name);
+      free(const_cast<char *>(debug_bos->name));
       free(debug_bos);
    }
    mtx_unlock(&dev->bo_mutex);
@@ -4274,8 +4581,10 @@ tu_debug_bos_del(struct tu_device *dev, struct tu_bo *bo)
 
 static int debug_bos_count_compare(const void *in_a, const void *in_b)
 {
-   struct tu_debug_bos_entry *a = *(struct tu_debug_bos_entry **)in_a;
-   struct tu_debug_bos_entry *b = *(struct tu_debug_bos_entry **)in_b;
+   struct tu_debug_bos_entry *a =
+      *static_cast<struct tu_debug_bos_entry * const *>(in_a);
+   struct tu_debug_bos_entry *b =
+      *static_cast<struct tu_debug_bos_entry * const *>(in_b);
    return a->count - b->count;
 }
 
@@ -4295,7 +4604,7 @@ tu_debug_bos_print_stats(struct tu_device *dev)
    hash_table_foreach(dev->bo_sizes, entry)
    {
       struct tu_debug_bos_entry *debug_bos =
-         (struct tu_debug_bos_entry *) entry->data;
+         static_cast<struct tu_debug_bos_entry *>(entry->data);
       util_dynarray_append(&dyn, debug_bos);
       size += debug_bos->size / 1024;
       count += debug_bos->count;
@@ -4309,7 +4618,7 @@ tu_debug_bos_print_stats(struct tu_device *dev)
    {
       struct tu_debug_bos_entry *debug_bos = *entryp;
       mesa_logi("%30s: %4d bos, %lld kb\n", debug_bos->name, debug_bos->count,
-                (long long) (debug_bos->size / 1024));
+                static_cast<long long>(debug_bos->size / 1024));
    }
 
    mesa_logi("submitted %d bos (%d MB)\n", count, DIV_ROUND_UP(size, 1024));
@@ -4374,13 +4683,10 @@ tu_CmdBeginDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer,
     * buffers. Still, getting the simple case of cmd buffer annotation into
     * perfetto should prove useful.
     */
-   const char *label = pLabelInfo->pLabelName;
    if (cmd_buffer->state.pass) {
-      trace_start_cmd_buffer_annotation_rp(
-         &cmd_buffer->trace, &cmd_buffer->draw_cs, cmd_buffer, strlen(label), label);
+      trace_start_cmd_buffer_annotation_rp(&cmd_buffer->trace, &cmd_buffer->draw_cs, cmd_buffer);
    } else {
-      trace_start_cmd_buffer_annotation(&cmd_buffer->trace, &cmd_buffer->cs,
-                                        cmd_buffer, strlen(label), label);
+      trace_start_cmd_buffer_annotation(&cmd_buffer->trace, &cmd_buffer->cs, cmd_buffer);
    }
 }
 
@@ -4389,11 +4695,16 @@ tu_CmdEndDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, _commandBuffer);
 
-   if (cmd_buffer->state.pass) {
-      trace_end_cmd_buffer_annotation_rp(&cmd_buffer->trace,
-                                          &cmd_buffer->draw_cs);
-   } else {
-      trace_end_cmd_buffer_annotation(&cmd_buffer->trace, &cmd_buffer->cs);
+   if (cmd_buffer->vk.labels.size > 0) {
+      const VkDebugUtilsLabelEXT *label = util_dynarray_top_ptr(&cmd_buffer->vk.labels, VkDebugUtilsLabelEXT);
+
+      if (cmd_buffer->state.pass) {
+         trace_end_cmd_buffer_annotation_rp(&cmd_buffer->trace, &cmd_buffer->draw_cs, strlen(label->pLabelName),
+                                            label->pLabelName);
+      } else {
+         trace_end_cmd_buffer_annotation(&cmd_buffer->trace, &cmd_buffer->cs, strlen(label->pLabelName),
+                                         label->pLabelName);
+      }
    }
 
    vk_common_CmdEndDebugUtilsLabelEXT(_commandBuffer);
@@ -4404,11 +4715,12 @@ tu_SetDebugUtilsObjectNameEXT(
    VkDevice device,
    const VkDebugUtilsObjectNameInfoEXT *pNameInfo)
 {
+   UNUSED VK_FROM_HANDLE(tu_device, dev, device);
    VkResult result = vk_common_SetDebugUtilsObjectNameEXT(device, pNameInfo);
 
 #ifdef HAVE_PERFETTO
    if (result == VK_SUCCESS)
-      tu_perfetto_set_debug_utils_object_name(pNameInfo);
+      tu_perfetto_set_debug_utils_object_name(dev, pNameInfo);
 #endif
 
    return result;

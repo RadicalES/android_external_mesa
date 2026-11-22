@@ -6,7 +6,8 @@
  * Kernel interface layer for turnip running on virtio_gpu (aka virtgpu)
  */
 
-#include "tu_knl.h"
+#include "drm-uapi/msm_drm.h"
+#include "drm-uapi/virtgpu_drm.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -14,24 +15,27 @@
 #include <sys/mman.h>
 #include <xf86drm.h>
 
-#include "vk_util.h"
-
-#include "drm-uapi/msm_drm.h"
-#include "drm-uapi/virtgpu_drm.h"
-#include "util/u_debug.h"
 #include "util/hash_table.h"
 #include "util/libsync.h"
+#include "util/u_debug.h"
 #include "util/u_process.h"
+#include "vk_util.h"
 
+#include "common/freedreno_common.h"
 #include "tu_cmd_buffer.h"
 #include "tu_cs.h"
 #include "tu_device.h"
 #include "tu_dynamic_rendering.h"
+#include "tu_knl.h"
 #include "tu_knl_drm.h"
 #include "tu_queue.h"
 
+/* NOLINTBEGIN */
+/* clang-format off */
 #include "vdrm.h"
 #include "msm_proto.h"
+/* clang-format on */
+/* NOLINTEND */
 
 struct tu_userspace_fence_cmd {
    uint32_t pkt[4];    /* first 4 dwords of packet */
@@ -80,15 +84,15 @@ virtio_simple_ioctl(struct vdrm_device *vdrm, unsigned cmd, void *_req)
       rsp_len += _IOC_SIZE(cmd);
 
    uint8_t buf[req_len];
-   struct msm_ccmd_ioctl_simple_req *req = (struct msm_ccmd_ioctl_simple_req *)buf;
+   struct msm_ccmd_ioctl_simple_req *req = reinterpret_cast<struct msm_ccmd_ioctl_simple_req *>(buf);
    struct msm_ccmd_ioctl_simple_rsp *rsp;
 
    req->hdr = MSM_CCMD(IOCTL_SIMPLE, req_len);
    req->cmd = cmd;
    memcpy(req->payload, _req, _IOC_SIZE(cmd));
 
-   rsp = (struct msm_ccmd_ioctl_simple_rsp *)
-         vdrm_alloc_rsp(vdrm, &req->hdr, rsp_len);
+   rsp = static_cast<struct msm_ccmd_ioctl_simple_rsp *>(
+         vdrm_alloc_rsp(vdrm, &req->hdr, rsp_len));
 
    int ret = vdrm_send_req(vdrm, &req->hdr, true);
 
@@ -151,7 +155,7 @@ set_debuginfo(struct tu_device *dev)
 
    unsigned req_len = align(sizeof(*req) + comm_len + cmdline_len, 4);
 
-   req = (struct msm_ccmd_set_debuginfo_req *)malloc(req_len);
+   req = static_cast<struct msm_ccmd_set_debuginfo_req *>(malloc(req_len));
 
    req->hdr         = MSM_CCMD(SET_DEBUGINFO, req_len);
    req->comm_len    = comm_len;
@@ -181,9 +185,9 @@ virtio_device_init(struct tu_device *dev)
       }
    }
 
-   struct tu_virtio_device *vdev = (struct tu_virtio_device *)
+   struct tu_virtio_device *vdev = static_cast<struct tu_virtio_device *>(
             vk_zalloc(&instance->vk.alloc, sizeof(*vdev), 8,
-                      VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+                      VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE));
    if (!vdev) {
       close(fd);
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -262,20 +266,20 @@ static enum fdl_macrotile_mode
 tu_drm_get_macrotile_mode(struct vdrm_device *vdrm)
 {
    if (vdrm->caps.u.msm.macrotile_mode)
-      return (enum fdl_macrotile_mode)vdrm->caps.u.msm.macrotile_mode;
+      return static_cast<enum fdl_macrotile_mode>(vdrm->caps.u.msm.macrotile_mode);
    uint64_t value;
    int ret = tu_drm_get_param(vdrm, MSM_PARAM_MACROTILE_MODE, &value);
    if (ret)
       return FDL_MACROTILE_INVALID;
 
-   return (enum fdl_macrotile_mode) value;
+   return static_cast<enum fdl_macrotile_mode>(value);
 }
 
 static uint32_t
 tu_drm_get_ubwc_swizzle(struct vdrm_device *vdrm)
 {
    if (vdrm->caps.u.msm.ubwc_swizzle)
-      return (uint32_t)vdrm->caps.u.msm.ubwc_swizzle;
+      return static_cast<uint32_t>(vdrm->caps.u.msm.ubwc_swizzle);
    uint64_t value;
    int ret = tu_drm_get_param(vdrm, MSM_PARAM_UBWC_SWIZZLE, &value);
    if (ret)
@@ -420,17 +424,18 @@ tu_wait_fence(struct tu_device *dev,
    int ret;
 
    do {
-      rsp = (struct msm_ccmd_submitqueue_query_rsp *)
-            vdrm_alloc_rsp(vdrm, &req.hdr, sizeof(*rsp));
+      rsp = static_cast<struct msm_ccmd_submitqueue_query_rsp *>(
+            vdrm_alloc_rsp(vdrm, &req.hdr, sizeof(*rsp)));
 
       ret = vdrm_send_req(vdrm, &req.hdr, true);
       if (ret)
          goto out;
 
-      if (os_time_get_nano() >= end_time)
-         break;
-
       ret = rsp->ret;
+
+      if (timeout_ns != OS_TIMEOUT_INFINITE &&
+          os_time_get_nano() >= end_time)
+         break;
    } while (ret == -ETIMEDOUT);
 
 out:
@@ -439,7 +444,7 @@ out:
    return VK_ERROR_UNKNOWN;
 }
 
-VkResult
+static VkResult
 virtio_queue_wait_fence(struct tu_queue *queue, uint32_t fence,
                         uint64_t timeout_ns)
 {
@@ -458,8 +463,8 @@ tu_free_zombie_vma_locked(struct tu_device *dev, bool wait)
       return VK_SUCCESS;
 
    if (wait) {
-      struct tu_zombie_vma *vma = (struct tu_zombie_vma *)
-            u_vector_head(&dev->zombie_vmas);
+      struct tu_zombie_vma *vma = static_cast<struct tu_zombie_vma *>(
+            u_vector_head(&dev->zombie_vmas));
       /* Wait for 3s (arbitrary timeout) */
       VkResult ret = tu_wait_fence(dev, dev->queues[0]->msm_queue_id,
                                    vma->fence, 3000000000);
@@ -475,8 +480,8 @@ tu_free_zombie_vma_locked(struct tu_device *dev, bool wait)
     */
    int last_signaled_fence = -1;
    while (u_vector_length(&dev->zombie_vmas) > 0) {
-      struct tu_zombie_vma *vma = (struct tu_zombie_vma *)
-            u_vector_tail(&dev->zombie_vmas);
+      struct tu_zombie_vma *vma = static_cast<struct tu_zombie_vma *>(
+            u_vector_tail(&dev->zombie_vmas));
       if (vma->fence > last_signaled_fence) {
          VkResult ret =
             tu_wait_fence(dev, dev->queues[0]->msm_queue_id, vma->fence, 0);
@@ -492,7 +497,7 @@ tu_free_zombie_vma_locked(struct tu_device *dev, bool wait)
          set_iova(dev, vma->res_id, 0);
 
          struct tu_zombie_vma *vma2 =
-            (struct tu_zombie_vma *) u_vector_add(&vdev->zombie_vmas_stage_2);
+            static_cast<struct tu_zombie_vma *>(u_vector_add(&vdev->zombie_vmas_stage_2));
 
          *vma2 = *vma;
       }
@@ -500,8 +505,8 @@ tu_free_zombie_vma_locked(struct tu_device *dev, bool wait)
 
    /* And _then_ close the GEM handles: */
    while (u_vector_length(&vdev->zombie_vmas_stage_2) > 0) {
-      struct tu_zombie_vma *vma = (struct tu_zombie_vma *)
-            u_vector_remove(&vdev->zombie_vmas_stage_2);
+      struct tu_zombie_vma *vma = static_cast<struct tu_zombie_vma *>(
+            u_vector_remove(&vdev->zombie_vmas_stage_2));
 
       util_vma_heap_free(&dev->vma, vma->iova, vma->size);
       vdrm_bo_close(dev->vdev->vdrm, vma->gem_handle);
@@ -534,6 +539,7 @@ static VkResult
 virtio_allocate_userspace_iova_locked(struct tu_device *dev,
                                       uint32_t gem_handle,
                                       uint64_t size,
+                                      uint64_t align,
                                       uint64_t client_iova,
                                       enum tu_bo_alloc_flags flags,
                                       uint64_t *iova)
@@ -552,7 +558,7 @@ virtio_allocate_userspace_iova_locked(struct tu_device *dev,
 
    tu_free_zombie_vma_locked(dev, false);
 
-   result = tu_allocate_userspace_iova(dev, size, client_iova, flags, iova);
+   result = tu_allocate_userspace_iova(dev, size, align, client_iova, flags, iova);
    if (result == VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS) {
       /* Address may be already freed by us, but not considered as
        * freed by the kernel. We have to wait until all work that
@@ -560,7 +566,7 @@ virtio_allocate_userspace_iova_locked(struct tu_device *dev,
        * be replayed only by debug tooling, it should be ok to wait.
        */
       tu_free_zombie_vma_locked(dev, true);
-      result = tu_allocate_userspace_iova(dev, size, client_iova, flags, iova);
+      result = tu_allocate_userspace_iova(dev, size, align, client_iova, flags, iova);
    }
 
    return result;
@@ -587,13 +593,13 @@ tu_bo_init(struct tu_device *dev,
    /* grow the bo list if needed */
    if (idx >= dev->submit_bo_list_size) {
       uint32_t new_len = idx + 64;
-      struct drm_msm_gem_submit_bo *new_ptr = (struct drm_msm_gem_submit_bo *)
+      struct drm_msm_gem_submit_bo *new_ptr = static_cast<struct drm_msm_gem_submit_bo *>(
          vk_realloc(&dev->vk.alloc, dev->submit_bo_list, new_len * sizeof(*dev->submit_bo_list),
-                    8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+                    8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
       if (!new_ptr) {
          dev->submit_bo_count--;
          mtx_unlock(&dev->bo_mutex);
-         vdrm_bo_close(dev->vdev->vdrm, bo->gem_handle);
+         vdrm_bo_close(dev->vdev->vdrm, gem_handle);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
 
@@ -641,7 +647,7 @@ tu_bo_init(struct tu_device *dev,
  * reduce overhead.
  */
 static void
-tu_bo_set_kernel_name(struct tu_device *dev, struct tu_bo *bo, const char *name)
+tu_bo_set_kernel_name(struct tu_device *dev, struct tu_bo *bo, const char *name, size_t sz)
 {
    MESA_TRACE_FUNC();
    bool kernel_bo_names = dev->bo_sizes != NULL;
@@ -651,12 +657,21 @@ tu_bo_set_kernel_name(struct tu_device *dev, struct tu_bo *bo, const char *name)
    if (!kernel_bo_names)
       return;
 
-   size_t sz = strlen(name);
+   char name_buf[FD_MSM_GEM_NAME_LENGTH + 1];
+   if (sz > FD_MSM_GEM_NAME_LENGTH) {
+      mesa_logd("Truncating BO name: %s", name);
+
+      memcpy(name_buf, name, FD_MSM_GEM_NAME_LENGTH);
+      name_buf[FD_MSM_GEM_NAME_LENGTH] = '\0';
+
+      name = name_buf;
+      sz = FD_MSM_GEM_NAME_LENGTH;
+   }
 
    unsigned req_len = sizeof(struct msm_ccmd_gem_set_name_req) + align(sz, 4);
 
    uint8_t buf[req_len];
-   struct msm_ccmd_gem_set_name_req *req = (struct msm_ccmd_gem_set_name_req *)buf;
+   struct msm_ccmd_gem_set_name_req *req = reinterpret_cast<struct msm_ccmd_gem_set_name_req *>(buf);
 
    req->hdr = MSM_CCMD(GEM_SET_NAME, req_len);
    req->res_id = bo->res_id;
@@ -672,6 +687,7 @@ virtio_bo_init(struct tu_device *dev,
                struct vk_object_base *base,
                struct tu_bo **out_bo,
                uint64_t size,
+               uint64_t align,
                uint64_t client_iova,
                VkMemoryPropertyFlags mem_property,
                enum tu_bo_alloc_flags flags,
@@ -718,7 +734,7 @@ virtio_bo_init(struct tu_device *dev,
       req.iova = lazy_vma->msm.iova;
    } else {
       mtx_lock(&dev->vma_mutex);
-      result = virtio_allocate_userspace_iova_locked(dev, 0, size, client_iova,
+      result = virtio_allocate_userspace_iova_locked(dev, 0, size, align, client_iova,
                                                      flags, &req.iova);
       mtx_unlock(&dev->vma_mutex);
    }
@@ -733,7 +749,7 @@ virtio_bo_init(struct tu_device *dev,
    req.blob_id = p_atomic_inc_return(&vdev->next_blob_id);;
 
    uint32_t handle =
-      vdrm_bo_create(vdev->vdrm, size, blob_flags, req.blob_id, &req.hdr);
+      vdrm_bo_create(vdev->vdrm, size, blob_flags, req.blob_id, 0, &req.hdr);
 
    if (!handle) {
       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -753,13 +769,20 @@ virtio_bo_init(struct tu_device *dev,
    }
 
    *out_bo = bo;
+   if (lazy_vma)
+      lazy_vma->msm.backs_lazy_bo = true;
 
    /* We don't use bo->name here because for the !TU_DEBUG=bo case bo->name is NULL. */
-   tu_bo_set_kernel_name(dev, bo, name);
+   tu_bo_set_kernel_name(dev, bo, name, strlen(name));
 
    if ((mem_property & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) &&
        !(mem_property & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-      tu_bo_map(dev, bo, NULL);
+      result = tu_bo_map(dev, bo, NULL);
+      if (result != VK_SUCCESS) {
+         tu_bo_finish(dev, bo);
+         *out_bo = NULL;
+         return result;
+      }
 
       /* Cached non-coherent memory may already have dirty cache lines,
        * we should clean the cache lines before GPU got the chance to
@@ -773,9 +796,11 @@ virtio_bo_init(struct tu_device *dev,
    return VK_SUCCESS;
 
 fail:
-   mtx_lock(&dev->vma_mutex);
-   util_vma_heap_free(&dev->vma, req.iova, size);
-   mtx_unlock(&dev->vma_mutex);
+   if (!lazy_vma) {
+      mtx_lock(&dev->vma_mutex);
+      util_vma_heap_free(&dev->vma, req.iova, size);
+      mtx_unlock(&dev->vma_mutex);
+   }
    return result;
 }
 
@@ -783,17 +808,20 @@ static VkResult
 virtio_bo_init_dmabuf(struct tu_device *dev,
                    struct tu_bo **out_bo,
                    uint64_t size,
+                   uint64_t align,
+                   enum tu_bo_alloc_flags flags,
                    int prime_fd)
 {
    MESA_TRACE_FUNC();
    struct vdrm_device *vdrm = dev->vdev->vdrm;
    VkResult result;
    struct tu_bo* bo = NULL;
+   flags = static_cast<enum tu_bo_alloc_flags>(flags | TU_BO_ALLOC_DMABUF);
 
    /* lseek() to get the real size */
    off_t real_size = lseek(prime_fd, 0, SEEK_END);
    lseek(prime_fd, 0, SEEK_SET);
-   if (real_size < 0 || (uint64_t) real_size < size)
+   if (real_size < 0 || static_cast<uint64_t>(real_size) < size)
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    /* iova allocation needs to consider the object's *real* size: */
@@ -818,7 +846,7 @@ virtio_bo_init_dmabuf(struct tu_device *dev,
 
    res_id = vdrm_handle_to_res_id(vdrm, handle);
    if (!res_id) {
-      /* XXX gem_handle potentially leaked here since no refcnt */
+      vdrm_bo_close(vdrm, handle);
       result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
       goto out_unlock;
    }
@@ -836,24 +864,25 @@ virtio_bo_init_dmabuf(struct tu_device *dev,
    bo->res_id = res_id;
 
    mtx_lock(&dev->vma_mutex);
-   result = virtio_allocate_userspace_iova_locked(dev, handle, size, 0,
-                                                  TU_BO_ALLOC_DMABUF, &iova);
+   result = virtio_allocate_userspace_iova_locked(dev, handle, size, align,
+                                                  0, flags, &iova);
    mtx_unlock(&dev->vma_mutex);
    if (result != VK_SUCCESS) {
-      vdrm_bo_close(dev->vdev->vdrm, handle);
+      vdrm_bo_close(vdrm, handle);
       goto out_unlock;
    }
 
    result =
-      tu_bo_init(dev, NULL, bo, handle, size, iova, TU_BO_ALLOC_NO_FLAGS, "dmabuf");
+      tu_bo_init(dev, NULL, bo, handle, size, iova, flags, "dmabuf");
    if (result != VK_SUCCESS) {
+      mtx_lock(&dev->vma_mutex);
       util_vma_heap_free(&dev->vma, iova, size);
+      mtx_unlock(&dev->vma_mutex);
       memset(bo, 0, sizeof(*bo));
    } else {
       *out_bo = bo;
+      set_iova(dev, bo->res_id, iova);
    }
-
-   set_iova(dev, bo->res_id, iova);
 
 out_unlock:
    u_rwlock_wrunlock(&dev->dma_bo_lock);
@@ -901,7 +930,7 @@ virtio_bo_finish(struct tu_device *dev, struct tu_bo *bo)
    tu_debug_bos_del(dev, bo);
    tu_dump_bo_del(dev, bo);
 
-   if (bo->map)
+   if (bo->map && bo->map != MAP_FAILED)
       munmap(bo->map, bo->size);
 
    tu_bo_list_del(dev, bo);
@@ -918,17 +947,17 @@ virtio_sparse_vma_init(struct tu_device *dev,
                        struct tu_sparse_vma *out_vma,
                        uint64_t *out_iova,
                        enum tu_sparse_vma_flags flags,
-                       uint64_t size, uint64_t client_iova)
+                       uint64_t size, uint64_t align, uint64_t client_iova)
 {
    VkResult result;
    enum tu_bo_alloc_flags bo_flags =
       (flags & TU_SPARSE_VMA_REPLAYABLE) ? TU_BO_ALLOC_REPLAYABLE :
-      (enum tu_bo_alloc_flags)0;
+      static_cast<enum tu_bo_alloc_flags>(0);
 
    out_vma->msm.size = size;
 
    mtx_lock(&dev->vma_mutex);
-   result = virtio_allocate_userspace_iova_locked(dev, 0, size, client_iova,
+   result = virtio_allocate_userspace_iova_locked(dev, 0, size, align, client_iova,
                                                   bo_flags, &out_vma->msm.iova);
    mtx_unlock(&dev->vma_mutex);
 
@@ -946,9 +975,14 @@ static void
 virtio_sparse_vma_finish(struct tu_device *dev,
                          struct tu_sparse_vma *vma)
 {
-   mtx_lock(&dev->vma_mutex);
-   util_vma_heap_free(&dev->vma, vma->msm.iova, vma->msm.size);
-   mtx_unlock(&dev->vma_mutex);
+   /* For has_set_iova, if a lazy BO was mapped into this sparse VMA
+    * the allocation will be handed off to the zombie VMA mechanism.
+    */
+   if (!vma->msm.backs_lazy_bo) {
+      mtx_lock(&dev->vma_mutex);
+      util_vma_heap_free(&dev->vma, vma->msm.iova, vma->msm.size);
+      mtx_unlock(&dev->vma_mutex);
+   }
 }
 
 static VkResult
@@ -959,8 +993,8 @@ setup_fence_cmds(struct tu_device *dev)
    VkResult result;
 
    result = tu_bo_init_new(dev, NULL, &vdev->fence_cmds_mem,
-                           sizeof(*vdev->fence_cmds), (enum tu_bo_alloc_flags)
-                              (TU_BO_ALLOC_ALLOW_DUMP | TU_BO_ALLOC_GPU_READ_ONLY),
+                           sizeof(*vdev->fence_cmds), static_cast<enum tu_bo_alloc_flags>(
+                              TU_BO_ALLOC_ALLOW_DUMP | TU_BO_ALLOC_GPU_READ_ONLY),
                            "fence_cmds");
    if (result != VK_SUCCESS)
       return result;
@@ -969,7 +1003,7 @@ setup_fence_cmds(struct tu_device *dev)
    if (result != VK_SUCCESS)
       return result;
 
-   vdev->fence_cmds = (struct tu_userspace_fence_cmds *)vdev->fence_cmds_mem->map;
+   vdev->fence_cmds = static_cast<struct tu_userspace_fence_cmds *>(vdev->fence_cmds_mem->map);
 
    uint64_t fence_iova = dev->global_bo->iova + gb_offset(userspace_fence);
    for (int i = 0; i < ARRAY_SIZE(vdev->fence_cmds->cmds); i++) {
@@ -978,13 +1012,13 @@ setup_fence_cmds(struct tu_device *dev)
       memset(c, 0, sizeof(*c));
 
       if (fd_dev_gen(&dev->physical_device->dev_id) >= A7XX) {
-         c->pkt[0] = pm4_pkt7_hdr((uint8_t)CP_EVENT_WRITE7, 4);
+         c->pkt[0] = pm4_pkt7_hdr(static_cast<uint8_t>(CP_EVENT_WRITE7), 4);
          c->pkt[1] = CP_EVENT_WRITE7_0(.event = CACHE_FLUSH_TS,
                            .write_src = EV_WRITE_USER_32B,
                            .write_dst = EV_DST_RAM,
                            .write_enabled = true).value;
       } else {
-         c->pkt[0] = pm4_pkt7_hdr((uint8_t)CP_EVENT_WRITE, 4);
+         c->pkt[0] = pm4_pkt7_hdr(static_cast<uint8_t>(CP_EVENT_WRITE), 4);
          c->pkt[1] = CP_EVENT_WRITE_0_EVENT(CACHE_FLUSH_TS);
       }
       c->pkt[2] = fence_iova;
@@ -1004,7 +1038,7 @@ virtio_queue_submit(struct tu_queue *queue, void *_submit,
    VkResult result = VK_SUCCESS;
    int ret;
    struct tu_msm_queue_submit *submit =
-      (struct tu_msm_queue_submit *)_submit;
+      static_cast<struct tu_msm_queue_submit *>(_submit);
    struct tu_virtio_device *vdev = queue->device->vdev;
    struct drm_virtgpu_execbuffer_syncobj *in_syncobjs, *out_syncobjs;
    uint64_t gpu_offset = 0;
@@ -1035,7 +1069,7 @@ virtio_queue_submit(struct tu_queue *queue, void *_submit,
    struct tu_cs_entry fence_cs = {
       .bo = vdev->fence_cmds_mem,
       .size = 5 * 4,
-      .offset = ((intptr_t)&fcmds->cmds[idx]) - (intptr_t)fcmds,
+      .offset = reinterpret_cast<intptr_t>(&fcmds->cmds[idx]) - reinterpret_cast<intptr_t>(fcmds),
    };
    msm_submit_add_entries(queue->device, _submit, &fence_cs, 1);
 
@@ -1049,10 +1083,10 @@ virtio_queue_submit(struct tu_queue *queue, void *_submit,
    uint32_t flags = MSM_PIPE_3D0;
 
    /* Allocate without wait timeline semaphores */
-   in_syncobjs = (struct drm_virtgpu_execbuffer_syncobj *) vk_zalloc(
+   in_syncobjs = static_cast<struct drm_virtgpu_execbuffer_syncobj *>(vk_zalloc(
       &queue->device->vk.alloc,
       wait_count * sizeof(*in_syncobjs), 8,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    if (in_syncobjs == NULL) {
       result = vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1060,10 +1094,10 @@ virtio_queue_submit(struct tu_queue *queue, void *_submit,
    }
 
    /* Allocate with signal timeline semaphores considered */
-   out_syncobjs = (struct drm_virtgpu_execbuffer_syncobj *) vk_zalloc(
+   out_syncobjs = static_cast<struct drm_virtgpu_execbuffer_syncobj *>(vk_zalloc(
       &queue->device->vk.alloc,
       signal_count * sizeof(*out_syncobjs), 8,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    if (out_syncobjs == NULL) {
       result = vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1115,8 +1149,8 @@ virtio_queue_submit(struct tu_queue *queue, void *_submit,
       cmd->submit_idx = (*bo)->submit_bo_list_idx;
    }
 
-   req = (struct msm_ccmd_gem_submit_req *)vk_alloc(
-         &queue->device->vk.alloc, req_len, 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   req = static_cast<struct msm_ccmd_gem_submit_req *>(vk_alloc(
+         &queue->device->vk.alloc, req_len, 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    if (!req) {
       mtx_unlock(&queue->device->bo_mutex);
@@ -1303,9 +1337,9 @@ tu_knl_drm_virtio_load(struct tu_instance *instance,
                                "No address space");
    }
 
-   struct tu_physical_device *device = (struct tu_physical_device *)
+   struct tu_physical_device *device = static_cast<struct tu_physical_device *>(
       vk_zalloc(&instance->vk.alloc, sizeof(*device), 8,
-                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE));
    if (!device) {
       result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto fail;
@@ -1326,7 +1360,9 @@ tu_knl_drm_virtio_load(struct tu_instance *instance,
    device->ubwc_config.highest_bank_bit = caps.u.msm.highest_bank_bit;
    device->has_set_iova   = true;
    device->has_lazy_bos   = true;
+   device->has_iova_align = true;
    device->has_preemption = has_preemption;
+   device->is_perf_cntr_selectable = true;
    device->uche_trap_base = uche_trap_base;
 
    device->ubwc_config.bank_swizzle_levels = bank_swizzle_levels;

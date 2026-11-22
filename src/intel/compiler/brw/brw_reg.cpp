@@ -9,69 +9,6 @@
 #include "util/macros.h"
 
 bool
-brw_reg_saturate_immediate(brw_reg *reg)
-{
-   union {
-      unsigned ud;
-      int d;
-      float f;
-      double df;
-   } imm, sat_imm = { 0 };
-
-   const unsigned size = brw_type_size_bytes(reg->type);
-
-   /* We want to either do a 32-bit or 64-bit data copy, the type is otherwise
-    * irrelevant, so just check the size of the type and copy from/to an
-    * appropriately sized field.
-    */
-   if (size < 8)
-      imm.ud = reg->ud;
-   else
-      imm.df = reg->df;
-
-   switch (reg->type) {
-   case BRW_TYPE_UD:
-   case BRW_TYPE_D:
-   case BRW_TYPE_UW:
-   case BRW_TYPE_W:
-   case BRW_TYPE_UQ:
-   case BRW_TYPE_Q:
-      /* Nothing to do. */
-      return false;
-   case BRW_TYPE_F:
-      sat_imm.f = SATURATE(imm.f);
-      break;
-   case BRW_TYPE_DF:
-      sat_imm.df = SATURATE(imm.df);
-      break;
-   case BRW_TYPE_UB:
-   case BRW_TYPE_B:
-      UNREACHABLE("no UB/B immediates");
-   case BRW_TYPE_V:
-   case BRW_TYPE_UV:
-   case BRW_TYPE_VF:
-      UNREACHABLE("unimplemented: saturate vector immediate");
-   case BRW_TYPE_HF:
-      UNREACHABLE("unimplemented: saturate HF immediate");
-   default:
-      UNREACHABLE("invalid type");
-   }
-
-   if (size < 8) {
-      if (imm.ud != sat_imm.ud) {
-         reg->ud = sat_imm.ud;
-         return true;
-      }
-   } else {
-      if (imm.df != sat_imm.df) {
-         reg->df = sat_imm.df;
-         return true;
-      }
-   }
-   return false;
-}
-
-bool
 brw_reg_negate_immediate(brw_reg *reg)
 {
    switch (reg->type) {
@@ -312,5 +249,72 @@ brw_reg::component_size(unsigned width) const
       return ((MAX2(1, h) - 1) * vs + MAX2(w * hs, 1)) * brw_type_size_bytes(type);
    } else {
       return MAX2(width * stride, 1) * brw_type_size_bytes(type);
+   }
+}
+
+extern "C" uint32_t
+brw_register_file_size(const struct intel_device_info *devinfo)
+{
+   return (devinfo->ver >= 30 ? XE3_MAX_GRF :
+           devinfo->ver >= 20 ? XE2_MAX_GRF :
+           BRW_MAX_GRF) * REG_SIZE;
+}
+
+unsigned
+brw_implicit_accumulator_bits(unsigned exec_size, unsigned group,
+                              brw_reg_type type)
+{
+   if (type == BRW_TYPE_DF) {
+      /* On platforms that support this, there is a single SIMD4
+       * accumulator. These platforms have acc0 and acc1. Both are accessed.
+       */
+      return 0x3;
+   } else if (brw_type_is_int(type)) {
+      /* Integer types are always 33-bits. Yes, 33. This means that accesses
+       * uses twice the number of accumulators that would be expected.
+       *
+       * The Bspec says, "Writing to acc1/acc3 using any datatype may corrupt
+       * this result." Marking the accesses as always writing a pair of
+       * accumulators is the safe thing.
+       *
+       * For implicit access, acc2 is not possible.
+       */
+      return exec_size <= 8 ? 0x3 : 0xf;
+   } else if (type == BRW_TYPE_F || type == BRW_TYPE_HF) {
+      unsigned nr = group / 8;
+
+      return ((1u << (exec_size / 8)) - 1) << nr;
+   } else {
+      UNREACHABLE("Bad type.");
+      return 0xffffffff;
+   }
+}
+
+unsigned
+brw_explicit_accumulator_bits(unsigned exec_size, const brw_reg &reg)
+{
+   unsigned nr = reg.nr & 0x0f;
+
+   if (reg.type == BRW_TYPE_DF) {
+      /* On platforms that support this, there is a single SIMD4
+       * accumulator. These platforms have acc0 and acc1. Both are accessed.
+       */
+      return 0x3;
+   } else if (brw_type_is_int(reg.type)) {
+      /* Integer types are always 33-bits. Yes, 33. This means that accesses
+       * use twice the number of accumulators that would be expected.
+       *
+       * The Bspec says, "Writing to acc1/acc3 using any datatype may corrupt
+       * this result." Marking the accesses as always writing a pair of
+       * accumulators is the safe thing.
+       */
+      unsigned bits = exec_size <= 8 ? 0x3 : 0xf;
+
+      return bits << nr;
+   } else if (reg.type == BRW_TYPE_F || reg.type == BRW_TYPE_HF) {
+      return ((1u << (exec_size / 8)) - 1) << nr;
+   } else {
+      UNREACHABLE("Bad type.");
+      return 0xffffffff;
    }
 }

@@ -13,6 +13,7 @@
 
 #include "util/bitscan.h"
 #include "util/list.h"
+#include "util/macros.h"
 #include "util/set.h"
 #include "util/u_debug.h"
 
@@ -36,22 +37,21 @@ struct ir3_info {
    /* byte offset from start of the shader to the NIR constant data. */
    uint32_t constant_data_offset;
    /* Size in dwords of the instructions. */
-   uint16_t sizedwords;
-   uint16_t instrs_count; /* expanded to account for rpt's */
-   uint16_t preamble_instrs_count;
-   uint16_t nops_count;   /* # of nop instructions, including nopN */
-   uint16_t mov_count;
-   uint16_t cov_count;
-   uint16_t loops;
-   uint16_t stp_count;
-   uint16_t ldp_count;
+   uint32_t sizedwords;
+   uint32_t instrs_count; /* expanded to account for rpt's */
+   uint32_t preamble_instrs_count;
+   uint32_t nops_count;   /* # of nop instructions, including nopN */
+   uint32_t mov_count;
+   uint32_t cov_count;
+   uint32_t loops;
+   uint32_t stp_count;
+   uint32_t ldp_count;
    /* NOTE: max_reg, etc, does not include registers not touched
     * by the shader (ie. vertex fetched via VFD_DECODE but not
     * touched by shader)
     */
    int8_t max_reg; /* highest GPR # used by shader */
    int8_t max_half_reg;
-   int16_t max_const;
    unsigned constlen;
    /* This is the maximum # of waves that can executed at once in one core,
     * assuming that they are all executing this shader.
@@ -64,19 +64,19 @@ struct ir3_info {
    bool uses_ray_intersection;
 
    /* number of sync bits: */
-   uint16_t ss, sy;
+   uint32_t ss, sy;
 
    /* estimate of number of cycles stalled on (ss) */
-   uint16_t sstall;
+   uint32_t sstall;
    /* estimate of number of cycles stalled on (sy) */
-   uint16_t systall;
+   uint32_t systall;
 
-   uint16_t last_baryf; /* instruction # of last varying fetch */
+   uint32_t last_baryf; /* instruction # of last varying fetch */
 
-   uint16_t last_helper; /* last instruction to use helper invocations */
+   uint32_t last_helper; /* last instruction to use helper invocations */
 
    /* Number of instructions of a given category: */
-   uint16_t instrs_per_cat[8];
+   uint32_t instrs_per_cat[8];
 };
 
 struct ir3_merge_set {
@@ -200,6 +200,9 @@ typedef enum ir3_register_flags {
     */
    IR3_REG_UNIFORM = BIT(24),
 } ir3_register_flags;
+
+#define IR3_REG_SRC_MODS (IR3_REG_FNEG | IR3_REG_FABS | IR3_REG_SNEG | \
+                          IR3_REG_SABS | IR3_REG_BNOT)
 
 struct ir3_register {
    BITMASK_ENUM(ir3_register_flags) flags;
@@ -446,7 +449,6 @@ struct ir3_instruction {
          type_t src_type, dst_type;
          round_t round;
          reduce_op_t reduce_op;
-         bool sat;
          uint16_t r[2];
       } cat1;
       struct {
@@ -475,6 +477,10 @@ struct ir3_instruction {
          unsigned tex_base : 3;
          unsigned cluster_size : 4;
          type_t type;
+         enum {
+            IR3_MATCH_MODE_SAD = 0, /* Sum of Absolute Difference */
+            IR3_MATCH_MODE_SSD = 1, /* Sum of Squared Differences */
+         } match_mode; /* for block matching textures */
       } cat5;
       struct {
          type_t type;
@@ -707,7 +713,7 @@ struct ir3_array {
    /* extra stuff used in RA pass: */
    unsigned base; /* base vreg name */
    unsigned reg;  /* base physical reg */
-   uint16_t start_ip, end_ip;
+   uint32_t start_ip, end_ip;
 
    /* Indicates if half-precision */
    bool half;
@@ -747,9 +753,20 @@ struct ir3_block {
    DECLARE_ARRAY(struct ir3_block *, physical_predecessors);
    DECLARE_ARRAY(struct ir3_block *, physical_successors);
 
-   uint16_t start_ip, end_ip;
+   uint32_t start_ip, end_ip;
 
+   /**
+    * Is the block a reconvergence point within a wave:
+    */
    bool reconvergence_point;
+
+   /**
+    * If the block is not a recoverngence point within a wave, it may
+    * still be a point where parallel waves recoverge.  This should
+    * be considered for (jp) marking and branchstack, but need not be
+    * considered for constructing physical edges for uGPR allocation.
+    */
+   bool wave_reconvergence_point;
 
    bool in_early_preamble;
 
@@ -792,6 +809,202 @@ struct ir3_cursor {
 struct ir3_builder {
    struct ir3_cursor cursor;
 };
+
+#define MASK(n) ((1 << (n)) - 1)
+
+/* iterator for an instructions's sources (reg), also returns src #: */
+#define foreach_src_n(__srcreg, __n, __instr)                                  \
+   if ((__instr)->srcs_count)                                                  \
+      for (struct ir3_register *__srcreg = (struct ir3_register *)~0; __srcreg;\
+           __srcreg = NULL)                                                    \
+         for (unsigned __cnt = (__instr)->srcs_count, __n = 0; __n < __cnt;    \
+              __n++)                                                           \
+            if ((__srcreg = (__instr)->srcs[__n]))
+
+/* iterator for an instructions's sources (reg): */
+#define foreach_src(__srcreg, __instr) foreach_src_n (__srcreg, __i, __instr)
+
+#define foreach_src_if(__srcreg, __instr, __filter)                            \
+   foreach_src (__srcreg, __instr)                                             \
+      if (__filter(__srcreg))
+
+/* Is this either the first src in an alias group (see IR3_REG_FIRST_ALIAS) or a
+ * normal src.
+ */
+static inline bool
+ir3_src_is_first_in_group(struct ir3_register *src)
+{
+   return (src->flags & IR3_REG_FIRST_ALIAS) || !(src->flags & IR3_REG_ALIAS);
+}
+
+/* Iterator for an instruction's sources taking alias groups into account.
+ * __src_n will hold the original source index (i.e., the index before expanding
+ * collects to alias groups) while __alias_n the index within the current
+ * group. Thus, the actual source index is __src_n + __alias_n.
+ */
+#define foreach_src_with_alias_n(__srcreg, __src_n, __alias_n, __instr)        \
+   for (unsigned __src_n = -1, __alias_n = -1, __e = 0; !__e; __e = 1)         \
+      foreach_src (__srcreg, __instr)                                          \
+         if (__src_n += ir3_src_is_first_in_group(__srcreg) ? 1 : 0,           \
+             __alias_n =                                                       \
+                ir3_src_is_first_in_group(__srcreg) ? 0 : __alias_n + 1,       \
+             true)
+
+/* Iterator for all the sources in the alias group (see IR3_REG_FIRST_ALIAS)
+ * starting at source index __start. __alias_n is the offset of the source
+ * from the start of the alias group.
+ */
+#define foreach_src_in_alias_group_n(__alias, __alias_n, __instr, __start)     \
+   for (struct ir3_register *__alias = __instr->srcs[__start];                 \
+        __alias && (__alias->flags & IR3_REG_FIRST_ALIAS); __alias = NULL)     \
+      for (unsigned __i = __start, UNUSED __alias_n = 0;                       \
+           __i < __instr->srcs_count &&                                        \
+           (__i == __start || !ir3_src_is_first_in_group(__instr->srcs[__i])); \
+           __i++, __alias_n++)                                                 \
+         if ((__alias = __instr->srcs[__i]))
+
+#define foreach_src_in_alias_group(__alias, __instr, __start)                  \
+   foreach_src_in_alias_group_n (__alias, __alias_n, __instr, __start)
+
+static inline unsigned
+ir3_alias_group_size(struct ir3_instruction *instr, unsigned src_n)
+{
+   unsigned size = 0;
+
+   foreach_src_in_alias_group (src, instr, src_n) {
+      size++;
+   }
+
+   return size;
+}
+
+/* iterator for an instructions's destinations (reg), also returns dst #: */
+#define foreach_dst_n(__dstreg, __n, __instr)                                  \
+   if ((__instr)->dsts_count)                                                  \
+      for (struct ir3_register *__dstreg = (struct ir3_register *)~0; __dstreg;\
+           __dstreg = NULL)                                                    \
+         for (unsigned __cnt = (__instr)->dsts_count, __n = 0; __n < __cnt;    \
+              __n++)                                                           \
+            if ((__dstreg = (__instr)->dsts[__n]))
+
+/* iterator for an instructions's destinations (reg): */
+#define foreach_dst(__dstreg, __instr) foreach_dst_n (__dstreg, __i, __instr)
+
+#define foreach_dst_if(__dstreg, __instr, __filter)                            \
+   foreach_dst (__dstreg, __instr)                                             \
+      if (__filter(__dstreg))
+
+/* returns defining instruction for reg */
+/* TODO better name */
+static inline struct ir3_instruction *
+ssa(struct ir3_register *reg)
+{
+   if ((reg->flags & (IR3_REG_SSA | IR3_REG_ARRAY)) && reg->def)
+      return reg->def->instr;
+   return NULL;
+}
+
+static inline unsigned
+__ssa_src_cnt(struct ir3_instruction *instr)
+{
+   return instr->srcs_count + instr->deps_count;
+}
+
+static inline bool
+__is_false_dep(struct ir3_instruction *instr, unsigned n)
+{
+   if (n >= instr->srcs_count)
+      return true;
+   return false;
+}
+
+static inline struct ir3_instruction **
+__ssa_srcp_n(struct ir3_instruction *instr, unsigned n)
+{
+   if (__is_false_dep(instr, n))
+      return &instr->deps[n - instr->srcs_count];
+   if (ssa(instr->srcs[n]))
+      return &instr->srcs[n]->def->instr;
+   return NULL;
+}
+
+#define foreach_ssa_srcp_n(__srcp, __n, __instr)                               \
+   for (struct ir3_instruction **__srcp = (void *)~0; __srcp; __srcp = NULL)   \
+      for (unsigned __cnt = __ssa_src_cnt(__instr), __n = 0; __n < __cnt;      \
+           __n++)                                                              \
+         if ((__srcp = __ssa_srcp_n(__instr, __n)))
+
+#define foreach_ssa_srcp(__srcp, __instr)                                      \
+   foreach_ssa_srcp_n (__srcp, __i, __instr)
+
+/* iterator for an instruction's SSA sources (instr), also returns src #: */
+#define foreach_ssa_src_n(__srcinst, __n, __instr)                             \
+   for (struct ir3_instruction *__srcinst = (void *)~0; __srcinst;             \
+        __srcinst = NULL)                                                      \
+      foreach_ssa_srcp_n (__srcp, __n, __instr)                                \
+         if ((__srcinst = *__srcp))
+
+/* iterator for an instruction's SSA sources (instr): */
+#define foreach_ssa_src(__srcinst, __instr)                                    \
+   foreach_ssa_src_n (__srcinst, __i, __instr)
+
+/* iterators for shader inputs: */
+#define foreach_input_n(__ininstr, __cnt, __ir)                                \
+   for (struct ir3_instruction *__ininstr = (void *)~0; __ininstr;             \
+        __ininstr = NULL)                                                      \
+      for (unsigned __cnt = 0; __cnt < (__ir)->inputs_count; __cnt++)          \
+         if ((__ininstr = (__ir)->inputs[__cnt]))
+#define foreach_input(__ininstr, __ir) foreach_input_n (__ininstr, __i, __ir)
+
+/* iterators for instructions: */
+#define foreach_instr(__instr, __list)                                         \
+   list_for_each_entry (struct ir3_instruction, __instr, __list, node)
+#define foreach_instr_from(__instr, __start, __list)                           \
+   list_for_each_entry_from(struct ir3_instruction, __instr, &(__start)->node, \
+                            __list, node)
+#define foreach_instr_rev(__instr, __list)                                     \
+   list_for_each_entry_rev (struct ir3_instruction, __instr, __list, node)
+#define foreach_instr_safe(__instr, __list)                                    \
+   list_for_each_entry_safe (struct ir3_instruction, __instr, __list, node)
+#define foreach_instr_from_safe(__instr, __start, __list)                      \
+   list_for_each_entry_from_safe(struct ir3_instruction, __instr, __start,     \
+                                 __list, node)
+
+/* Iterate over all instructions in a repeat group. */
+#define foreach_instr_rpt(__rpt, __instr)                                      \
+   if (assert(ir3_instr_is_first_rpt(__instr)), true)                          \
+      for (struct ir3_instruction *__rpt = __instr; __rpt;                     \
+           __rpt = __rpt->rpt_next)
+
+/* Iterate over all instructions except the first one in a repeat group. */
+#define foreach_instr_rpt_excl(__rpt, __instr)                                 \
+   if (assert(ir3_instr_is_first_rpt(__instr)), true)                          \
+      for (struct ir3_instruction *__rpt = __instr->rpt_next; __rpt;           \
+           __rpt = __rpt->rpt_next)
+
+#define foreach_instr_rpt_excl_safe(__rpt, __instr)                            \
+   if (assert(ir3_instr_is_first_rpt(__instr)), __instr->rpt_next)             \
+      for (struct ir3_instruction *__rpt = __instr->rpt_next,                  \
+                                  *__next = __rpt->rpt_next;                   \
+           __rpt; __rpt = __next, __next = __next ? __next->rpt_next : NULL)
+
+/* iterators for blocks: */
+#define foreach_block(__block, __list)                                         \
+   list_for_each_entry (struct ir3_block, __block, __list, node)
+#define foreach_block_safe(__block, __list)                                    \
+   list_for_each_entry_safe (struct ir3_block, __block, __list, node)
+#define foreach_block_rev(__block, __list)                                     \
+   list_for_each_entry_rev (struct ir3_block, __block, __list, node)
+#define foreach_block_from(__block, __list, __start)                           \
+   list_for_each_entry_from (struct ir3_block, __block, __start, __list, node)
+#define foreach_main_block(__block, __ir)                                      \
+   foreach_block_from (__block, &__ir->block_list, ir3_after_preamble(__ir))
+
+/* iterators for arrays: */
+#define foreach_array(__array, __list)                                         \
+   list_for_each_entry (struct ir3_array, __array, __list, node)
+#define foreach_array_safe(__array, __list)                                    \
+   list_for_each_entry_safe (struct ir3_array, __array, __list, node)
 
 uint32_t block_id(struct ir3_block *block);
 
@@ -871,8 +1084,14 @@ unsigned ir3_get_reg_dependent_max_waves(const struct ir3_compiler *compiler,
 unsigned ir3_get_reg_independent_max_waves(struct ir3_shader_variant *v,
                                            bool double_threadsize);
 
+unsigned ir3_get_min_reg_count(const struct ir3_shader_variant *v,
+                               bool double_threadsize);
+
 bool ir3_should_double_threadsize(struct ir3_shader_variant *v,
                                   unsigned regs_count);
+
+unsigned ir3_get_waves_per_wg(struct ir3_shader_variant *v,
+                              bool double_threadsize);
 
 struct ir3_block *ir3_block_create(struct ir3 *shader);
 
@@ -889,6 +1108,8 @@ void ir3_instr_add_dep(struct ir3_instruction *instr,
                        struct ir3_instruction *dep);
 const char *ir3_instr_name(struct ir3_instruction *instr);
 void ir3_instr_remove(struct ir3_instruction *instr);
+struct ir3_instruction *ir3_instr_prev(struct ir3_instruction *instr);
+struct ir3_instruction *ir3_instr_next(struct ir3_instruction *instr);
 
 void ir3_instr_create_rpt(struct ir3_instruction **instrs, unsigned n);
 bool ir3_instr_is_rpt(const struct ir3_instruction *instr);
@@ -984,6 +1205,8 @@ int ir3_flut(struct ir3_register *src_reg);
 bool ir3_valid_flags(struct ir3_instruction *instr, unsigned n, unsigned flags);
 
 bool ir3_valid_immediate(struct ir3_instruction *instr, int32_t immed);
+bool ir3_valid_const(struct ir3_instruction *instr, unsigned src_n,
+                     unsigned num);
 
 /**
  * Given an instruction whose result we want to test for nonzero, return a
@@ -1066,10 +1289,10 @@ is_same_type_reg(struct ir3_register *dst, struct ir3_register *src)
 
 /* Is it a non-transformative (ie. not type changing) mov?  This can
  * also include absneg.s/absneg.f, which for the most part can be
- * treated as a mov (single src argument).
+ * treated as a mov (single src argument) with source modifiers.
  */
 static inline bool
-is_same_type_mov(struct ir3_instruction *instr)
+is_same_type_mov(struct ir3_instruction *instr, bool allow_src_mods)
 {
    struct ir3_register *dst;
 
@@ -1085,6 +1308,8 @@ is_same_type_mov(struct ir3_instruction *instr)
       break;
    case OPC_ABSNEG_F:
    case OPC_ABSNEG_S:
+      if (!allow_src_mods)
+         return false;
       if (instr->flags & IR3_INSTR_SAT)
          return false;
       /* If the type of dest reg and src reg are different,
@@ -1172,6 +1397,12 @@ static inline bool
 is_alu(struct ir3_instruction *instr)
 {
    return (1 <= opc_cat(instr->opc)) && (opc_cat(instr->opc) <= 3);
+}
+
+static inline bool
+is_mov(struct ir3_instruction *instr)
+{
+   return opc_cat(instr->opc) == 1;
 }
 
 static inline bool
@@ -1306,6 +1537,7 @@ is_bool(struct ir3_instruction *instr)
    case OPC_CMPS_F:
    case OPC_CMPS_S:
    case OPC_CMPS_U:
+   case OPC_GETBIT_B:
       return true;
    default:
       return false;
@@ -1480,10 +1712,10 @@ writes_gpr(struct ir3_instruction *instr)
 static inline bool
 writes_addr0(struct ir3_instruction *instr)
 {
-   /* Note: only the first dest can write to a0.x */
-   if (instr->dsts_count > 0) {
-      struct ir3_register *dst = instr->dsts[0];
-      return dst->num == regid(REG_A0, 0);
+   foreach_dst (dst, instr) {
+      if (dst->num == regid(REG_A0, 0)) {
+         return true;
+      }
    }
    return false;
 }
@@ -1491,10 +1723,10 @@ writes_addr0(struct ir3_instruction *instr)
 static inline bool
 writes_addr1(struct ir3_instruction *instr)
 {
-   /* Note: only the first dest can write to a1.x */
-   if (instr->dsts_count > 0) {
-      struct ir3_register *dst = instr->dsts[0];
-      return dst->num == regid(REG_A0, 1);
+   foreach_dst (dst, instr) {
+      if (dst->num == regid(REG_A0, 1)) {
+         return true;
+      }
    }
    return false;
 }
@@ -1531,6 +1763,7 @@ writes_pred(struct ir3_instruction *instr)
 #define SHARED_REG_SIZE (4 * 8)
 #define NONGPR_REG_START (SHARED_REG_START + SHARED_REG_SIZE)
 #define NONGPR_REG_SIZE (4 * 8)
+#define CONST_REG_SIZE (4 * 512)
 
 enum ir3_reg_file {
    IR3_FILE_FULL,
@@ -1564,16 +1797,6 @@ ir3_reg_file_offset(const struct ir3_register *reg, unsigned num,
       *file = IR3_FILE_HALF;
       return num;
    }
-}
-
-/* returns defining instruction for reg */
-/* TODO better name */
-static inline struct ir3_instruction *
-ssa(struct ir3_register *reg)
-{
-   if ((reg->flags & (IR3_REG_SSA | IR3_REG_ARRAY)) && reg->def)
-      return reg->def->instr;
-   return NULL;
 }
 
 static inline bool
@@ -1867,188 +2090,6 @@ ir3_try_swap_signedness(opc_t opc, bool *can_swap)
    }
 }
 
-#define MASK(n) ((1 << (n)) - 1)
-
-/* iterator for an instructions's sources (reg), also returns src #: */
-#define foreach_src_n(__srcreg, __n, __instr)                                  \
-   if ((__instr)->srcs_count)                                                  \
-      for (struct ir3_register *__srcreg = (struct ir3_register *)~0; __srcreg;\
-           __srcreg = NULL)                                                    \
-         for (unsigned __cnt = (__instr)->srcs_count, __n = 0; __n < __cnt;    \
-              __n++)                                                           \
-            if ((__srcreg = (__instr)->srcs[__n]))
-
-/* iterator for an instructions's sources (reg): */
-#define foreach_src(__srcreg, __instr) foreach_src_n (__srcreg, __i, __instr)
-
-#define foreach_src_if(__srcreg, __instr, __filter)                            \
-   foreach_src (__srcreg, __instr)                                             \
-      if (__filter(__srcreg))
-
-/* Is this either the first src in an alias group (see IR3_REG_FIRST_ALIAS) or a
- * normal src.
- */
-static inline bool
-ir3_src_is_first_in_group(struct ir3_register *src)
-{
-   return (src->flags & IR3_REG_FIRST_ALIAS) || !(src->flags & IR3_REG_ALIAS);
-}
-
-/* Iterator for an instruction's sources taking alias groups into account.
- * __src_n will hold the original source index (i.e., the index before expanding
- * collects to alias groups) while __alias_n the index within the current
- * group. Thus, the actual source index is __src_n + __alias_n.
- */
-#define foreach_src_with_alias_n(__srcreg, __src_n, __alias_n, __instr)        \
-   for (unsigned __src_n = -1, __alias_n = -1, __e = 0; !__e; __e = 1)         \
-      foreach_src (__srcreg, __instr)                                          \
-         if (__src_n += ir3_src_is_first_in_group(__srcreg) ? 1 : 0,           \
-             __alias_n =                                                       \
-                ir3_src_is_first_in_group(__srcreg) ? 0 : __alias_n + 1,       \
-             true)
-
-/* Iterator for all the sources in the alias group (see IR3_REG_FIRST_ALIAS)
- * starting at source index __start. __alias_n is the offset of the source
- * from the start of the alias group.
- */
-#define foreach_src_in_alias_group_n(__alias, __alias_n, __instr, __start)     \
-   for (struct ir3_register *__alias = __instr->srcs[__start];                 \
-        __alias && (__alias->flags & IR3_REG_FIRST_ALIAS); __alias = NULL)     \
-      for (unsigned __i = __start, __alias_n = 0;                              \
-           __i < __instr->srcs_count &&                                        \
-           (__i == __start || !ir3_src_is_first_in_group(__instr->srcs[__i])); \
-           __i++, __alias_n++)                                                 \
-         if ((__alias = __instr->srcs[__i]))
-
-#define foreach_src_in_alias_group(__alias, __instr, __start)                  \
-   foreach_src_in_alias_group_n (__alias, __alias_n, __instr, __start)
-
-static inline unsigned
-ir3_alias_group_size(struct ir3_instruction *instr, unsigned src_n)
-{
-   unsigned size = 0;
-
-   foreach_src_in_alias_group (src, instr, src_n) {
-      size++;
-   }
-
-   return size;
-}
-
-/* iterator for an instructions's destinations (reg), also returns dst #: */
-#define foreach_dst_n(__dstreg, __n, __instr)                                  \
-   if ((__instr)->dsts_count)                                                  \
-      for (struct ir3_register *__dstreg = (struct ir3_register *)~0; __dstreg;\
-           __dstreg = NULL)                                                    \
-         for (unsigned __cnt = (__instr)->dsts_count, __n = 0; __n < __cnt;    \
-              __n++)                                                           \
-            if ((__dstreg = (__instr)->dsts[__n]))
-
-/* iterator for an instructions's destinations (reg): */
-#define foreach_dst(__dstreg, __instr) foreach_dst_n (__dstreg, __i, __instr)
-
-#define foreach_dst_if(__dstreg, __instr, __filter)                            \
-   foreach_dst (__dstreg, __instr)                                             \
-      if (__filter(__dstreg))
-
-static inline unsigned
-__ssa_src_cnt(struct ir3_instruction *instr)
-{
-   return instr->srcs_count + instr->deps_count;
-}
-
-static inline bool
-__is_false_dep(struct ir3_instruction *instr, unsigned n)
-{
-   if (n >= instr->srcs_count)
-      return true;
-   return false;
-}
-
-static inline struct ir3_instruction **
-__ssa_srcp_n(struct ir3_instruction *instr, unsigned n)
-{
-   if (__is_false_dep(instr, n))
-      return &instr->deps[n - instr->srcs_count];
-   if (ssa(instr->srcs[n]))
-      return &instr->srcs[n]->def->instr;
-   return NULL;
-}
-
-#define foreach_ssa_srcp_n(__srcp, __n, __instr)                               \
-   for (struct ir3_instruction **__srcp = (void *)~0; __srcp; __srcp = NULL)   \
-      for (unsigned __cnt = __ssa_src_cnt(__instr), __n = 0; __n < __cnt;      \
-           __n++)                                                              \
-         if ((__srcp = __ssa_srcp_n(__instr, __n)))
-
-#define foreach_ssa_srcp(__srcp, __instr)                                      \
-   foreach_ssa_srcp_n (__srcp, __i, __instr)
-
-/* iterator for an instruction's SSA sources (instr), also returns src #: */
-#define foreach_ssa_src_n(__srcinst, __n, __instr)                             \
-   for (struct ir3_instruction *__srcinst = (void *)~0; __srcinst;             \
-        __srcinst = NULL)                                                      \
-      foreach_ssa_srcp_n (__srcp, __n, __instr)                                \
-         if ((__srcinst = *__srcp))
-
-/* iterator for an instruction's SSA sources (instr): */
-#define foreach_ssa_src(__srcinst, __instr)                                    \
-   foreach_ssa_src_n (__srcinst, __i, __instr)
-
-/* iterators for shader inputs: */
-#define foreach_input_n(__ininstr, __cnt, __ir)                                \
-   for (struct ir3_instruction *__ininstr = (void *)~0; __ininstr;             \
-        __ininstr = NULL)                                                      \
-      for (unsigned __cnt = 0; __cnt < (__ir)->inputs_count; __cnt++)          \
-         if ((__ininstr = (__ir)->inputs[__cnt]))
-#define foreach_input(__ininstr, __ir) foreach_input_n (__ininstr, __i, __ir)
-
-/* iterators for instructions: */
-#define foreach_instr(__instr, __list)                                         \
-   list_for_each_entry (struct ir3_instruction, __instr, __list, node)
-#define foreach_instr_from(__instr, __start, __list)                           \
-   list_for_each_entry_from(struct ir3_instruction, __instr, &(__start)->node, \
-                            __list, node)
-#define foreach_instr_rev(__instr, __list)                                     \
-   list_for_each_entry_rev (struct ir3_instruction, __instr, __list, node)
-#define foreach_instr_safe(__instr, __list)                                    \
-   list_for_each_entry_safe (struct ir3_instruction, __instr, __list, node)
-#define foreach_instr_from_safe(__instr, __start, __list)                      \
-   list_for_each_entry_from_safe(struct ir3_instruction, __instr, __start,     \
-                                 __list, node)
-
-/* Iterate over all instructions in a repeat group. */
-#define foreach_instr_rpt(__rpt, __instr)                                      \
-   if (assert(ir3_instr_is_first_rpt(__instr)), true)                          \
-      for (struct ir3_instruction *__rpt = __instr; __rpt;                     \
-           __rpt = __rpt->rpt_next)
-
-/* Iterate over all instructions except the first one in a repeat group. */
-#define foreach_instr_rpt_excl(__rpt, __instr)                                 \
-   if (assert(ir3_instr_is_first_rpt(__instr)), true)                          \
-      for (struct ir3_instruction *__rpt = __instr->rpt_next; __rpt;           \
-           __rpt = __rpt->rpt_next)
-
-#define foreach_instr_rpt_excl_safe(__rpt, __instr)                            \
-   if (assert(ir3_instr_is_first_rpt(__instr)), __instr->rpt_next)             \
-      for (struct ir3_instruction *__rpt = __instr->rpt_next,                  \
-                                  *__next = __rpt->rpt_next;                   \
-           __rpt; __rpt = __next, __next = __next ? __next->rpt_next : NULL)
-
-/* iterators for blocks: */
-#define foreach_block(__block, __list)                                         \
-   list_for_each_entry (struct ir3_block, __block, __list, node)
-#define foreach_block_safe(__block, __list)                                    \
-   list_for_each_entry_safe (struct ir3_block, __block, __list, node)
-#define foreach_block_rev(__block, __list)                                     \
-   list_for_each_entry_rev (struct ir3_block, __block, __list, node)
-
-/* iterators for arrays: */
-#define foreach_array(__array, __list)                                         \
-   list_for_each_entry (struct ir3_array, __array, __list, node)
-#define foreach_array_safe(__array, __list)                                    \
-   list_for_each_entry_safe (struct ir3_array, __array, __list, node)
-
 #define IR3_PASS(ir, pass, ...)                                                \
    ({                                                                          \
       bool progress = pass(ir, ##__VA_ARGS__);                                 \
@@ -2123,7 +2164,7 @@ needs_ss(const struct ir3_compiler *compiler, struct ir3_instruction *producer,
 static inline bool
 supports_ss(struct ir3_instruction *instr)
 {
-   return opc_cat(instr->opc) < 5 || instr->opc == OPC_ALIAS;
+   return opc_cat(instr->opc) < 5 || opc_cat(instr->opc) == 7;
 }
 
 /* The soft delay for approximating the cost of (ss). */
@@ -2157,14 +2198,18 @@ is_sy_producer(struct ir3_instruction *instr)
       is_atomic(instr->opc);
 }
 
+static inline bool
+is_compute_or_frag(mesa_shader_stage type)
+{
+   return mesa_shader_stage_is_compute(type) || (type == MESA_SHADER_FRAGMENT);
+}
+
 static inline unsigned
 soft_sy_delay(struct ir3_instruction *instr, struct ir3 *shader)
 {
    /* TODO: this is just an optimistic guess, we can do better post-RA.
     */
-   bool double_wavesize =
-      shader->type == MESA_SHADER_FRAGMENT ||
-      shader->type == MESA_SHADER_COMPUTE;
+   bool double_wavesize = is_compute_or_frag(shader->type);
 
    unsigned components = reg_elems(instr->dsts[0]);
 
@@ -2275,7 +2320,8 @@ void ir3_ra_predicates(struct ir3_shader_variant *v);
 bool ir3_lower_subgroups(struct ir3 *ir);
 
 /* legalize: */
-bool ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary);
+bool ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary,
+                  bool is_preamble_speculatable);
 bool ir3_legalize_relative(struct ir3 *ir);
 
 static inline bool
@@ -2711,7 +2757,7 @@ static inline struct ir3_instruction *ir3_##name(                              \
    struct ir3_instruction *instr =                                             \
       ir3_build_instr(build, opc, dst_count, 1);                               \
    unsigned dst_flag = scalar_alu ? (a->dsts[0]->flags & IR3_REG_SHARED) : 0;  \
-   for (unsigned i = 0; i < dst_count; i++)                                    \
+   if (dst_count > 0)                                                          \
       __ssa_dst(instr)->flags |= dst_flag;                                     \
    __ssa_src(instr, a, aflags);                                                \
    instr->flags |= flag;                                                       \
@@ -2732,7 +2778,10 @@ static inline struct ir3_instruction_rpt ir3_##name##_rpt(                     \
 /* clang-format on */
 #define INSTR1F(f, name)  __INSTR1(IR3_INSTR_##f, 1, name##_##f, OPC_##name,   \
                                    false)
+#define INSTR1FEXTRADST(f, name)  __INSTR1(IR3_INSTR_##f, 2, name##_##f,       \
+                                           OPC_##name, false)
 #define INSTR1(name)      __INSTR1((ir3_instruction_flags)0, 1, name, OPC_##name, false)
+#define INSTR1EXTRADST(name) __INSTR1((ir3_instruction_flags)0, 2, name, OPC_##name, false)
 #define INSTR1S(name)     __INSTR1((ir3_instruction_flags)0, 1, name, OPC_##name, true)
 #define INSTR1NODST(name) __INSTR1((ir3_instruction_flags)0, 0, name, OPC_##name, false)
 
@@ -3019,13 +3068,13 @@ INSTR1S(COS)
 INSTR1S(SQRT)
 
 /* cat5 instructions: */
-INSTR1(DSX)
-INSTR1(DSXPP_MACRO)
-INSTR1(DSY)
-INSTR1(DSYPP_MACRO)
-INSTR1F(3D, DSX)
-INSTR1F(3D, DSY)
-INSTR1(RGETPOS)
+INSTR1EXTRADST(DSX)
+INSTR1EXTRADST(DSXPP_MACRO)
+INSTR1EXTRADST(DSY)
+INSTR1EXTRADST(DSYPP_MACRO)
+INSTR1FEXTRADST(3D, DSX)
+INSTR1FEXTRADST(3D, DSY)
+INSTR1EXTRADST(RGETPOS)
 
 static inline struct ir3_instruction *
 ir3_SAM(struct ir3_builder *build, opc_t opc, type_t type, unsigned wrmask,
@@ -3045,7 +3094,10 @@ ir3_SAM(struct ir3_builder *build, opc_t opc, type_t type, unsigned wrmask,
       nreg++;
    }
 
-   sam = ir3_build_instr(build, opc, 1, nreg);
+   /* Add an extra destination for fake writes to a0.x for the alias.tex
+    * workaround.
+    */
+   sam = ir3_build_instr(build, opc, 2, nreg);
    sam->flags |= flags;
    __ssa_dst(sam)->wrmask = wrmask;
    if (flags & IR3_INSTR_S2EN) {
@@ -3101,6 +3153,7 @@ INSTR3NODST(STLW)
 INSTR3NODST(STP)
 INSTR1(RESINFO)
 INSTR1(RESFMT)
+INSTR1(RESBASE)
 INSTR2(ATOMIC_ADD)
 INSTR2(ATOMIC_SUB)
 INSTR2(ATOMIC_XCHG)
@@ -3330,6 +3383,8 @@ struct ir3_nop_state {
    unsigned half_ready[GPR_REG_SIZE];
 };
 
+typedef BITSET_DECLARE(conststate_t, CONST_REG_SIZE);
+
 struct ir3_legalize_state {
    regmask_t needs_ss;
    regmask_t needs_ss_scalar_full; /* half scalar ALU producer -> full scalar ALU consumer */
@@ -3340,8 +3395,8 @@ struct ir3_legalize_state {
    regmask_t needs_ss_scalar_war; /* scalar ALU write -> ALU write */
    regmask_t needs_ss_or_sy_scalar_war;
    regmask_t needs_sy;
-   bool needs_ss_for_const;
-   bool needs_sy_for_const;
+   conststate_t needs_ss_for_const;
+   conststate_t needs_sy_for_const;
 
    /* Next instruction needs (ss)/(sy), no matter its dsts/srcs. */
    bool force_ss;
@@ -3389,5 +3444,8 @@ ir3_required_sync_flags(struct ir3_legalize_state *state,
 unsigned ir3_required_delay(struct ir3_legalize_state *state,
                             struct ir3_compiler *compiler,
                             struct ir3_instruction *instr);
+
+bool ir3_prefetch_sam_needs_helpers(struct ir3_compiler *compiler,
+                                    struct ir3_instruction *sam);
 
 #endif /* IR3_H_ */

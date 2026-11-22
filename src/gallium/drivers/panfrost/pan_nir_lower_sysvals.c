@@ -67,7 +67,7 @@ sysval_for_intrinsic(unsigned arch, nir_intrinsic_instr *intr, unsigned *offset)
    case nir_intrinsic_load_num_vertices:
       return PAN_SYSVAL_NUM_VERTICES;
 
-   case nir_intrinsic_load_raw_vertex_offset_pan:
+   case nir_intrinsic_load_raw_vertex_offset:
       return PAN_SYSVAL_VERTEX_INSTANCE_OFFSETS;
    case nir_intrinsic_load_base_vertex:
       *offset = 4;
@@ -110,6 +110,13 @@ sysval_for_intrinsic(unsigned arch, nir_intrinsic_instr *intr, unsigned *offset)
       return PAN_SYSVAL(RT_CONVERSION, rt | (size << 4));
    }
 
+   case nir_intrinsic_image_samples: {
+      uint32_t uindex = nir_src_as_uint(intr->src[0]);
+      bool is_array = nir_intrinsic_image_array(intr);
+      unsigned dim = nir_intrinsic_dest_components(intr) - is_array;
+
+      return PAN_SYSVAL(IMAGE_SAMPLES, PAN_TXS_SYSVAL_ID(uindex, dim, is_array));
+   }
    case nir_intrinsic_image_size: {
       uint32_t uindex = nir_src_as_uint(intr->src[0]);
       bool is_array = nir_intrinsic_image_array(intr);

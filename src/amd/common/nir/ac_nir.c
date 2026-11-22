@@ -10,10 +10,16 @@
 #include "nir_builder.h"
 #include "nir_intrinsics.h"
 
+#if AMD_LLVM_AVAILABLE
+#include <llvm/Config/llvm-config.h>
+#endif
+
 /* Set NIR options shared by ACO, LLVM, RADV, and radeonsi. */
-void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
+void ac_nir_set_options(const struct ac_compiler_info *info, bool use_llvm,
                         nir_shader_compiler_options *options)
 {
+   memset(options, 0, sizeof(*options));
+
    /*        |---------------------------------- Performance & Availability --------------------------------|
     *        |MAD/MAC/MADAK/MADMK|MAD_LEGACY|MAC_LEGACY|    FMA     |FMAC/FMAAK/FMAMK|FMA_LEGACY|PK_FMA_F16,|Best choice
     * Arch   |    F32,F16,F64    | F32,F16  | F32,F16  |F32,F16,F64 |    F32,F16     |   F32    |PK_FMAC_F16|F16,F32,F64
@@ -34,7 +40,17 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
     * gfx10 and older prefer MAD for F32 because of the legacy instruction.
     */
 
-   memset(options, 0, sizeof(*options));
+   options->float_mul_add32 = nir_float_muladd_support_has_ffma;
+   if (info->has_mad32)
+      options->float_mul_add32 |= nir_float_muladd_support_prefers_split;
+
+   if (info->gfx_level >= GFX8) {
+      options->float_mul_add16 = nir_float_muladd_support_has_ffma;
+      if (info->gfx_level == GFX8)
+         options->float_mul_add16 |= nir_float_muladd_support_prefers_split;
+   }
+
+   options->float_mul_add64 = nir_float_muladd_support_has_ffma;
    options->vertex_id_zero_based = true;
    options->lower_scmp = true;
    options->lower_flrp16 = true;
@@ -65,7 +81,10 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->lower_iadd_sat = info->gfx_level <= GFX8;
    options->lower_hadd = true;
    options->lower_mul_32x16 = true;
-   options->lower_bfloat16_conversions = true,
+   options->lower_bfloat16_conversions = true;
+   options->lower_uadd_carry = true;
+   options->lower_usub_borrow = true;
+   options->has_ldexp = true;
    options->has_bfe = true;
    options->has_bfm = true;
    options->has_bitfield_select = true;
@@ -73,23 +92,24 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->has_ford_funord = true;
    options->has_fsub = true;
    options->has_isub = true;
-   options->has_sdot_4x8 = info->cu_info.has_accelerated_dot_product;
-   options->has_sudot_4x8 = info->cu_info.has_accelerated_dot_product && info->gfx_level >= GFX11;
-   options->has_udot_4x8 = info->cu_info.has_accelerated_dot_product;
-   options->has_sdot_4x8_sat = info->cu_info.has_accelerated_dot_product;
-   options->has_sudot_4x8_sat = info->cu_info.has_accelerated_dot_product && info->gfx_level >= GFX11;
-   options->has_udot_4x8_sat = info->cu_info.has_accelerated_dot_product;
-   options->has_dot_2x16 = info->cu_info.has_accelerated_dot_product && info->gfx_level < GFX11;
+   options->has_sdot_4x8 = info->has_accelerated_dot_product;
+   options->has_sudot_4x8 = info->has_accelerated_dot_product && info->gfx_level >= GFX11;
+   options->has_udot_4x8 = info->has_accelerated_dot_product;
+   options->has_sdot_4x8_sat = info->has_accelerated_dot_product;
+   options->has_sudot_4x8_sat = info->has_accelerated_dot_product && info->gfx_level >= GFX11;
+   options->has_udot_4x8_sat = info->has_accelerated_dot_product;
+   options->has_dot_2x16 = info->has_accelerated_dot_product && info->gfx_level < GFX11;
    options->has_bfdot2_bfadd = info->gfx_level >= GFX12;
    options->has_find_msb_rev = true;
    options->has_pack_32_4x8 = true;
    options->has_pack_half_2x16_rtz = true;
    options->has_bit_test = !use_llvm;
    options->has_fmulz = true;
+   options->has_ffmaz_no_denorms = info->gfx_level >= GFX10_3;
    options->has_msad = true;
    options->has_shfr32 = true;
    options->has_mul24_relaxed = true;
-   options->has_f2e4m3fn_satfn = !use_llvm && info->gfx_level >= GFX12;
+   options->has_f2e4m3fn_satfn = !use_llvm && info->gfx_level >= GFX11_7;
    options->has_atomic_isub = true;
    options->has_atomic_load_store = true;
    options->lower_int64_options = nir_lower_imul64 | nir_lower_imul_high64 | nir_lower_imul_2x32_64 | nir_lower_divmod64 |
@@ -103,7 +123,7 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->optimize_quad_vote_to_reduce = !use_llvm;
    options->lower_fisnormal = true;
    options->support_16bit_alu = info->gfx_level >= GFX8;
-   options->vectorize_vec2_16bit = info->cu_info.has_packed_math_16bit;
+   options->vectorize_vec2_16bit = info->has_packed_math_16bit;
    options->discard_is_demote = true;
    options->optimize_sample_mask_in = true;
    options->optimize_load_front_face_fsign = true;
@@ -130,6 +150,14 @@ void ac_nir_set_options(struct radeon_info *info, bool use_llvm,
    options->max_workgroup_count[1] = UINT16_MAX;
    options->max_workgroup_count[2] = UINT16_MAX;
    options->max_samples = 8;
+
+   /* Workaround for LLVM bug that crashes when using legacy fma on GFX12. */
+#if AMD_LLVM_AVAILABLE
+   if (info->gfx_level == GFX12 && use_llvm && LLVM_VERSION_MAJOR <= 21)
+      options->has_ffmaz_no_denorms = false;
+#else
+   assert(!use_llvm);
+#endif
 }
 
 /* Sleep for the given number of clock cycles. */
@@ -154,31 +182,38 @@ ac_nir_sleep(nir_builder *b, unsigned num_cycles)
 /* Load argument with index start from arg plus relative_index. */
 nir_def *
 ac_nir_load_arg_at_offset(nir_builder *b, const struct ac_shader_args *ac_args,
-                          struct ac_arg arg, unsigned relative_index)
+                          struct ac_arg arg, unsigned relative_index, bool scalar_wg_div)
 {
+   assert(arg.used);
+
    unsigned arg_index = arg.arg_index + relative_index;
    unsigned num_components = ac_args->args[arg_index].size;
 
    if (ac_args->args[arg_index].skip)
       return nir_undef(b, num_components, 32);
 
-   if (ac_args->args[arg_index].file == AC_ARG_SGPR)
-      return nir_load_scalar_arg_amd(b, num_components, .base = arg_index);
-   else
+   if (ac_args->args[arg_index].file == AC_ARG_SGPR) {
+      if (scalar_wg_div)
+         return nir_load_scalar_arg_wg_div_amd(b, num_components, .base = arg_index);
+      else
+         return nir_load_scalar_arg_amd(b, num_components, .base = arg_index);
+   } else {
+      assert(!scalar_wg_div);
       return nir_load_vector_arg_amd(b, num_components, .base = arg_index);
+   }
 }
 
 nir_def *
 ac_nir_load_arg(nir_builder *b, const struct ac_shader_args *ac_args, struct ac_arg arg)
 {
-   return ac_nir_load_arg_at_offset(b, ac_args, arg, 0);
+   return ac_nir_load_arg_at_offset(b, ac_args, arg, 0, false);
 }
 
 nir_def *
 ac_nir_load_arg_upper_bound(nir_builder *b, const struct ac_shader_args *ac_args, struct ac_arg arg,
                             unsigned upper_bound)
 {
-   nir_def *value = ac_nir_load_arg_at_offset(b, ac_args, arg, 0);
+   nir_def *value = ac_nir_load_arg_at_offset(b, ac_args, arg, 0, false);
    nir_intrinsic_set_arg_upper_bound_u32_amd(nir_def_as_intrinsic(value),
                                              upper_bound);
    return value;
@@ -217,9 +252,49 @@ ac_nir_unpack_arg(nir_builder *b, const struct ac_shader_args *ac_args, struct a
    return ac_nir_unpack_value(b, value, rshift, bitwidth);
 }
 
+nir_def *
+ac_nir_unpack_arg_wg_div(nir_builder *b, const struct ac_shader_args *ac_args, struct ac_arg arg,
+                         unsigned rshift, unsigned bitwidth)
+{
+   nir_def *value = ac_nir_load_arg_at_offset(b, ac_args, arg, 0, true);
+   return ac_nir_unpack_value(b, value, rshift, bitwidth);
+}
+
+/* This lowers small indirect array derefs to if-else trees. We might want to do this before
+ * ac_nir_lower_indirect_derefs() to lower small array derefs to if-else trees earlier than
+ * lowering large array derefs to scratch. This is because we want to do the scratch lowering
+ * as late as possible (because scratch access isn't very optimizable), but the if-else tree
+ * lowering can be optimized. For example, an indirect access where we can know that all
+ * elements that might be accessed are equal could be replaced with a use of that element, or
+ * nir_opt_peephole_select() can flatten some of the if-else tree. */
 bool
-ac_nir_lower_indirect_derefs(nir_shader *shader,
-                             enum amd_gfx_level gfx_level)
+ac_nir_lower_indirect_derefs_early(nir_shader *shader)
+{
+   struct set vars;
+   _mesa_pointer_set_init(&vars, NULL);
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_function_temp_variable(var, impl) {
+         unsigned var_size, var_align;
+         glsl_get_natural_size_align_bytes(var->type, &var_size, &var_align);
+         if (var_size < 256)
+            _mesa_set_add(&vars, var);
+      }
+   }
+
+   bool progress = false;
+   if (vars.entries)
+      NIR_PASS(progress, shader, nir_lower_indirect_var_derefs_to_if_else_trees, &vars);
+
+   _mesa_set_fini(&vars, NULL);
+
+   return progress;
+}
+
+/* This lowers all indirect array derefs to either scratch adccess or if-else trees, ensuring
+ * that none remains.
+ */
+bool
+ac_nir_lower_indirect_derefs(nir_shader *shader)
 {
    bool progress = false;
 
@@ -310,20 +385,56 @@ ac_optimization_barrier_vgpr_array(const struct radeon_info *info, nir_builder *
 nir_def *
 ac_get_global_ids(nir_builder *b, unsigned num_components, unsigned bit_size)
 {
-   unsigned mask = BITFIELD_MASK(num_components);
+   assert(!b->shader->info.workgroup_size_variable);
+   assert(util_is_power_of_two_nonzero(b->shader->info.workgroup_size[0]));
+   assert(util_is_power_of_two_nonzero(b->shader->info.workgroup_size[1]));
+   assert(util_is_power_of_two_nonzero(b->shader->info.workgroup_size[2]));
 
-   nir_def *local_ids = nir_channels(b, nir_load_local_invocation_id(b), mask);
-   nir_def *block_ids = nir_channels(b, nir_load_workgroup_id(b), mask);
-   nir_def *block_size = nir_channels(b, nir_load_workgroup_size(b), mask);
+   unsigned log_block_size_x = util_logbase2(b->shader->info.workgroup_size[0]);
+   unsigned log_block_size_y = util_logbase2(b->shader->info.workgroup_size[1]);
+   unsigned log_block_size_z = util_logbase2(b->shader->info.workgroup_size[2]);
 
-   assert(bit_size == 32 || bit_size == 16);
-   if (bit_size == 16) {
-      local_ids = nir_i2iN(b, local_ids, bit_size);
-      block_ids = nir_i2iN(b, block_ids, bit_size);
-      block_size = nir_i2iN(b, block_size, bit_size);
+   /* Doing it in 32 bits results in smaller code size because each component becomes v_lshl_add_u32. */
+   if (bit_size != 16 || log_block_size_x != log_block_size_y || num_components == 1) {
+      return nir_u2uN(b, nir_trim_vector(b, nir_load_global_invocation_id(b, MAX2(32, bit_size)),
+                                         num_components), bit_size);
    }
 
-   return nir_iadd(b, nir_imul(b, block_ids, block_size), local_ids);
+   /* The following 16x2 ishl and iadd for XY is reduced to single v_lshl_add_u32 computing both
+    * components simultaneously because workgroup_size.xy is a square and there is no 16-bit
+    * integer wraparound. This is correct to do in general if all global IDs are representable
+    * in 16 bits.
+    *
+    * Z is computed in 32 bits to get v_lshl_add_u32.
+    */
+   nir_def *local_ids = nir_load_local_invocation_id(b);
+   nir_def *block_ids = nir_load_workgroup_id(b);
+
+   nir_def *xy = nir_i2i16(b, nir_trim_vector(b, block_ids, 2));
+   nir_def *z = nir_channel(b, block_ids, 2);
+
+   /* Promote a 16-bit vec2 ishl (imul) to a 32-bit scalar ishl (imul).
+    *    16x2 a.xy * k.xx = bitcast_u32(a) * k if (a.x * k) doesn't wrap around.
+    *
+    * TODO: nir_opt_algebraic could do this in the future. For that:
+    * - We need NUW to apply to ishl (meaning no bits shifted out).
+    * - We need nir_opt_algebraic to preserve NUW when replacing imul with ishl.
+    * - If the load_global_invocation_id lowering replaces this helper, it should set NUW
+    *   and the intrinsic should allow bit_size=16. (implying that all global IDs are
+    *   representable in 16 bits)
+    */
+   xy = nir_ishl_imm(b, nir_pack_32_2x16(b, xy), log_block_size_x);
+   z = nir_ishl_imm(b, z, log_block_size_z);
+
+   /* Promote 16-bit vec2 iadd to a 32-bit scalar iadd.
+    *    16x2 a.xy + b.xy = bitcast_u32(a) + bitcast_u32(b) if (a.x + b.x) doesn't wrap around.
+    */
+   xy = nir_iadd_nuw(b, xy, nir_pack_32_2x16(b, nir_i2i16(b, nir_trim_vector(b, local_ids, 2))));
+   z = nir_iadd_nuw(b, z, nir_channel(b, local_ids, 2));
+
+   nir_def *xyz = nir_vector_insert_imm(b, nir_pad_vector(b, nir_unpack_32_2x16(b, xy), 3),
+                                        nir_i2i16(b, z), 2);
+   return nir_trim_vector(b, xyz, num_components);
 }
 
 nir_def *
@@ -397,8 +508,6 @@ lower_bit_size_callback(const nir_instr *instr, enum amd_gfx_level chip, bool di
       switch (alu->op) {
       case nir_op_imul_high:
       case nir_op_umul_high:
-      case nir_op_uadd_carry:
-      case nir_op_usub_borrow:
          return 32;
       case nir_op_iabs:
       case nir_op_imax:
@@ -498,10 +607,8 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
                               nir_intrinsic_instr *high, void *data)
 {
    struct ac_nir_config *config = (struct ac_nir_config *)data;
-   bool uses_smem = (nir_intrinsic_has_access(low) &&
-                     nir_intrinsic_access(low) & ACCESS_SMEM_AMD) ||
-                    /* These don't have the "access" field. */
-                    low->intrinsic == nir_intrinsic_load_push_constant;
+   bool uses_smem = nir_intrinsic_has_access(low) &&
+                    nir_intrinsic_access(low) & ACCESS_SMEM_AMD;
    bool is_store = !nir_intrinsic_infos[low->intrinsic].has_dest;
    bool swizzled = low->intrinsic == nir_intrinsic_load_stack ||
                     low->intrinsic == nir_intrinsic_store_stack ||
@@ -516,6 +623,14 @@ ac_nir_mem_vectorize_callback(unsigned align_mul, unsigned align_offset, unsigne
    unsigned swizzle_element_size = config->gfx_level <= GFX8 ? 4 : 16;
 
    assert(!is_store || hole_size <= 0);
+
+   /* We don't have 5 component stores, so it makes no sense to create them just to split
+    * them again later. Additionally, they can result in suboptimal vectorization,
+    * i.e. vec5 + vec1 + vec2 instead of vec4 + vec4 -> vec8 because NIR doesn't
+    * have vec6 or vec7, and only two instructions are combined at a time.
+    */
+   if (is_store && num_components == 5)
+      return false;
 
    /* If we get derefs here, only shared memory derefs are expected. */
    assert((low->intrinsic != nir_intrinsic_load_deref &&
@@ -931,7 +1046,7 @@ ac_nir_op_supports_packed_math_16bit(const nir_alu_instr* alu)
 {
    switch (alu->op) {
    case nir_op_f2f16: {
-      nir_shader* shader = nir_cf_node_get_function(&alu->instr.block->cf_node)->function->shader;
+      nir_shader* shader = alu->instr.block->impl->function->shader;
       unsigned execution_mode = shader->info.float_controls_execution_mode;
       return (shader->options->force_f2f16_rtz && !nir_is_rounding_mode_rtne(execution_mode, 16)) ||
              nir_is_rounding_mode_rtz(execution_mode, 16);
@@ -992,6 +1107,15 @@ max_alu_src_identity_swizzle(const nir_alu_instr *alu, const nir_alu_src *src)
 uint8_t
 ac_nir_opt_vectorize_cb(const nir_instr *instr, const void *data)
 {
+   if (instr->type == nir_instr_type_phi) {
+      nir_phi_instr *phi = nir_instr_as_phi(instr);
+
+      if (phi->def.bit_size != 1 && phi->def.bit_size < 32)
+         return 32 / phi->def.bit_size;
+
+      return 1;
+   }
+
    if (instr->type != nir_instr_type_alu)
       return 0;
 

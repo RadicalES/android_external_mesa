@@ -58,7 +58,9 @@
 struct pipe_sampler_view *
 st_update_single_texture(struct st_context *st,
                          GLuint texUnit, bool glsl130_or_later,
-                         bool ignore_srgb_decode)
+                         bool ignore_srgb_decode,
+                         unsigned num_norelease_views,
+                         const struct pipe_sampler_view **norelease_views)
 {
    struct gl_context *ctx = st->ctx;
    struct gl_texture_object *texObj;
@@ -69,7 +71,7 @@ st_update_single_texture(struct st_context *st,
    GLenum target = texObj->Target;
 
    if (unlikely(target == GL_TEXTURE_BUFFER))
-      return st_get_buffer_sampler_view_from_stobj(st, texObj);
+      return st_get_buffer_sampler_view_from_stobj(st, texObj, num_norelease_views, norelease_views);
 
    if (!st_finalize_texture(ctx, st->pipe, texObj, 0) || !texObj->pt)
       return NULL; /* out of mem */
@@ -81,9 +83,24 @@ st_update_single_texture(struct st_context *st,
    return st_get_texture_sampler_view_from_stobj(st, texObj,
                                                  _mesa_get_samplerobj(ctx, texUnit),
                                                  glsl130_or_later,
-                                                 ignore_srgb_decode);
+                                                 ignore_srgb_decode,
+                                                 num_norelease_views, norelease_views);
 }
 
+
+
+/* Packed YUV (YUYV & friends) has one plane: chroma is interleaved with luma
+ * in the same memory.  If the dri frontend lowered it into two overlapping
+ * resources for sampling, pt->next is the chroma view; otherwise (stored
+ * natively, e.g. an EXT_YUV_target render target) pt itself already holds
+ * both.  Unrelated to NV12-style resources, which always chain one resource
+ * per plane.
+ */
+static struct pipe_resource *
+packed_yuv_chroma_resource(struct gl_texture_object *texObj)
+{
+   return texObj->pt->next ? texObj->pt->next : texObj->pt;
+}
 
 
 unsigned
@@ -99,7 +116,6 @@ st_get_sampler_views(struct st_context *st,
    GLbitfield texel_fetch_samplers = prog->info.textures_used_by_txf[0];
    GLbitfield free_slots = ~prog->SamplersUsed;
    GLbitfield external_samplers_used = prog->ExternalSamplersUsed;
-   GLuint unit;
    *extra_sampler_views = 0;
 
    if (samplers_used == 0x0 && old_max == 0)
@@ -110,7 +126,7 @@ st_get_sampler_views(struct st_context *st,
       (prog->shader_program ? prog->shader_program->GLSL_Version : 0) >= 130;
 
    /* loop over sampler units (aka tex image units) */
-   for (unit = 0; unit < num_textures; unit++) {
+   for (GLuint unit = 0; unit < num_textures; unit++) {
       unsigned bit = BITFIELD_BIT(unit);
 
       if (!(samplers_used & bit)) {
@@ -147,7 +163,9 @@ st_get_sampler_views(struct st_context *st,
        */
       sampler_views[unit] =
          st_update_single_texture(st, prog->SamplerUnits[unit], glsl130,
-                                  texel_fetch_samplers & bit);
+                                  texel_fetch_samplers & bit,
+                                  /* prevent any of these views from being released */
+                                  unit, (const struct pipe_sampler_view **)sampler_views);
    }
 
    /* For any external samplers with multiplaner YUV, stuff the additional
@@ -171,8 +189,8 @@ st_get_sampler_views(struct st_context *st,
       /* use original view as template: */
       tmpl = *sampler_views[unit];
 
-      /* if resource format matches then YUV wasn't lowered */
-      if (st_get_view_format(stObj) == stObj->pt->format)
+      /* if no extra YUV plane views are needed, skip */
+      if (!stObj->needs_yuv_plane_views)
          continue;
 
       switch (st_get_view_format(stObj)) {
@@ -182,7 +200,7 @@ st_get_sampler_views(struct st_context *st,
             break;
 
          /* we need one additional R8G8 view: */
-         tmpl.format = PIPE_FORMAT_RG88_UNORM;
+         tmpl.format = PIPE_FORMAT_R8G8_UNORM;
          tmpl.swizzle_g = PIPE_SWIZZLE_Y;   /* tmpl from Y plane is R8 */
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
@@ -195,7 +213,7 @@ st_get_sampler_views(struct st_context *st,
             break;
 
          /* we need one additional R8G8 view: */
-         tmpl.format = PIPE_FORMAT_RG88_UNORM;
+         tmpl.format = PIPE_FORMAT_R8G8_UNORM;
          tmpl.swizzle_g = PIPE_SWIZZLE_Y;   /* tmpl from Y plane is R8 */
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
@@ -208,7 +226,7 @@ st_get_sampler_views(struct st_context *st,
             break;
 
          /* we need one additional R8G8 view: */
-         tmpl.format = PIPE_FORMAT_RG88_UNORM;
+         tmpl.format = PIPE_FORMAT_R8G8_UNORM;
          tmpl.swizzle_g = PIPE_SWIZZLE_Y;   /* tmpl from Y plane is R8 */
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
@@ -219,7 +237,7 @@ st_get_sampler_views(struct st_context *st,
       case PIPE_FORMAT_NV24:
       case PIPE_FORMAT_NV42:
          /* we need one additional R8G8 view: */
-         tmpl.format = PIPE_FORMAT_RG88_UNORM;
+         tmpl.format = PIPE_FORMAT_R8G8_UNORM;
          tmpl.swizzle_g = PIPE_SWIZZLE_Y;   /* tmpl from Y plane is R8 */
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
@@ -231,7 +249,7 @@ st_get_sampler_views(struct st_context *st,
       case PIPE_FORMAT_P016:
       case PIPE_FORMAT_P030:
          /* we need one additional R16G16 view: */
-         tmpl.format = PIPE_FORMAT_RG1616_UNORM;
+         tmpl.format = stObj->pt->next->format;
          tmpl.swizzle_g = PIPE_SWIZZLE_Y;   /* tmpl from Y plane is R16 */
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
@@ -265,11 +283,12 @@ st_get_sampler_views(struct st_context *st,
       case PIPE_FORMAT_Y16_U16_V16_422_UNORM:
       case PIPE_FORMAT_Y16_U16_V16_444_UNORM:
          /* we need two additional R16 views: */
-         tmpl.format = PIPE_FORMAT_R16_UNORM;
+         tmpl.format = stObj->pt->next->format;
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
                pipe->create_sampler_view(pipe, stObj->pt->next, &tmpl);
          (*extra_sampler_views) |= 1 << extra;
+         tmpl.format = stObj->pt->next->next->format;
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
                pipe->create_sampler_view(pipe, stObj->pt->next->next, &tmpl);
@@ -282,13 +301,15 @@ st_get_sampler_views(struct st_context *st,
             /* no additional views needed */
             break;
 
-         /* we need one additional BGRA8888 view: */
-         tmpl.format = PIPE_FORMAT_BGRA8888_UNORM;
+         /* we need one additional B8G8R8A8 view of the chroma samples: */
+         tmpl.format = PIPE_FORMAT_B8G8R8A8_UNORM;
          tmpl.swizzle_b = PIPE_SWIZZLE_Z;
          tmpl.swizzle_a = PIPE_SWIZZLE_W;
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
-               pipe->create_sampler_view(pipe, stObj->pt->next, &tmpl);
+               pipe->create_sampler_view(pipe,
+                                         packed_yuv_chroma_resource(stObj),
+                                         &tmpl);
          (*extra_sampler_views) |= 1 << extra;
          break;
       case PIPE_FORMAT_UYVY:
@@ -298,13 +319,15 @@ st_get_sampler_views(struct st_context *st,
             /* no additional views needed */
             break;
 
-         /* we need one additional RGBA8888 view: */
-         tmpl.format = PIPE_FORMAT_RGBA8888_UNORM;
+         /* we need one additional R8G8B8A8 view of the chroma samples: */
+         tmpl.format = PIPE_FORMAT_R8G8B8A8_UNORM;
          tmpl.swizzle_b = PIPE_SWIZZLE_Z;
          tmpl.swizzle_a = PIPE_SWIZZLE_W;
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
-               pipe->create_sampler_view(pipe, stObj->pt->next, &tmpl);
+               pipe->create_sampler_view(pipe,
+                                         packed_yuv_chroma_resource(stObj),
+                                         &tmpl);
          (*extra_sampler_views) |= 1 << extra;
          break;
       case PIPE_FORMAT_Y210:
@@ -315,13 +338,15 @@ st_get_sampler_views(struct st_context *st,
             /* no additional views needed */
             break;
 
-         /* we need one additional R16G16B16A16 view: */
-         tmpl.format = PIPE_FORMAT_R16G16B16A16_UNORM;
+         /* we need one additional R16G16B16A16 view of the chroma samples: */
+         tmpl.format = packed_yuv_chroma_resource(stObj)->format;
          tmpl.swizzle_b = PIPE_SWIZZLE_Z;
          tmpl.swizzle_a = PIPE_SWIZZLE_W;
          extra = u_bit_scan(&free_slots);
          sampler_views[extra] =
-               pipe->create_sampler_view(pipe, stObj->pt->next, &tmpl);
+               pipe->create_sampler_view(pipe,
+                                         packed_yuv_chroma_resource(stObj),
+                                         &tmpl);
          (*extra_sampler_views) |= 1 << extra;
          break;
       default:
@@ -344,6 +369,19 @@ update_textures(struct st_context *st,
    unsigned extra_sampler_views = 0;
    unsigned num_textures =
       st_get_sampler_views(st, shader_stage, prog, sampler_views, &extra_sampler_views);
+
+   /* Emulated polygon stipple: bind the stipple texture at the unit the bound
+    * fragment shader variant expects (see st_update_fp / nir_lower_pstipple_fs),
+    * filling any gap with NULL views.
+    */
+   if (shader_stage == MESA_SHADER_FRAGMENT && st->fp_stipple_sampler >= 0) {
+      unsigned unit = st->fp_stipple_sampler;
+      assert(unit < PIPE_MAX_SAMPLERS);
+      for (unsigned i = num_textures; i < unit; i++)
+         sampler_views[i] = NULL;
+      sampler_views[unit] = st->pstipple.sampler_view;
+      num_textures = MAX2(num_textures, unit + 1);
+   }
 
    unsigned old_num_textures = st->state.num_sampler_views[shader_stage];
    unsigned num_unbind = old_num_textures > num_textures ?

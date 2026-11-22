@@ -12,6 +12,7 @@
 #include "vk_graphics_state.h"
 #include "vk_log.h"
 
+#include "pan_nir.h"
 #include "pan_shader.h"
 
 #include "panvk_blend.h"
@@ -81,19 +82,21 @@ get_blend_shader(struct panvk_device *dev,
 
    nir_shader *nir =
       GENX(pan_blend_create_shader)(state, src0_type, src1_type, rt);
+   PAN_NIR_SET_BLAKE3_INTERNAL(nir, &key);
 
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_load_blend_const,
             nir_metadata_control_flow, NULL);
 
    /* Compile the NIR shader */
    struct pan_compile_inputs inputs = {
-      .gpu_id = pdev->kmod.dev->props.gpu_id,
-      .gpu_variant = pdev->kmod.dev->props.gpu_variant,
+      .arch = PAN_ARCH,
+      .model = pdev->model,
       .is_blend = true,
+      /* Blend constants are loaded from the first four FAU words. */
+      .fau.reserved = 4,
    };
 
-   pan_preprocess_nir(nir, inputs.gpu_id);
-   pan_postprocess_nir(nir, inputs.gpu_id);
+   pan_preprocess_nir(nir, PAN_ARCH);
 
    VkResult result =
       panvk_per_arch(create_internal_shader)(dev, nir, &inputs, &shader);
@@ -117,7 +120,7 @@ static void
 emit_blend_desc(const struct pan_blend_state *state, uint8_t rt_idx,
                 const struct pan_shader_info *fs_info, uint8_t loc,
                 uint64_t fs_code, uint64_t blend_shader, uint16_t constant,
-                struct mali_blend_packed *bd)
+                bool dithered, struct mali_blend_packed *bd)
 {
    const struct pan_blend_rt_state *rt = &state->rts[rt_idx];
 
@@ -168,7 +171,7 @@ emit_blend_desc(const struct pan_blend_state *state, uint8_t rt_idx,
           */
          cfg.internal.fixed_function.num_comps = 4;
          cfg.internal.fixed_function.conversion.memory_format =
-            GENX(pan_dithered_format_from_pipe_format)(rt->format, false);
+            GENX(pan_dithered_format_from_pipe_format)(rt->format, dithered);
 
 #if PAN_ARCH >= 7
          if (cfg.internal.mode == MALI_BLEND_MODE_FIXED_FUNCTION &&
@@ -226,11 +229,11 @@ blend_needs_shader(const struct pan_blend_state *state, unsigned rt_idx,
       return false;
 
    /* Not all formats can be blended by fixed-function hardware */
-   if (!GENX(pan_blendable_format_from_pipe_format)(rt->format)->internal)
+   if (!GENX(pan_format_supports_hw_blend)(rt->format))
       return true;
 
    bool supports_2src = pan_blend_supports_2src(PAN_ARCH);
-   if (!pan_blend_can_fixed_function(rt->equation, supports_2src))
+   if (!pan_blend_can_fixed_function(PAN_ARCH, rt->equation, supports_2src))
       return true;
 
    unsigned constant_mask = pan_blend_constant_mask(rt->equation);
@@ -284,7 +287,7 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
       .alpha_to_one = dyns->ms.alpha_to_one_enable,
       .logicop_enable = cb->logic_op_enable,
       .logicop_func = vk_logic_op_to_pipe(cb->logic_op),
-      .rt_count = cmdbuf->state.gfx.render.fb.info.rt_count,
+      .rt_count = cmdbuf->state.gfx.render.fb.layout.rt_count,
       .constants =
          {
             cb->blend_constants[0],
@@ -296,7 +299,6 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
    uint64_t blend_shaders[8] = {};
    /* All bits set to one encodes unused fixed-function blend constant. */
    unsigned ff_blend_constant = ~0;
-   uint32_t blend_count = MAX2(cmdbuf->state.gfx.render.fb.info.rt_count, 1);
 
    uint8_t loc_rt[MAX_RTS], rt_loc[MAX_RTS];
    memset(loc_rt, MESA_VK_ATTACHMENT_UNUSED, sizeof(loc_rt));
@@ -380,13 +382,17 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
       ff_blend_constant = 0;
 
    struct mali_blend_packed packed[MAX_RTS];
-   for (uint8_t rt = 0; rt < blend_count; rt++) {
+   for (uint8_t rt = 0; rt < bs.rt_count; rt++) {
+      bool dithered = render->flags &
+                      VK_RENDERING_ENABLE_LEGACY_DITHERING_BIT_EXT;
+
       emit_blend_desc(&bs, rt, fs_info, rt_loc[rt], fs_code,
-                      blend_shaders[rt], ff_blend_constant, &packed[rt]);
+                      blend_shaders[rt], ff_blend_constant, dithered,
+                      &packed[rt]);
    }
 
    /* Copy into the GPU descriptor array */
-   typed_memcpy(bds, packed, blend_count);
+   typed_memcpy(bds, packed, bs.rt_count);
 
    /* Re-order blend descriptors for the shader
     *

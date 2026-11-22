@@ -56,32 +56,18 @@ if with_wayland_bind_display
     gen_args += [ '--bind-wl-display' ]
 endif
 
-g_egldispatchstubs_c = custom_target(
-  'g_egldispatchstubs.c',
+g_egldispatchstubs = custom_target(
   input : [
     'generate/gen_egl_dispatch.py',
     'generate/egl.xml', 'generate/egl_other.xml'
   ],
-  output : 'g_egldispatchstubs.c',
+  output : ['g_egldispatchstubs.c', 'g_egldispatchstubs.h'],
   command : [
-    prog_python, '@INPUT0@', gen_args, 'source', '@INPUT1@', '@INPUT2@'
+    prog_python, '@INPUT0@', gen_args,
+   '--source', '@OUTPUT0@', '--header', '@OUTPUT1@',
+   '@INPUT1@', '@INPUT2@'
   ],
-  depend_files : [ 'generate/eglFunctionList.py', glapi_xml_py_deps],
-  capture : true,
-)
-
-g_egldispatchstubs_h = custom_target(
-  'g_egldispatchstubs.h',
-  input : [
-    'generate/gen_egl_dispatch.py',
-    'generate/egl.xml', 'generate/egl_other.xml'
-  ],
-  output : 'g_egldispatchstubs.h',
-  command : [
-    prog_python, '@INPUT0@', gen_args, 'header', '@INPUT1@', '@INPUT2@'
-  ],
-  depend_files : [ 'generate/eglFunctionList.py', glapi_xml_py_deps],
-  capture : true,
+  depend_files : ['generate/eglFunctionList.py', glapi_xml_py_deps],
 )
 
 if with_dri
@@ -108,7 +94,7 @@ if with_dri
     files_egl += files('drivers/dri2/platform_x11.c')
     incs_for_egl += inc_loader_x11
     link_for_egl += libloader_x11
-    if with_dri_platform == 'drm'
+    if with_dri_platform == 'drm' or with_dri_platform == 'pseudo-drm'
       files_egl += files('drivers/dri2/platform_x11_dri3.c')
     endif
     deps_for_egl += [dep_x11_xcb, dep_xcb_xrandr, dep_xcb_xfixes, dep_xcb_shm]
@@ -122,7 +108,7 @@ if with_dri
     deps_for_egl += [dep_wayland_client, dep_wayland_server, dep_wayland_egl_headers]
     link_for_egl += libloader_wayland_helper
     files_egl += files('drivers/dri2/platform_wayland.c')
-    files_egl += wp_files['linux-dmabuf-unstable-v1']
+    files_egl += wp_files['linux-dmabuf-v1']
     files_egl += wp_files['presentation-time']
     if with_wayland_bind_display
       files_egl += [wayland_drm_client_protocol_h]
@@ -175,7 +161,7 @@ else
   egl_lib_version = '0.0.0'
   egl_lib_soversion = '0'
   deps_for_egl += dep_glvnd
-  files_egl += [g_egldispatchstubs_h, g_egldispatchstubs_c]
+  files_egl += [g_egldispatchstubs]
   files_egl += files('main/eglglvnd.c', 'main/egldispatchstubs.c')
 endif
 
@@ -200,12 +186,15 @@ egl_def = custom_target(
   command : gen_vs_module_defs_normal_command,
 )
 
+if egl_native_platform != ''
+  c_args_for_egl += '-D_EGL_NATIVE_PLATFORM=_EGL_PLATFORM_@0@'.format(egl_native_platform.to_upper())
+endif
+
 libegl = shared_library(
   egl_lib_name,
   files_egl,
   c_args : [
     c_args_for_egl,
-    '-D_EGL_NATIVE_PLATFORM=_EGL_PLATFORM_@0@'.format(egl_native_platform.to_upper()),
   ],
   cpp_args : [cpp_args_for_egl],
   gnu_symbol_visibility : 'hidden',

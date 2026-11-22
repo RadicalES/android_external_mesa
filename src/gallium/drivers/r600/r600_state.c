@@ -190,6 +190,9 @@ bool r600_is_format_supported(struct pipe_screen *screen,
 		}
 	}
 
+	if (unlikely(format == PIPE_FORMAT_L8_SRGB))
+		return false;
+
 	if (usage & PIPE_BIND_SAMPLER_VIEW) {
 		if (target == PIPE_BUFFER) {
 			if (r600_is_buffer_format_supported(format, false, R600_PBO_NO_WORKAROUND_NEEDED))
@@ -356,6 +359,7 @@ static void *r600_create_blend_state_mode(struct pipe_context *ctx,
 	blend->cb_color_control = color_control;
 	blend->cb_color_control_no_blend = color_control & C_028808_TARGET_BLEND_ENABLE;
 	blend->alpha_to_one = state->alpha_to_one;
+	blend->alpha_to_one_and_coverage = state->alpha_to_one && state->alpha_to_coverage;
 
 	r600_store_context_reg(&blend->buffer, R_028D44_DB_ALPHA_TO_MASK,
 			       S_028D44_ALPHA_TO_MASK_ENABLE(state->alpha_to_coverage) |
@@ -1857,10 +1861,14 @@ static void r600_emit_sampler_states(struct r600_context *rctx,
 			union pipe_color_union border_color = {{0,0,0,1}};
 			unsigned offset;
 
-			/* The rv770 border color is fully compatible with
-			 * evergreen. */
-			evergreen_convert_border_color(&rstate->border_color,
-						       &border_color, &rview->base);
+			if (rview) {
+				/* The rv770 border color is fully compatible with
+				* evergreen. */
+				evergreen_convert_border_color(&rstate->border_color,
+				                	       &border_color, &rview->base);
+			} else {
+				border_color = rstate->border_color;
+			}
 
 			offset = border_color_reg;
 			offset += i * 16;
@@ -2484,9 +2492,14 @@ void r600_update_ps_state(struct pipe_context *ctx, struct r600_pipe_shader *sha
 		if (varying_slot == VARYING_SLOT_COL0)
 			tmp |= S_028644_DEFAULT_VAL(3);
 
+		/* INTERP_MODE_NONE is used for default color interpolation too; only
+		 * treat color inputs as flatshade-dependent to match old TGSI_COLOR.
+		 */
 		if (varying_slot == VARYING_SLOT_POS ||
-			rshader->input[i].interpolate == TGSI_INTERPOLATE_CONSTANT ||
-			(rshader->input[i].interpolate == TGSI_INTERPOLATE_COLOR && flatshade))
+			rshader->input[i].interpolate == INTERP_MODE_FLAT ||
+			(rshader->input[i].interpolate == INTERP_MODE_NONE && flatshade &&
+			 ((varying_slot >= VARYING_SLOT_COL0 && varying_slot <= VARYING_SLOT_COL1) ||
+			  (varying_slot >= VARYING_SLOT_BFC0 && varying_slot <= VARYING_SLOT_BFC1))))
 			tmp |= S_028644_FLAT_SHADE(1);
 
 		if (varying_slot == VARYING_SLOT_PNTC ||
@@ -2495,13 +2508,13 @@ void r600_update_ps_state(struct pipe_context *ctx, struct r600_pipe_shader *sha
 			tmp |= S_028644_PT_SPRITE_TEX(1);
 		}
 
-		if (rshader->input[i].interpolate_location == TGSI_INTERPOLATE_LOC_CENTROID)
+		if (rshader->input[i].interpolate_location == R600_INTERP_LOC_CENTROID)
 			tmp |= S_028644_SEL_CENTROID(1);
 
-		if (rshader->input[i].interpolate_location == TGSI_INTERPOLATE_LOC_SAMPLE)
+		if (rshader->input[i].interpolate_location == R600_INTERP_LOC_SAMPLE)
 			tmp |= S_028644_SEL_SAMPLE(1);
 
-		if (rshader->input[i].interpolate == TGSI_INTERPOLATE_LINEAR) {
+		if (rshader->input[i].interpolate == INTERP_MODE_NOPERSPECTIVE) {
 			need_linear = 1;
 			tmp |= S_028644_SEL_LINEAR(1);
 		}
@@ -2530,6 +2543,10 @@ void r600_update_ps_state(struct pipe_context *ctx, struct r600_pipe_shader *sha
 			break;
 		}
 	}
+
+	if (unlikely(rctx->alpha_to_one_and_coverage))
+		exports_ps |= 1;
+
 	db_shader_control |= S_02880C_Z_EXPORT_ENABLE(z_export);
 	db_shader_control |= S_02880C_STENCIL_REF_EXPORT_ENABLE(stencil_export);
 	db_shader_control |= S_02880C_MASK_EXPORT_ENABLE(mask_export);
@@ -2552,10 +2569,10 @@ void r600_update_ps_state(struct pipe_context *ctx, struct r600_pipe_shader *sha
 	spi_input_z = 0;
 	if (pos_index != -1) {
 		spi_ps_in_control_0 |= (S_0286CC_POSITION_ENA(1) |
-					S_0286CC_POSITION_CENTROID(rshader->input[pos_index].interpolate_location == TGSI_INTERPOLATE_LOC_CENTROID) |
+					S_0286CC_POSITION_CENTROID(rshader->input[pos_index].interpolate_location == R600_INTERP_LOC_CENTROID) |
 					S_0286CC_POSITION_ADDR(rshader->input[pos_index].gpr) |
 					S_0286CC_BARYC_SAMPLE_CNTL(1)) |
-					S_0286CC_POSITION_SAMPLE(rshader->input[pos_index].interpolate_location == TGSI_INTERPOLATE_LOC_SAMPLE);
+					S_0286CC_POSITION_SAMPLE(rshader->input[pos_index].interpolate_location == R600_INTERP_LOC_SAMPLE);
 		spi_input_z |= S_0286D8_PROVIDE_Z_TO_SPI(1);
 	}
 
@@ -2813,11 +2830,14 @@ void r600_update_db_shader_control(struct r600_context * rctx)
 		return;
 	}
 
+	const bool alpha_to_one_and_coverage = rctx->ps_shader->current->key.ps.alpha_to_one_and_coverage;
 	dual_export = rctx->cb_state.export_16bpc &&
-		      !rctx->ps_shader->current->ps_depth_export;
+		      !rctx->ps_shader->current->ps_depth_export &&
+		      !alpha_to_one_and_coverage;
 
 	db_shader_control = rctx->ps_shader->current->db_shader_control |
-			    S_02880C_DUAL_EXPORT_ENABLE(dual_export);
+			    S_02880C_DUAL_EXPORT_ENABLE(dual_export) |
+		            S_02880C_COVERAGE_TO_MASK_ENABLE(alpha_to_one_and_coverage);
 
 	ps_conservative_z = rctx->ps_shader->current->shader.ps_conservative_z;
 

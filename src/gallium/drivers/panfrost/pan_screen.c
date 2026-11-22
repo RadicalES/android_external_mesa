@@ -12,6 +12,7 @@
 #include "pipe/p_screen.h"
 #include "util/format/u_format.h"
 #include "util/format/u_format_s3tc.h"
+#include "util/os_misc.h"
 #include "util/os_time.h"
 #include "util/u_debug.h"
 #include "util/u_memory.h"
@@ -19,7 +20,6 @@
 #include "util/u_screen.h"
 #include "util/u_video.h"
 #include "util/xmlconfig.h"
-#include "util/perf/cpu_trace.h"
 
 #include <fcntl.h>
 
@@ -36,8 +36,10 @@
 #include "pan_screen.h"
 #include "pan_compiler.h"
 #include "pan_util.h"
+#include "pan_trace.h"
 
 #include "pan_context.h"
+#include "panfrost_perfetto.h"
 
 #define DEFAULT_MAX_AFBC_PACKING_RATIO 90
 
@@ -83,6 +85,19 @@ panfrost_get_device_vendor(struct pipe_screen *screen)
    return "Arm";
 }
 
+static const char *
+panfrost_get_cl_cts_version(struct pipe_screen *screen)
+{
+   uint32_t gpu_prod_id = panfrost_device_gpu_prod_id(pan_device(screen));
+
+   /* https://www.khronos.org/conformance/adopters/conformant-products/opencl#submission_474 */
+   if (gpu_prod_id == PAN_PROD_ID(10, 8, 7) ||
+       gpu_prod_id == PAN_PROD_ID(10, 12, 4))
+      return "v2026-06-18-00";
+
+   return NULL;
+}
+
 static int
 from_kmod_group_allow_priority_flags(
    enum pan_kmod_group_allow_priority_flags kmod_flags)
@@ -117,6 +132,8 @@ pipe_to_pan_bind_flags(uint32_t pipe_bind_flags)
       pan_bind_flags |= PAN_BIND_VERTEX_BUFFER;
    if (pipe_bind_flags & PIPE_BIND_SAMPLER_VIEW)
       pan_bind_flags |= PAN_BIND_SAMPLER_VIEW;
+   if (pipe_bind_flags & PIPE_BIND_SHADER_IMAGE)
+      pan_bind_flags |= PAN_BIND_STORAGE_IMAGE;
 
    return pan_bind_flags;
 }
@@ -138,7 +155,7 @@ get_max_msaa(struct panfrost_device *dev, enum pipe_format format)
     * the r1p0 version, which prevents 16x MSAA from working properly.
     */
    if (panfrost_device_gpu_prod_id(dev) == 0x750 &&
-       panfrost_device_gpu_rev(dev) < 0x1000)
+       panfrost_device_gpu_rev(dev) < PAN_REV(1, 0))
       max_msaa = MIN2(max_msaa, 8);
 
    if (dev->model->quirks.max_4x_msaa)
@@ -401,6 +418,13 @@ panfrost_walk_dmabuf_modifiers(struct pipe_screen *screen,
    for (unsigned i = 0; i < ARRAY_SIZE(native_mods); ++i) {
       uint64_t mod =  native_mods[i];
 
+      /* We don't implement the WSI interface for
+       * DRM_FORMAT_MOD_ARM_INTERLEAVED_64K so let's just not advertise images
+       * using this modifier, which will take care of it being advertised for
+       * WSI. */
+      if (mod == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K)
+         continue;
+
       if ((dev->debug & PAN_DBG_NO_AFBC) && drm_is_afbc(mod))
          continue;
 
@@ -625,18 +649,8 @@ panfrost_init_compute_caps(struct panfrost_screen *screen)
     */
    caps->max_threads_per_block = dev->arch >= 6 ? 256 : 128;
 
-   uint64_t total_ram;
-   if (!os_get_total_physical_memory(&total_ram))
-      total_ram = 0;
-
-   /* We don't want to burn too much ram with the GPU. If the user has 4GiB
-    * or less, we use at most half. If they have more than 4GiB, we use 3/4.
-    */
-   uint64_t available_ram;
-   if (total_ram <= 4ull * 1024 * 1024 * 1024)
-      available_ram = total_ram / 2;
-   else
-      available_ram = total_ram * 3 / 4;
+   const uint64_t available_ram =
+      os_get_gpu_heap_size(screen->heap_memory_percent, NULL);
 
    /* 48bit address space max, with the lower 32MB reserved. We clamp
     * things so it matches kmod VA range limitations.
@@ -681,6 +695,7 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->depth_clip_disable = true;
    caps->mixed_framebuffer_sizes = true;
    caps->frontend_noop = true;
+   caps->texture_query_lod = dev->arch >= 9;
    caps->sample_shading = dev->arch >= 6;
    caps->fragment_shader_derivatives = true;
    caps->framebuffer_no_attachment = true;
@@ -744,6 +759,8 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->buffer_sampler_view_rgba_only = true;
    caps->packed_uniforms = true;
    caps->image_load_formatted = true;
+   caps->image_store_formatted = true;
+   caps->image_atomic_inc_wrap = true;
    caps->cube_map_array = true;
    caps->compute = true;
    caps->int64 = true;
@@ -824,6 +841,7 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    caps->texture_transfer_modes = 0;
 
+   caps->device_type = PIPE_DEVICE_TYPE_INTEGRATED_GPU;
    caps->endianness = PIPE_ENDIAN_NATIVE;
 
    caps->max_texture_gather_components = 4;
@@ -832,9 +850,8 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    caps->max_texture_gather_offset = 7;
 
-   uint64_t system_memory;
-   caps->video_memory = os_get_total_physical_memory(&system_memory) ?
-      system_memory >> 20 : 0;
+   caps->video_memory =
+      os_get_gpu_heap_size(screen->heap_memory_percent, NULL) >> 20;
 
    caps->shader_stencil_export = true;
    caps->conditional_render = true;
@@ -892,14 +909,12 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->supported_prim_modes =
    caps->supported_prim_modes_with_restart = modes;
 
-   caps->image_store_formatted = true;
-
    caps->native_fence_fd = true;
 
    caps->context_priority_mask = from_kmod_group_allow_priority_flags(
       dev->kmod.dev->props.allowed_group_priorities_mask);
 
-   caps->astc_decode_mode = dev->arch >= 9 && (dev->compressed_formats & (1 << 30));
+   caps->astc_decode_mode = dev->arch >= 7 && (dev->compressed_formats & (1 << 30));
 
    caps->min_line_width =
    caps->min_line_width_aa =
@@ -922,6 +937,9 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    /* We hard-code this value as it is dictated by driver uAPI */
    caps->max_label_length = 4096;
+
+   /* Avoid emulating non-perspective interpolation when not needed */
+   caps->prefer_persp = true;
 }
 
 static void
@@ -1012,8 +1030,8 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
 
    struct panfrost_device *dev = pan_device(&screen->base);
 
-   driParseConfigFiles(config->options, config->options_info, 0,
-                       "panfrost", NULL, NULL, NULL, 0, NULL, 0);
+   driParseConfigFiles(config->options, config->options_info,
+                       &(driConfigFileParseParams) { .driverName = "panfrost" });
 
    /* Debug must be set first for pandecode to work correctly */
    dev->debug =
@@ -1022,6 +1040,8 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       debug_get_num_option("PAN_FAULT_INJECTION_RATE", 0);
    screen->max_afbc_packing_ratio = debug_get_num_option(
       "PAN_MAX_AFBC_PACKING_RATIO", DEFAULT_MAX_AFBC_PACKING_RATIO);
+
+   pan_trace_init();
 
    if (panfrost_open_device(screen, fd, dev)) {
       ralloc_free(screen);
@@ -1042,12 +1062,13 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       return NULL;
    }
 
-   unsigned core_id_range;
-   unsigned core_count =
-      pan_query_core_count(&dev->kmod.dev->props, &core_id_range);
+   unsigned core_count = pan_query_core_count(&dev->kmod.dev->props);
 
-   snprintf(screen->renderer_string, sizeof(screen->renderer_string),
-            "%s MC%u (Panfrost)", dev->model->name, core_count);
+   pan_model_device_name(screen->renderer_string, sizeof(screen->renderer_string),
+                         dev->model, core_count, " (Panfrost)");
+
+   screen->heap_memory_percent =
+      driQueryOptionf(config->options, "heap_memory_percent");
 
    screen->afbc_tiled = driQueryOptionb(config->options, "pan_afbc_tiled");
 
@@ -1099,6 +1120,7 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
    screen->base.get_name = panfrost_get_name;
    screen->base.get_vendor = panfrost_get_vendor;
    screen->base.get_device_vendor = panfrost_get_device_vendor;
+   screen->base.get_cl_cts_version = panfrost_get_cl_cts_version;
    screen->base.get_driver_query_info = panfrost_get_driver_query_info;
    screen->base.get_timestamp = panfrost_get_timestamp;
    screen->base.is_format_supported = panfrost_is_format_supported;
@@ -1134,7 +1156,7 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->base.nir_options[i] =
-         pan_get_nir_shader_compiler_options(dev->arch);
+         pan_get_nir_shader_compiler_options(dev->arch, i, false);
 
    switch (dev->arch) {
    case 4:
@@ -1155,17 +1177,28 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
    case 10:
       panfrost_cmdstream_screen_init_v10(screen);
       break;
+   case 11:
+      panfrost_cmdstream_screen_init_v11(screen);
+      break;
    case 12:
       panfrost_cmdstream_screen_init_v12(screen);
       break;
    case 13:
       panfrost_cmdstream_screen_init_v13(screen);
       break;
+   case 14:
+      panfrost_cmdstream_screen_init_v14(screen);
+      break;
    default:
       debug_printf("panfrost: Unhandled architecture major %d", dev->arch);
       panfrost_destroy_screen(&(screen->base));
       return NULL;
    }
+
+#ifdef HAVE_PERFETTO
+   if (dev->arch >= 10)
+      panfrost_perfetto_init(dev);
+#endif
 
    return &screen->base;
 }

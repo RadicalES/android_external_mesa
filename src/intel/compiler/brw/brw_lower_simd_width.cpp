@@ -171,21 +171,23 @@ get_sampler_lowered_simd_width(const struct intel_device_info *devinfo,
        tex->sampler_opcode == BRW_SAMPLER_OPCODE_SAMPLE_D_C_PACKED)
       return devinfo->ver < 20 ? 8 : 16;
 
-   const unsigned max_payload_size =
-      MAX_SAMPLER_MESSAGE_SIZE *
-      (reg_unit(devinfo) * 8) /* min SIMD */ *
-      4 /* dword */;
-   const unsigned payload_param_size =
-      brw_type_size_bytes(tex->src[TEX_LOGICAL_SRC_PAYLOAD0].type);
-   unsigned payload_size =
-      (tex->sources - TEX_LOGICAL_SRC_PAYLOAD0) *
-      tex->exec_size *
-      payload_param_size;
-
    unsigned simd_width = tex->exec_size;
-   while (payload_size > max_payload_size) {
-      payload_size /= 2;
-      simd_width /= 2;
+   if (tex->sources > TEX_LOGICAL_SRC_PAYLOAD0) {
+      const unsigned max_payload_size =
+         MAX_SAMPLER_MESSAGE_SIZE *
+         (reg_unit(devinfo) * 8) /* min SIMD */ *
+         4 /* dword */;
+      const unsigned payload_param_size =
+         brw_type_size_bytes(tex->src[TEX_LOGICAL_SRC_PAYLOAD0].type);
+      unsigned payload_size =
+         (tex->sources - TEX_LOGICAL_SRC_PAYLOAD0) *
+         tex->exec_size *
+         payload_param_size;
+
+      while (payload_size > max_payload_size) {
+         payload_size /= 2;
+         simd_width /= 2;
+      }
    }
 
    const unsigned max_hw_simd = devinfo->ver < 20 ? 16 : 32;
@@ -293,7 +295,8 @@ brw_get_lowered_simd_width(const brw_shader *shader, const brw_inst *inst)
    case SHADER_OPCODE_EXP2:
    case SHADER_OPCODE_LOG2:
    case SHADER_OPCODE_SIN:
-   case SHADER_OPCODE_COS: {
+   case SHADER_OPCODE_COS:
+   case SHADER_OPCODE_TANH: {
       /* Xe2+: BSpec 56797
        *
        * Math operation rules when half-floats are used on both source and
@@ -368,6 +371,25 @@ brw_get_lowered_simd_width(const brw_shader *shader, const brw_inst *inst)
    case SHADER_OPCODE_MEMORY_STORE_LOGICAL:
    case SHADER_OPCODE_MEMORY_ATOMIC_LOGICAL: {
       const brw_mem_inst *mem = inst->as_mem();
+
+      /* Bspec 63970,53523: Instruction Load, field VectorSize
+       *
+       *  Xe2+:
+       *    Loads with vector size of 8 or more is restricted to EXEC_MASK <=
+       *    16 (lower 16 lanes).
+       *
+       *    Loads with data size of d64 and vector size of 3 or more is
+       *    restricted to EXEC_MASK <= 16 (lower 16 lanes).
+       *
+       *  Older platforms:
+       *    Loads with vector size of 8 or more is restricted to EXEC_MASK <= 8
+       *    (lower 8 lanes).
+       *
+       *    Loads with data size of d64 and vector size of 3 or more is
+       *    restricted to EXEC_MASK <= 8 (lower 8 lanes).
+       */
+      if (mem->components >= (mem->data_size == LSC_DATA_SIZE_D64 ? 3 : 8))
+         return MIN2(devinfo->ver >= 20 ? 16 : 8, mem->exec_size);
 
       if (devinfo->ver >= 20)
          return mem->exec_size;
@@ -561,7 +583,7 @@ needs_dst_copy(const brw_builder &lbld, const brw_inst *inst)
        */
       if (regions_overlap(inst->dst, inst->size_written,
                           inst->src[i], inst->size_read(lbld.shader->devinfo, i)) &&
-          !inst->dst.equals(inst->src[i]))
+          !inst->dst.equals(inst->src[i].without_src_mods()))
         return true;
    }
 

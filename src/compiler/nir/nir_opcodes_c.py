@@ -42,12 +42,16 @@ nir_type_conversion_op(nir_alu_type src, nir_alu_type dst, nir_rounding_mode rnd
    } else if (src == dst && src_base == nir_type_bool) {
       return nir_op_mov;
    } else if ((src_base == nir_type_int || src_base == nir_type_uint) &&
-              (dst_base == nir_type_int || dst_base == nir_type_uint) &&
-              src_bit_size == dst_bit_size) {
+              (dst_base == nir_type_int || dst_base == nir_type_uint)) {
       /* Integer <-> integer conversions with the same bit-size on both
        * ends are just no-op moves.
        */
-      return nir_op_mov;
+      if (src_bit_size == dst_bit_size)
+         return nir_op_mov;
+
+      /* For downcasts, always use uint. */
+      if (src_bit_size > dst_bit_size)
+         src_base = dst_base = nir_type_uint;
    }
 
    /* f2b, i2b, and u2b do not exist.  Use ine or fne (via nir_type_conversion)
@@ -124,7 +128,11 @@ const nir_op_info nir_op_infos[nir_num_opcodes] = {
    .algebraic_properties =
       ${ "0" if opcode.algebraic_properties == "" else " | ".join(
             "NIR_OP_IS_" + prop.upper() for prop in
-               opcode.algebraic_properties.strip().split(" ")) }
+               opcode.algebraic_properties.strip().split(" ")) },
+   .valid_fp_math_ctrl =
+      ${ "0" if opcode.valid_fp_math_ctrl == "" else " | ".join(
+            "nir_fp_" + prop for prop in
+               opcode.valid_fp_math_ctrl.strip().split(" ")) }
 },
 % endfor
 };

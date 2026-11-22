@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2020 Collabora, Ltd.
- * Copyright (C) 2018-2019 Alyssa Rosenzweig <alyssa@rosenzweig.io>
+ * Copyright (C) 2018-2019 Alyssa Rosenzweig
  * Copyright © 2014 Intel Corporation
  * SPDX-License-Identifier: MIT
  */
@@ -48,7 +48,7 @@ bi_compute_liveness_ssa(bi_context *ctx)
       bi_block *blk = bi_worklist_pop_head(&worklist);
 
       /* Update its liveness information */
-      memcpy(blk->ssa_live_in, blk->ssa_live_out, words * sizeof(BITSET_WORD));
+      __bitset_copy(blk->ssa_live_in, blk->ssa_live_out, words);
 
       bi_foreach_instr_in_block_rev(blk, I) {
          /* Phi nodes are handled separately, so we skip them. As phi nodes are
@@ -72,7 +72,7 @@ bi_compute_liveness_ssa(bi_context *ctx)
        */
       bi_foreach_predecessor(blk, pred) {
          BITSET_WORD *live = ralloc_array(blk, BITSET_WORD, words);
-         memcpy(live, blk->ssa_live_in, words * sizeof(BITSET_WORD));
+         __bitset_copy(live, blk->ssa_live_in, words);
 
          /* Kill write */
          bi_foreach_phi_in_block(blk, I) {

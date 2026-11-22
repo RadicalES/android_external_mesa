@@ -268,6 +268,8 @@ vk_format_to_pipe_format(VkFormat vkformat)
          return PIPE_FORMAT_X4R12_UNORM;
       case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
          return PIPE_FORMAT_X6R10X6G10_UNORM;
+      case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
+         return PIPE_FORMAT_X6R10X6G10X6B10X6A10_UNORM;
       case VK_FORMAT_R12X4G12X4_UNORM_2PACK16:
          return PIPE_FORMAT_X4R12X4G12_UNORM;
       case VK_FORMAT_G8B8G8R8_422_UNORM:
@@ -298,6 +300,8 @@ vk_format_to_pipe_format(VkFormat vkformat)
          return PIPE_FORMAT_X6G10_X6B10X6R10_420_UNORM;
       case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
          return PIPE_FORMAT_X4G12_X4B12X4R12_420_UNORM;
+      case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+         return PIPE_FORMAT_X6G10_X6B10X6R10_422_UNORM;
       case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
          return PIPE_FORMAT_G8_B8R8_444_UNORM;
       case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
@@ -464,6 +468,7 @@ static const VkFormat formats[PIPE_FORMAT_COUNT] = {
    [PIPE_FORMAT_X6R10_UNORM] = VK_FORMAT_R10X6_UNORM_PACK16,
    [PIPE_FORMAT_X4R12_UNORM] = VK_FORMAT_R12X4_UNORM_PACK16,
    [PIPE_FORMAT_X6R10X6G10_UNORM] = VK_FORMAT_R10X6G10X6_UNORM_2PACK16,
+   [PIPE_FORMAT_X6R10X6G10X6B10X6A10_UNORM] = VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16,
    [PIPE_FORMAT_X4R12X4G12_UNORM] = VK_FORMAT_R12X4G12X4_UNORM_2PACK16,
    [PIPE_FORMAT_G8B8_G8R8_UNORM] = VK_FORMAT_G8B8G8R8_422_UNORM,
    [PIPE_FORMAT_B8G8_R8G8_UNORM] = VK_FORMAT_B8G8R8G8_422_UNORM,
@@ -471,6 +476,7 @@ static const VkFormat formats[PIPE_FORMAT_COUNT] = {
    [PIPE_FORMAT_G8_B8R8_420_UNORM] = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
    [PIPE_FORMAT_X6G10_X6B10X6R10_420_UNORM] = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
    [PIPE_FORMAT_X4G12_X4B12X4R12_420_UNORM] = VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16,
+   [PIPE_FORMAT_X6G10_X6B10X6R10_422_UNORM] = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16,
    [PIPE_FORMAT_A8_UNORM] = VK_FORMAT_A8_UNORM_KHR,
    [PIPE_FORMAT_R5G5B5A1_UNORM] = VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,
 
@@ -650,6 +656,24 @@ vk_format_get_plane_format(VkFormat format, unsigned plane_id)
 }
 
 VkFormat
+vk_format_get_plane_aspect_format(VkFormat format, const VkImageAspectFlags aspect)
+{
+   assert(aspect & vk_format_aspects(format));
+
+   switch(aspect) {
+   case VK_IMAGE_ASPECT_PLANE_0_BIT:
+      return vk_format_get_plane_format(format, 0);
+   case VK_IMAGE_ASPECT_PLANE_1_BIT:
+      return vk_format_get_plane_format(format, 1);
+   case VK_IMAGE_ASPECT_PLANE_2_BIT:
+      return vk_format_get_plane_format(format, 2);
+   default:
+      assert(vk_format_get_plane_count(format) == 1);
+      return format;
+   }
+}
+
+VkFormat
 vk_format_get_aspect_format(VkFormat format, const VkImageAspectFlags aspect)
 {
    assert(util_bitcount(aspect) == 1);
@@ -663,11 +687,9 @@ vk_format_get_aspect_format(VkFormat format, const VkImageAspectFlags aspect)
    case VK_IMAGE_ASPECT_STENCIL_BIT:
       return vk_format_stencil_only(format);
    case VK_IMAGE_ASPECT_PLANE_0_BIT:
-      return vk_format_get_plane_format(format, 0);
    case VK_IMAGE_ASPECT_PLANE_1_BIT:
-      return vk_format_get_plane_format(format, 1);
    case VK_IMAGE_ASPECT_PLANE_2_BIT:
-      return vk_format_get_plane_format(format, 2);
+      return vk_format_get_plane_aspect_format(format, aspect);
    default:
       UNREACHABLE("Cannot translate format aspect");
    }

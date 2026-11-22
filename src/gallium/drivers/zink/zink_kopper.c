@@ -96,7 +96,7 @@ kopper_CreateSurface(struct zink_screen *screen, struct kopper_displaytarget *cd
    switch (type) {
 #ifdef VK_USE_PLATFORM_XCB_KHR
    case VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR: {
-#ifdef GLX_USE_APPLE
+#ifdef GLX_USE_APPLEGL
       error = VK_INCOMPLETE;
 #else
       VkXcbSurfaceCreateInfoKHR *xcb = (VkXcbSurfaceCreateInfoKHR *)&cdt->info.bos;
@@ -154,6 +154,14 @@ fail:
 }
 
 static void
+recycle_semaphore(struct zink_screen *screen, VkSemaphore sem)
+{
+   simple_mtx_lock(&screen->semaphores_lock);
+   util_dynarray_append(&screen->semaphores, sem);
+   simple_mtx_unlock(&screen->semaphores_lock);
+}
+
+static void
 destroy_swapchain(struct zink_screen *screen, struct kopper_swapchain *cswap)
 {
    if (!cswap)
@@ -171,17 +179,14 @@ destroy_swapchain(struct zink_screen *screen, struct kopper_swapchain *cswap)
       pipe_resource_reference(&cswap->images[i].readback, NULL);
       zink_destroy_resource_surface_cache(screen, &cswap->images[i].surface_cache, false);
    }
-   free(cswap->images);
-   hash_table_foreach(cswap->presents, he) {
-      struct util_dynarray *arr = he->data;
-      simple_mtx_lock(&screen->semaphores_lock);
-      util_dynarray_append_dynarray(&screen->semaphores, arr);
-      simple_mtx_unlock(&screen->semaphores_lock);
-      util_dynarray_fini(arr);
-      free(arr);
-   }
-   _mesa_hash_table_destroy(cswap->presents, NULL);
+   simple_mtx_destroy(&cswap->lock);
    VKSCR(DestroySwapchainKHR)(screen->dev, cswap->swapchain, NULL);
+   /* the images can't be acquired again, so their presents end with the swapchain */
+   for (unsigned i = 0; i < cswap->num_images; i++) {
+      if (cswap->images[i].present)
+         recycle_semaphore(screen, cswap->images[i].present);
+   }
+   free(cswap->images);
    free(cswap);
 }
 
@@ -190,10 +195,12 @@ prune_old_swapchains(struct zink_screen *screen, struct kopper_displaytarget *cd
 {
    while (cdt->old_swapchain) {
       struct kopper_swapchain *cswap = cdt->old_swapchain;
-      if (cswap->async_presents) {
-         if (wait)
-            continue;
-         return;
+      /* present_fence is always in signalled state when !cdt->async */
+      if (cdt->async && cdt->swapchain && !util_queue_fence_is_signalled(&cdt->swapchain->present_fence)) {
+         if (!wait)
+            return;
+         util_queue_fence_wait(&cdt->swapchain->present_fence);
+         assert(!p_atomic_read_relaxed(&cswap->async_presents));
       }
       struct zink_batch_usage *u = cswap->batch_uses;
       if (!zink_screen_usage_check_completion(screen, u)) {
@@ -203,6 +210,12 @@ prune_old_swapchains(struct zink_screen *screen, struct kopper_displaytarget *cd
 
          zink_screen_timeline_wait(screen, u->usage, UINT64_MAX);
          cswap->batch_uses = NULL;
+      }
+      if (cswap->present_batch) {
+         /* don't wait on a timeline syncpoint which will never occur */
+         uint64_t batch = wait ? MIN2(cswap->present_batch, screen->curr_batch - 1) : cswap->present_batch;
+         if (!zink_screen_timeline_wait(screen, batch, wait ? UINT64_MAX : 0))
+            return;
       }
       cdt->old_swapchain = cswap->next;
       destroy_swapchain(screen, cswap);
@@ -253,10 +266,12 @@ zink_kopper_deinit_displaytarget(struct zink_screen *screen, struct kopper_displ
    cdt = he->data;
    _mesa_hash_table_remove(&screen->dts, he);
    simple_mtx_unlock(&screen->dt_lock);
-   destroy_swapchain(screen, cdt->swapchain);
+   struct kopper_swapchain *cswap = cdt->swapchain;
+   cdt->swapchain = NULL;
+   destroy_swapchain(screen, cswap);
    prune_old_swapchains(screen, cdt, true);
    VKSCR(DestroySurfaceKHR)(screen->instance, cdt->surface, NULL);
-   cdt->swapchain = cdt->old_swapchain = NULL;
+   cdt->old_swapchain = NULL;
    cdt->surface = VK_NULL_HANDLE;
 }
 
@@ -269,8 +284,8 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
       *result = VK_ERROR_OUT_OF_HOST_MEMORY;
       return NULL;
    }
-   cswap->last_present_prune = 1;
    util_queue_fence_init(&cswap->present_fence);
+   simple_mtx_init(&cswap->lock, mtx_plain);
 
    bool has_alpha = cdt->info.has_alpha && (cdt->caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR);
    if (cdt->swapchain) {
@@ -381,7 +396,6 @@ kopper_GetSwapchainImages(struct zink_screen *screen, struct kopper_swapchain *c
       mesa_loge("ZINK: failed to allocate cswap->images!");
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
-   cswap->presents = _mesa_hash_table_create_u32_keys(NULL);
    VkImage images[32];
    error = VKSCR(GetSwapchainImagesKHR)(screen->dev, cswap->swapchain, &cswap->num_images, images);
    assert(cswap->num_images <= ARRAY_SIZE(images));
@@ -409,15 +423,22 @@ update_swapchain(struct zink_screen *screen, struct kopper_displaytarget *cdt, u
    VkResult error = update_caps(screen, cdt);
    if (error != VK_SUCCESS)
       return error;
+   if (cdt->async)
+      util_queue_fence_wait(&cdt->swapchain->present_fence);
    struct kopper_swapchain *cswap = kopper_CreateSwapchain(screen, cdt, w, h, &error);
    if (!cswap)
       return error;
    prune_old_swapchains(screen, cdt, false);
-   struct kopper_swapchain **pswap = &cdt->old_swapchain;
-   while (*pswap)
-      *pswap = (*pswap)->next;
-   *pswap = cdt->swapchain;
+   for (struct kopper_swapchain **pswap = &cdt->old_swapchain; *pswap; pswap = &(*pswap)->next) {
+      if (!(*pswap)->next) {
+         (*pswap)->next = cdt->swapchain;
+         break;
+      }
+   }
+   if (!cdt->old_swapchain)
+      cdt->old_swapchain = cdt->swapchain;
    cdt->swapchain = cswap;
+   cdt->swapchain_serial++;
 
    return kopper_GetSwapchainImages(screen, cdt->swapchain);
 }
@@ -549,6 +570,47 @@ zink_kopper_displaytarget_destroy(struct zink_screen *screen, struct kopper_disp
    FREE(cdt);
 }
 
+/* images the app holds, including presents still queued on the flush thread */
+static unsigned
+kopper_held_images(const struct kopper_swapchain *cswap)
+{
+   unsigned held = p_atomic_read(&cswap->async_presents);
+   for (unsigned i = 0; i < cswap->num_images; i++)
+      held += cswap->images[i].acquire || cswap->images[i].acquired;
+   return held;
+}
+
+/* the indices and image state of a resource belong to the swapchain it last used */
+static void
+reset_swapchain_state(struct zink_resource *res)
+{
+   struct kopper_displaytarget *cdt = res->obj->dt;
+   res->obj->dt_idx = res->obj->last_dt_idx = UINT32_MAX;
+   res->obj->dt_serial = cdt->swapchain_serial;
+   /* the old swapchain counted this acquire, the new one has none */
+   res->obj->indefinite_acquire = false;
+   res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+   res->obj->access = 0;
+   res->obj->access_stage = 0;
+}
+
+/* another resource of the same displaytarget may have replaced the swapchain since */
+void
+zink_kopper_sync_idx(struct zink_resource *res)
+{
+   struct kopper_displaytarget *cdt = res->obj->dt;
+   if (cdt && res->obj->dt_serial != cdt->swapchain_serial)
+      reset_swapchain_state(res);
+}
+
+/* dt_idx for code outside the acquire path: UINT32_MAX if the swapchain was replaced since the last acquire */
+uint32_t
+zink_kopper_get_dt_idx(struct zink_resource *res)
+{
+   zink_kopper_sync_idx(res);
+   return res->obj->dt_idx;
+}
+
 static VkResult
 kopper_acquire(struct zink_screen *screen, struct zink_resource *res, uint64_t timeout)
 {
@@ -565,6 +627,7 @@ kopper_acquire(struct zink_screen *screen, struct zink_resource *res, uint64_t t
        (cdt->swapchain->images[res->obj->dt_idx].acquire || cdt->swapchain->images[res->obj->dt_idx].acquired))
       return VK_SUCCESS;
    VkSemaphore acquire = VK_NULL_HANDLE;
+   const bool infinite = timeout == UINT64_MAX;
 
    while (true) {
       if (res->obj->new_dt) {
@@ -573,13 +636,12 @@ kopper_acquire(struct zink_screen *screen, struct zink_resource *res, uint64_t t
          if (error != VK_SUCCESS)
             return error;
          res->obj->new_dt = false;
-         res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
-         res->obj->access = 0;
-         res->obj->access_stage = 0;
+         reset_swapchain_state(res);
       }
-      if (timeout == UINT64_MAX && cdt->async &&
-          p_atomic_read_relaxed(&cdt->swapchain->num_acquires) >= cdt->swapchain->max_acquires) {
-         util_queue_fence_wait(&cdt->swapchain->present_fence);
+      if (timeout == UINT64_MAX &&
+          kopper_held_images(cdt->swapchain) >= cdt->swapchain->max_acquires) {
+         if (cdt->async)
+            util_queue_fence_wait(&cdt->swapchain->present_fence);
          /* With a sequence of
               glDrawBuffer(GL_FRONT_AND_BACK);
               glClearBufferfv(GL_COLOR, 0, purple);
@@ -597,7 +659,7 @@ kopper_acquire(struct zink_screen *screen, struct zink_resource *res, uint64_t t
             So let's check whether the number of acquired images is still too
             large after the fence was signalled, and if so then clear the timeout.
          */
-         if (p_atomic_read_relaxed(&cdt->swapchain->num_acquires) >= cdt->swapchain->max_acquires)
+         if (kopper_held_images(cdt->swapchain) >= cdt->swapchain->max_acquires)
             timeout = 0;
       }
       VkResult ret;
@@ -607,15 +669,16 @@ kopper_acquire(struct zink_screen *screen, struct zink_resource *res, uint64_t t
          if (!acquire)
             return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
+      simple_mtx_lock(&cdt->swapchain->lock);
       ret = VKSCR(AcquireNextImageKHR)(screen->dev, cdt->swapchain->swapchain, timeout, acquire, VK_NULL_HANDLE, &res->obj->dt_idx);
+      simple_mtx_unlock(&cdt->swapchain->lock);
       if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
          if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
             res->obj->new_dt = true;
             continue;
          }
-         if (ret == VK_NOT_READY || ret == VK_TIMEOUT) {
-            if (timeout > 1000000)
-               UNREACHABLE("kopper_acquire: updated timeout after failure has become unreasonable large");
+         /* past the acquire limit an image may never come back, so retry only briefly */
+         if ((ret == VK_NOT_READY || ret == VK_TIMEOUT) && infinite && timeout < 1000000) {
             timeout += 4000;
             continue;
          }
@@ -626,6 +689,11 @@ kopper_acquire(struct zink_screen *screen, struct zink_resource *res, uint64_t t
    }
 
    cdt->swapchain->images[res->obj->dt_idx].acquire = acquire;
+   /* getting the image back means its last present is done with the semaphore */
+   if (cdt->swapchain->images[res->obj->dt_idx].present) {
+      recycle_semaphore(screen, cdt->swapchain->images[res->obj->dt_idx].present);
+      cdt->swapchain->images[res->obj->dt_idx].present = VK_NULL_HANDLE;
+   }
    if (cdt->swapchain->images[res->obj->dt_idx].readback)
       zink_resource(cdt->swapchain->images[res->obj->dt_idx].readback)->valid = false;
    res->obj->image = cdt->swapchain->images[res->obj->dt_idx].image;
@@ -643,6 +711,7 @@ kopper_acquire(struct zink_screen *screen, struct zink_resource *res, uint64_t t
    }
    res->obj->unordered_read = true;
    res->obj->unordered_write = true;
+   res->obj->has_ordered_access = false;
    res->obj->access = 0;
    res->obj->unordered_access = 0;
    /* this is the stage used by the acquire semaphore */
@@ -694,6 +763,7 @@ zink_kopper_acquire(struct zink_context *ctx, struct zink_resource *res, uint64_
       return false;
    }
    const struct kopper_swapchain *cswap = cdt->swapchain;
+   zink_kopper_sync_idx(res);
    res->obj->new_dt |= res->base.b.width0 != cswap->scci.imageExtent.width ||
                        res->base.b.height0 != cswap->scci.imageExtent.height;
    struct zink_screen *zscreen = zink_screen(kopper_get_zink_screen(ctx->base.screen));
@@ -707,9 +777,8 @@ zink_kopper_acquire(struct zink_context *ctx, struct zink_resource *res, uint64_
    } else if (is_swapchain_kill(ret)) {
       kill_swapchain(ctx, res);
    }
-   bool is_kill = is_swapchain_kill(ret);
    zink_batch_usage_set(&cdt->swapchain->batch_uses, ctx->bs);
-   return !is_kill;
+   return ret == VK_SUCCESS || ret == VK_SUBOPTIMAL_KHR;
 }
 
 VkSemaphore
@@ -717,10 +786,11 @@ zink_kopper_acquire_submit(struct zink_screen *screen, struct zink_resource *res
 {
    assert(res->obj->dt);
    struct kopper_displaytarget *cdt = res->obj->dt;
-   assert(res->obj->dt_idx != UINT32_MAX);
+   /* the swapchain was replaced and this resource has not been reacquired */
+   if (zink_kopper_get_dt_idx(res) == UINT32_MAX)
+      return VK_NULL_HANDLE;
    if (cdt->swapchain->images[res->obj->dt_idx].dt_has_data)
       return VK_NULL_HANDLE;
-   assert(res->obj->dt_idx != UINT32_MAX);
    if (cdt->swapchain->images[res->obj->dt_idx].acquired) {
       assert(!cdt->swapchain->images[res->obj->dt_idx].acquire);
       return VK_NULL_HANDLE;
@@ -784,7 +854,12 @@ kopper_present(void *data, void *gdata, int thread_idx)
       cpi->info.pWaitSemaphores = NULL;
       cpi->info.waitSemaphoreCount = 0;
    }
+   simple_mtx_lock(&swapchain->lock);
    VkResult error2 = VKSCR(QueuePresentKHR)(screen->queue, &cpi->info);
+   /* under the lock, so an acquire that returns the image finds it */
+   if (cpi->info.waitSemaphoreCount)
+      swapchain->images[cpi->image].present = cpi->sem;
+   simple_mtx_unlock(&swapchain->lock);
    zink_screen_debug_marker_end(screen, screen->frame_marker_emitted);
    zink_screen_debug_marker_begin(screen, "frame");
    simple_mtx_unlock(screen->queue_lock);
@@ -794,48 +869,14 @@ kopper_present(void *data, void *gdata, int thread_idx)
    if (error2 == VK_SUBOPTIMAL_KHR && cdt->swapchain == swapchain)
       cpi->res->obj->new_dt = true;
 
-   /* it's illegal to destroy semaphores if they're in use by a cmdbuf.
-    * but what does "in use" actually mean?
-    * in truth, when using timelines, nobody knows. especially not VVL.
-    *
-    * thus, to avoid infinite error spam and thread-related races,
-    * present semaphores need their own free queue based on the
-    * last-known completed timeline id so that the semaphore persists through
-    * normal cmdbuf submit/signal and then also exists here when it's needed for the present operation
-    */
-   struct util_dynarray *arr;
-   for (; screen->last_finished && swapchain->last_present_prune != screen->last_finished; swapchain->last_present_prune++) {
-      struct hash_entry *he = _mesa_hash_table_search(swapchain->presents,
-                                                      (void*)(uintptr_t)swapchain->last_present_prune);
-      if (he) {
-         arr = he->data;
-         simple_mtx_lock(&screen->semaphores_lock);
-         util_dynarray_append_dynarray(&screen->semaphores, arr);
-         simple_mtx_unlock(&screen->semaphores_lock);
-         util_dynarray_fini(arr);
-         free(arr);
-         _mesa_hash_table_remove(swapchain->presents, he);
-      }
-   }
-   /* queue this wait semaphore for deletion on completion of the next batch */
+   /* with implicit sync, the submit above already waited on the semaphore */
+   if (!cpi->info.waitSemaphoreCount)
+      recycle_semaphore(screen, cpi->sem);
    assert(screen->curr_batch > 0);
    uint32_t next = (uint32_t)screen->curr_batch + 1;
    /* handle overflow */
    next = MAX2(next + 1, 1);
-   struct hash_entry *he = _mesa_hash_table_search(swapchain->presents, (void*)(uintptr_t)next);
-   if (he)
-      arr = he->data;
-   else {
-      arr = malloc(sizeof(struct util_dynarray));
-      if (!arr) {
-         mesa_loge("ZINK: failed to allocate arr!");
-         return;
-      }
-
-      *arr = UTIL_DYNARRAY_INIT;
-      _mesa_hash_table_insert(swapchain->presents, (void*)(uintptr_t)next, arr);
-   }
-   util_dynarray_append(arr, cpi->sem);
+   swapchain->present_batch = next;
 out:
    if (thread_idx != -1) {
       p_atomic_dec(&swapchain->async_presents);
@@ -896,6 +937,15 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
          cpi->regions[i].extent.height = boxes[i].height;
          cpi->regions[i].extent.width = MIN2(cpi->regions[i].extent.width, cpi->swapchain->scci.imageExtent.width - cpi->regions[i].offset.x);
          cpi->regions[i].extent.height = MIN2(cpi->regions[i].extent.height, cpi->swapchain->scci.imageExtent.height - cpi->regions[i].offset.y);
+         /* if region is out of bounds, clamp to 0x0 */
+         if (cpi->regions[i].offset.x + (int64_t)cpi->regions[i].extent.width <= 0) {
+            cpi->regions[i].offset.x = 1;
+            cpi->regions[i].extent.width = 0;
+         }
+         if (cpi->regions[i].offset.y + (int64_t)cpi->regions[i].extent.height <= 0) {
+            cpi->regions[i].offset.y = 1;
+            cpi->regions[i].extent.height = 0;
+         }
          cpi->regions[i].layer = boxes[i].z;
       }
       cpi->info.pNext = &cpi->rinfo;
@@ -968,6 +1018,7 @@ kopper_ensure_readback(struct zink_screen *screen, struct zink_resource *res)
       struct pipe_resource templ = res->base.b;
       templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
       cswap->images[i].readback = screen->base.resource_create(&screen->base, &templ);
+      cswap->images[i].readback_needs_update = true;
    }
    return true;
 }
@@ -979,6 +1030,7 @@ zink_kopper_acquire_readback(struct zink_context *ctx, struct zink_resource *res
    assert(res->obj->dt);
    struct kopper_displaytarget *cdt = res->obj->dt;
    const struct kopper_swapchain *cswap = cdt->swapchain;
+   zink_kopper_sync_idx(res);
    uint32_t last_dt_idx = res->obj->last_dt_idx;
    VkResult ret = VK_SUCCESS;
 
@@ -1023,15 +1075,26 @@ zink_kopper_acquire_readback(struct zink_context *ctx, struct zink_resource *res
          util_queue_fence_wait(&cdt->swapchain->present_fence);
       }
       cdt->age_locked = true;
-      do {
-         ret = kopper_acquire(screen, res, 0);
-      } while (!is_swapchain_kill(ret) && (ret == VK_NOT_READY || ret == VK_TIMEOUT));
+      /* this waits, and gives up shortly once past the acquire limit */
+      ret = kopper_acquire(screen, res, UINT64_MAX);
+      if (ret == VK_NOT_READY || ret == VK_TIMEOUT) {
+         /* other buffers hold every acquirable image, so read the copies kept from now on */
+         kopper_ensure_readback(screen, res);
+         const struct kopper_swapchain *cur = cdt->swapchain;
+         struct pipe_resource *copy = cur->images[last_dt_idx < cur->num_images ? last_dt_idx : 0].readback;
+         *readback = copy ? zink_resource(copy) : res;
+         cdt->age_locked = false;
+         return false;
+      }
       if (is_swapchain_kill(ret)) {
          kill_swapchain(ctx, res);
          *readback = NULL;
          cdt->age_locked = false;
          return false;
       }
+      /* the acquire replaced the swapchain, so this buffer is the newest and last_dt_idx can't match */
+      if (res->obj->last_dt_idx == UINT32_MAX)
+         break;
    }
    if (cswap != cdt->swapchain) {
       ctx->swapchain_size = cdt->swapchain->scci.imageExtent;
@@ -1050,9 +1113,15 @@ zink_kopper_present_readback(struct zink_context *ctx, struct zink_resource *res
    struct kopper_displaytarget *cdt = res->obj->dt;
    VkSubmitInfo si = {0};
    assert(zink_is_swapchain(res));
-   if (res->obj->last_dt_idx == UINT32_MAX)
+   zink_kopper_sync_idx(res);
+   if (res->obj->last_dt_idx == UINT32_MAX) {
+      /* nothing was written since the swapchain was replaced, but the age lock must end */
+      cdt->age_locked = false;
       return true;
+   }
    if (res->layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+      /* the transition has to wait for the acquire */
+      zink_batch_reference_resource_rw(ctx, res, false);
       zink_screen(ctx->base.screen)->image_barrier(ctx, res, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
       ctx->base.flush(&ctx->base, NULL, 0);
    }
@@ -1081,9 +1150,11 @@ zink_kopper_present_readback(struct zink_context *ctx, struct zink_resource *res
    error = VKSCR(QueueWaitIdle)(screen->queue);
    simple_mtx_unlock(screen->queue_lock);
 
-   simple_mtx_lock(&screen->semaphores_lock);
-   util_dynarray_append(&screen->semaphores, acquire);
-   simple_mtx_unlock(&screen->semaphores_lock);
+   if (acquire) {
+      simple_mtx_lock(&screen->semaphores_lock);
+      util_dynarray_append(&screen->semaphores, acquire);
+      simple_mtx_unlock(&screen->semaphores_lock);
+   }
 
    cdt->age_locked = false;
 
@@ -1156,8 +1227,6 @@ zink_kopper_fixup_depth_buffer(struct zink_context *ctx)
    if (!ctx->fb_state.zsbuf.texture)
       return;
 
-   assert(ctx->fb_state.zsbuf.texture->bind & PIPE_BIND_DISPLAY_TARGET);
-
    struct zink_resource *res = zink_resource(ctx->fb_state.zsbuf.texture);
    unsigned width = pipe_surface_width(&ctx->fb_state.zsbuf);
    unsigned height = pipe_surface_height(&ctx->fb_state.zsbuf);
@@ -1199,24 +1268,30 @@ zink_kopper_check(struct pipe_resource *pres)
 }
 
 void
-zink_kopper_set_swap_interval(struct pipe_screen *pscreen, struct pipe_resource *pres, int interval)
+zink_kopper_set_swap_interval(struct pipe_context *pctx, struct pipe_resource *pres, int interval)
 {
    struct zink_resource *res = zink_resource(pres);
-   struct zink_screen *screen = zink_screen(pscreen);
+   struct zink_screen *screen = zink_screen(pctx->screen);
    assert(res->obj->dt);
    struct kopper_displaytarget *cdt = res->obj->dt;
    VkPresentModeKHR old_present_mode = cdt->present_mode;
+
+   zink_tc_context_unwrap(pctx);
+   zink_kopper_sync_idx(res);
 
    zink_kopper_set_present_mode_for_interval(cdt, interval);
 
    if (old_present_mode == cdt->present_mode)
       return;
-   cdt->present_mode = old_present_mode;
    if (res->obj->dt_idx == UINT32_MAX) {
-      /* only update swapchain when there is no current acquire to avoid flickering */
-      VkResult ret = update_swapchain(screen, cdt, cdt->caps.currentExtent.width, cdt->caps.currentExtent.height);
-      if (ret != VK_SUCCESS)
+      /* only update swapchain when there is no current acquire to avoid flickering,
+       * otherwise the update is deferred to the next present
+       */
+      VkResult ret = update_swapchain(screen, cdt, cdt->swapchain->scci.imageExtent.width, cdt->swapchain->scci.imageExtent.height);
+      if (ret != VK_SUCCESS) {
+         cdt->present_mode = old_present_mode;
          mesa_loge("zink: failed to set swap interval!");
+      }
    }
 }
 
@@ -1233,7 +1308,7 @@ zink_kopper_query_buffer_age(struct pipe_context *pctx, struct pipe_resource *pr
    /* Returning 0 here isn't ideal (yes, the buffer is undefined, because you
     * lost it) but threading the error up is more hassle than it's worth.
     */
-   if (!zink_kopper_acquired(res->obj->dt, res->obj->dt_idx))
+   if (!zink_kopper_acquired(cdt, zink_kopper_get_dt_idx(res)))
       if (!zink_kopper_acquire(ctx, res, UINT64_MAX))
          return 0;
 

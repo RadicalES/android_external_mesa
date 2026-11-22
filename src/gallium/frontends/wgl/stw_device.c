@@ -49,25 +49,6 @@
 
 struct stw_device *stw_dev = NULL;
 
-static int
-stw_get_param(struct pipe_frontend_screen *fscreen,
-              enum st_manager_param param)
-{
-   switch (param) {
-   case ST_MANAGER_BROKEN_INVALIDATE:
-      /*
-       * Force framebuffer validation on glViewport.
-       *
-       * Certain applications, like Rhinoceros 4, uses glReadPixels
-       * exclusively (never uses SwapBuffers), so framebuffers never get
-       * resized unless we check on glViewport.
-       */
-      return 1;
-   default:
-      return 0;
-   }
-}
-
 
 /** Get the refresh rate for the monitor, in Hz */
 static int
@@ -113,6 +94,7 @@ static const driOptionDescription gallium_driconf[] = {
 DRI_CONF_SECTION("WGL")
    DRI_CONF_WGL_FRAME_LATENCY(2)
    DRI_CONF_WGL_SWAP_INTERVAL(1)
+   DRI_CONF_WGL_REQUIRE_GDI_COMPAT(false)
 DRI_CONF_SECTION_END
 };
 
@@ -121,8 +103,10 @@ init_options()
 {
    const char *driver_name = stw_dev->stw_winsys->get_name ? stw_dev->stw_winsys->get_name() : NULL;
    driParseOptionInfo(&stw_dev->option_info, gallium_driconf, ARRAY_SIZE(gallium_driconf));
-   driParseConfigFiles(&stw_dev->option_cache, &stw_dev->option_info, 0,
-      driver_name ? driver_name : "", NULL, NULL, NULL, 0, NULL, 0);
+   driParseConfigFiles(&stw_dev->option_cache, &stw_dev->option_info,
+                       &(driConfigFileParseParams) {
+                          .driverName = driver_name ? driver_name : "",
+                       });
    
    u_driconf_fill_st_options(&stw_dev->st_options, &stw_dev->option_cache);
 
@@ -156,7 +140,14 @@ stw_init(const struct stw_winsys *stw_winsys)
    if (!stw_dev->fscreen)
       goto error1;
 
-   stw_dev->fscreen->get_param = stw_get_param;
+   /*
+    * Force framebuffer validation on glViewport.
+    *
+    * Certain applications, like Rhinoceros 4, uses glReadPixels
+    * exclusively (never uses SwapBuffers), so framebuffers never get
+    * resized unless we check on glViewport.
+    */
+   stw_dev->fscreen->broken_invalidate = true;
 
    InitializeCriticalSection(&stw_dev->screen_mutex);
    InitializeCriticalSection(&stw_dev->ctx_mutex);
@@ -242,6 +233,7 @@ stw_cleanup(void)
       return;
    }
 
+   free(stw_dev->st_options.force_explicit_uniform_loc_zero);
    free(stw_dev->st_options.force_gl_vendor);
    free(stw_dev->st_options.force_gl_renderer);
    free(stw_dev->st_options.mesa_extension_override);

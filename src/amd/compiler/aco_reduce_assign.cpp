@@ -5,7 +5,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "aco_builder.h"
 #include "aco_ir.h"
 
 #include <vector>
@@ -42,8 +41,8 @@ setup_reduce_temp(Program* program)
       return;
 
    assert(maxSize == 1 || maxSize == 2);
-   Temp reduceTmp(0, RegClass(RegType::vgpr, maxSize).as_linear());
-   Temp vtmp(0, RegClass(RegType::vgpr, maxSize).as_linear());
+   Temp reduceTmp(0, lv1.resize(maxSize * 4));
+   Temp vtmp(0, lv1.resize(maxSize * 4));
    int inserted_at = -1;
    int vtmp_inserted_at = -1;
 
@@ -105,10 +104,8 @@ setup_reduce_temp(Program* program)
                std::vector<aco_ptr<Instruction>>& instructions =
                   program->blocks[last_top_level_block_idx].instructions;
                auto insert_point =
-                  std::find_if(instructions.rbegin(), instructions.rend(),
-                               [](const auto& iter) {
-                                  return iter->opcode == aco_opcode::p_logical_end;
-                               })
+                  std::find_if(instructions.rbegin(), instructions.rend(), [](const auto& iter)
+                               { return iter->opcode == aco_opcode::p_logical_end; })
                      .base();
                instructions.insert(insert_point, std::move(create));
                inserted_at = last_top_level_block_idx;
@@ -150,10 +147,8 @@ setup_reduce_temp(Program* program)
                std::vector<aco_ptr<Instruction>>& instructions =
                   program->blocks[last_top_level_block_idx].instructions;
                auto insert_point =
-                  std::find_if(instructions.rbegin(), instructions.rend(),
-                               [](const auto& iter) {
-                                  return iter->opcode == aco_opcode::p_logical_end;
-                               })
+                  std::find_if(instructions.rbegin(), instructions.rend(), [](const auto& iter)
+                               { return iter->opcode == aco_opcode::p_logical_end; })
                      .base();
                instructions.insert(insert_point, std::move(create));
                vtmp_inserted_at = last_top_level_block_idx;

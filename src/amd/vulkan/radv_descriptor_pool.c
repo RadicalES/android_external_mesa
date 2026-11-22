@@ -6,13 +6,13 @@
  */
 
 #include "radv_descriptor_pool.h"
+#include "tools/radv_rmv.h"
 #include "radv_buffer.h"
 #include "radv_descriptor_set.h"
 #include "radv_descriptors.h"
 #include "radv_device.h"
 #include "radv_entrypoints.h"
 #include "radv_physical_device.h"
-#include "radv_rmv.h"
 
 #include "vk_log.h"
 
@@ -57,14 +57,14 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_descriptor_pool *pool;
    uint64_t size = sizeof(struct radv_descriptor_pool);
-   uint64_t bo_size = 0, bo_count = 0, range_count = 0;
+   uint64_t bo_size = 0, range_count = 0;
    VkResult result = VK_SUCCESS;
 
    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
       vk_find_struct_const(pCreateInfo->pNext, MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT);
 
-   vk_foreach_struct_const (ext, pCreateInfo->pNext) {
-      switch (ext->sType) {
+   vk_foreach_struct_const (sType, ext, pCreateInfo->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO: {
          const VkDescriptorPoolInlineUniformBlockCreateInfo *info =
             (const VkDescriptorPoolInlineUniformBlockCreateInfo *)ext;
@@ -81,9 +81,6 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
 
    uint64_t num_16byte_descriptors = 0;
    for (unsigned i = 0; i < pCreateInfo->poolSizeCount; ++i) {
-      bo_count += radv_descriptor_type_buffer_count(pCreateInfo->pPoolSizes[i].type) *
-                  pCreateInfo->pPoolSizes[i].descriptorCount;
-
       switch (pCreateInfo->pPoolSizes[i].type) {
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
@@ -123,7 +120,7 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
                   num_16byte_descriptors += pCreateInfo->pPoolSizes[i].descriptorCount;
             }
          } else {
-            const uint32_t max_desc_size = pdev->use_fmask ? 64 : 32;
+            const uint32_t max_desc_size = radv_get_sampled_image_desc_size(pdev);
             bo_size += max_desc_size * pCreateInfo->pPoolSizes[i].descriptorCount;
          }
          break;
@@ -146,7 +143,6 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
 
    if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT)) {
       size += pCreateInfo->maxSets * sizeof(struct radv_descriptor_set);
-      size += sizeof(struct radeon_winsys_bo *) * bo_count;
       size += sizeof(struct radv_descriptor_range) * range_count;
    }
 
@@ -164,7 +160,7 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
       pool->host_memory_end = (uint8_t *)pool + size;
    } else {
       if (bo_size) {
-         util_vma_heap_init(&pool->bo_heap, RADV_POOL_HEAP_OFFSET, bo_size + RADV_POOL_HEAP_OFFSET);
+         util_vma_heap_init(&pool->bo_heap, RADV_POOL_HEAP_OFFSET, bo_size);
          pool->bo_heap.alloc_high = false;
       }
    }
@@ -172,9 +168,6 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
    if (bo_size) {
       if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT)) {
          enum radeon_bo_flag flags = RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY | RADEON_FLAG_32BIT;
-
-         if (radv_device_should_clear_vram(device))
-            flags |= RADEON_FLAG_ZERO_VRAM;
 
          result = radv_bo_create(device, &pool->base, bo_size, 32, RADEON_DOMAIN_VRAM, flags,
                                  RADV_BO_PRIORITY_DESCRIPTOR, 0, false, &pool->bo);
@@ -187,7 +180,7 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
             goto fail;
          }
       } else {
-         pool->host_bo = vk_alloc2(&device->vk.alloc, pAllocator, bo_size, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+         pool->host_bo = vk_zalloc2(&device->vk.alloc, pAllocator, bo_size, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
          if (!pool->host_bo) {
             result = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto fail;
@@ -238,7 +231,7 @@ radv_ResetDescriptorPool(VkDevice _device, VkDescriptorPool descriptorPool, VkDe
 
    if (!pool->host_memory_base && pool->size) {
       util_vma_heap_finish(&pool->bo_heap);
-      util_vma_heap_init(&pool->bo_heap, RADV_POOL_HEAP_OFFSET, pool->size + RADV_POOL_HEAP_OFFSET);
+      util_vma_heap_init(&pool->bo_heap, RADV_POOL_HEAP_OFFSET, pool->size);
       pool->bo_heap.alloc_high = false;
    }
 

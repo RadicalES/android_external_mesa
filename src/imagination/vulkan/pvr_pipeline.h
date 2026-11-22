@@ -20,6 +20,7 @@
 #include "pvr_common.h"
 #include "pvr_csb.h"
 #include "pvr_pds.h"
+#include "util/shader_stats.h"
 
 struct pvr_suballoc_bo;
 
@@ -84,6 +85,29 @@ struct pvr_fragment_shader_state {
 
    struct pvr_pds_kickusc_program pds_fragment_program;
    uint32_t *pds_fragment_program_buffer;
+
+   bool is_passthrough;
+};
+
+struct pvr_xfb_varying {
+   uint32_t register_start;
+   uint32_t register_count;
+   uint32_t xfb_buffer;
+   uint32_t xfb_offset;
+   uint32_t xfb_stride;
+};
+
+struct pvr_xfb_shader_state {
+   uint32_t varying_count;
+   struct pvr_xfb_varying *varyings;
+   uint32_t buffer_strides[PVR_XFB_MAX_BUFFERS];
+
+   uint32_t buffer_group_count;
+   uint32_t group_varying_count[PVR_XFB_MAX_BUFFERS];
+
+   struct pvr_suballoc_bo *counter_buffer_offsets;
+
+   struct pvr_suballoc_bo *indirect_byte_count;
 };
 
 struct pvr_pipeline {
@@ -109,6 +133,10 @@ struct pvr_compute_pipeline {
    uint32_t num_workgroups_data_patching_offset;
    uint32_t num_workgroups_indirect_src_patching_offset;
    uint32_t num_workgroups_indirect_src_dma_patching_offset;
+
+   /* Debug Info */
+   struct pvr_stats *cs_stats;
+   const char *cs_nir_str;
 };
 
 struct pvr_graphics_pipeline {
@@ -125,7 +153,15 @@ struct pvr_graphics_pipeline {
    struct {
       struct pvr_vertex_shader_state vertex;
       struct pvr_fragment_shader_state fragment;
+      struct pvr_xfb_shader_state xfb_shader_state;
    } shader_state;
+
+   /* Debug Info */
+   struct pvr_stats *vs_stats;
+   struct pvr_stats *fs_stats;
+
+   const char *vs_nir_str;
+   const char *fs_nir_str;
 };
 
 struct pvr_private_compute_pipeline {
@@ -173,35 +209,44 @@ pvr_stage_mask(VkPipelineStageFlags2 stage_mask)
 {
    enum pvr_pipeline_stage_bits stages = 0;
 
-   if (stage_mask & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+   if (stage_mask & VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT)
       return PVR_PIPELINE_STAGE_ALL_BITS;
 
-   if (stage_mask & (VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT))
+   if (stage_mask & (VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT))
       stages |= PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS;
 
-   if (stage_mask & (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                     VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-                     VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                     VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
-                     VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
-                     VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT)) {
+   if (stage_mask & (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                     VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                     VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT)) {
       stages |= PVR_PIPELINE_STAGE_GEOM_BIT;
    }
 
-   if (stage_mask & (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)) {
+   if (stage_mask & (VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)) {
       stages |= PVR_PIPELINE_STAGE_FRAG_BIT;
    }
 
-   if (stage_mask & (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)) {
+   if (stage_mask & (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)) {
       stages |= PVR_PIPELINE_STAGE_COMPUTE_BIT;
    }
 
-   if (stage_mask & (VK_PIPELINE_STAGE_TRANSFER_BIT))
+   if (stage_mask & (VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                     VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                     VK_PIPELINE_STAGE_2_COPY_BIT |
+                     VK_PIPELINE_STAGE_2_BLIT_BIT |
+                     VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+                     VK_PIPELINE_STAGE_2_CLEAR_BIT))
       stages |= PVR_PIPELINE_STAGE_TRANSFER_BIT;
+
+   if (stage_mask & (VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT))
+      stages |= PVR_PIPELINE_STAGE_QUERY_BIT;
 
    return stages;
 }

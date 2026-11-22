@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2019 Alyssa Rosenzweig <alyssa@rosenzweig.io>
+ * Copyright (C) 2018-2019 Alyssa Rosenzweig
  * SPDX-License-Identifier: MIT
  */
 
@@ -10,6 +10,7 @@
 #include <string.h>
 #include "compiler/nir/nir.h"
 #include "panfrost/compiler/pan_compiler.h"
+#include "panfrost/compiler/pan_nir.h"
 #include "util/u_dynarray.h"
 
 struct bifrost_precompiled_kernel_sysvals {
@@ -18,7 +19,6 @@ struct bifrost_precompiled_kernel_sysvals {
    } num_workgroups;
    uint64_t printf_buffer_address;
 } __attribute__((aligned(8)));
-;
 
 #define BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE                                \
    sizeof(struct bifrost_precompiled_kernel_sysvals)
@@ -63,48 +63,23 @@ bifrost_precompiled_kernel_prepare_push_uniforms(
           user_data_size);
 }
 
-void bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_optimize_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_postprocess_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_lower_texture_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_lower_texture_late_nir(nir_shader *nir, unsigned gpu_id);
-
-bool bifrost_will_dump_shaders(void);
+void bifrost_preprocess_nir(nir_shader *nir, unsigned arch);
+void bifrost_postprocess_nir(nir_shader *nir,
+                             const struct pan_compile_inputs *inputs,
+                             struct pan_shader_info *info);
 
 void bifrost_compile_shader_nir(nir_shader *nir,
                                 const struct pan_compile_inputs *inputs,
                                 struct util_dynarray *binary,
                                 struct pan_shader_info *info);
 
+bool valhall_can_merge_workgroups(nir_shader *nir);
+
 #define VALHAL_EX_FIFO_VARYING_BITS \
    (VARYING_BIT_PSIZ | VARYING_BIT_LAYER | VARYING_BIT_PRIMITIVE_ID)
 
-static inline bool
-valhal_writes_extended_fifo(uint64_t outputs_written,
-                            bool no_psiz, bool multiview)
-{
-   uint64_t ex_fifo_written = outputs_written & VALHAL_EX_FIFO_VARYING_BITS;
-   if (ex_fifo_written == 0)
-      return false;
-
-   /* Multiview shaders depend on the FIFO format for indexing per-view
-    * output writes. We don't currently patch these offsets in the no_psiz
-    * variant, so we need the extended format, regardless of point size.
-    */
-   if (multiview)
-      return true;
-
-   /* If we're not rendering in points mode, the no_psiz variant has point
-    * size write patched out for us.
-    */
-   if (no_psiz)
-      ex_fifo_written &= ~VARYING_BIT_PSIZ;
-
-   return ex_fifo_written != 0;
-}
-
-#define DEFINE_OPTIONS(arch)                                                   \
-   static const nir_shader_compiler_options bifrost_nir_options_v##arch = {    \
+#define DEFINE_OPTIONS(name, arch, merge_workgroups)                           \
+   static const nir_shader_compiler_options name = {                           \
       .lower_scmp = true,                                                      \
       .lower_flrp16 = true,                                                    \
       .lower_flrp32 = true,                                                    \
@@ -125,6 +100,7 @@ valhal_writes_extended_fifo(uint64_t outputs_written,
       .lower_bitfield_extract8 = true,                                         \
       .lower_bitfield_extract16 = true,                                        \
       .lower_insert_byte = true,                                               \
+      .has_bitfield_select = true,                                             \
                                                                                \
       .lower_pack_64_4x16 = true,                                              \
       .lower_pack_half_2x16 = true,                                            \
@@ -141,17 +117,27 @@ valhal_writes_extended_fifo(uint64_t outputs_written,
                                                                                \
       .lower_doubles_options =                                                 \
          nir_lower_dmod, /* TODO: Don't lower supported 64-bit operations */   \
-      .lower_int64_options = ~0, /* TODO: Use IMULD on v7 */                   \
+      .lower_int64_options = arch >= 9 ? ~(nir_lower_iadd64) : ~0,             \
+      /* Lower 64-bit ops (notably the shifts used for pointer arithmetic)    \
+       * ourselves, after nir_opt_load_store_vectorize. Letting the frontend  \
+       * lower int64 early turns address math into pack/unpack + carry chains \
+       * that nir_opt_load_store_vectorize cannot parse, which prevents        \
+       * vectorizing scalarized OpenCL vload/vstore accesses. */              \
+      .late_lower_int64 = (arch >= 9),                                         \
       .lower_mul_high = true,                                                  \
       .lower_fisnormal = true,                                                 \
       .lower_uadd_carry = true,                                                \
       .lower_usub_borrow = true,                                               \
                                                                                \
+      .has_ldexp = true,                                                       \
       .has_isub = true,                                                        \
       .vectorize_vec2_16bit = true,                                            \
-      .fuse_ffma16 = true,                                                     \
-      .fuse_ffma32 = true,                                                     \
-      .fuse_ffma64 = true,                                                     \
+      .float_mul_add16 = nir_float_muladd_support_has_ffma |                   \
+          nir_float_muladd_support_fuse,                                       \
+      .float_mul_add32 = nir_float_muladd_support_has_ffma |                   \
+          nir_float_muladd_support_fuse,                                       \
+      .float_mul_add64 = nir_float_muladd_support_has_ffma |                   \
+          nir_float_muladd_support_fuse,                                       \
                                                                                \
       .lower_uniforms_to_ubo = true,                                           \
                                                                                \
@@ -164,19 +150,33 @@ valhal_writes_extended_fifo(uint64_t outputs_written,
          (nir_var_shader_in | nir_var_shader_out | nir_var_function_temp),     \
       .force_indirect_unrolling_sampler = true,                                \
       .scalarize_ddx = true,                                                   \
-      .support_indirect_inputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL) |         \
-                                 BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |         \
-                                 BITFIELD_BIT(MESA_SHADER_FRAGMENT),           \
+      .support_indirect_inputs = 0 /* TODO support indirect varyings */,       \
       .lower_hadd = arch >= 11,                                                \
+      .lower_hadd64 = true,                                                    \
+      .lower_mul_32x16 = true,                                                 \
       .discard_is_demote = true,                                               \
       .has_udot_4x8 = arch >= 9,                                               \
       .has_udot_4x8_sat = arch >= 9,                                           \
       .has_sdot_4x8 = arch >= 9,                                               \
       .has_sdot_4x8_sat = arch >= 9,                                           \
+                                                                               \
+      .divergence_analysis_options = merge_workgroups ?                        \
+         (nir_divergence_across_subgroups |                                    \
+          nir_divergence_multiple_workgroup_per_compute_subgroup)              \
+         : 0,                                                                  \
+      .lower_mediump_io = pan_nir_lower_mediump_io,                            \
+      /* Skip unlowering IO to vars */                                         \
+      .io_options = nir_io_has_intrinsics | nir_io_non_interpolated_as_uint,   \
+      /* Valhall (arch >= 9) fp32 FLOG2/FEXP2 meet the CL ULP budget. */       \
+      .has_cl_log2_exp2 = arch >= 9,                                           \
    };
 
-DEFINE_OPTIONS(6);
-DEFINE_OPTIONS(9);
-DEFINE_OPTIONS(11);
+DEFINE_OPTIONS(bifrost_nir_options_v6, 6, false);
+DEFINE_OPTIONS(bifrost_nir_options_v9, 9, false);
+DEFINE_OPTIONS(bifrost_nir_options_v9_merge_wg, 9, true);
+DEFINE_OPTIONS(bifrost_nir_options_v11, 11, false);
+DEFINE_OPTIONS(bifrost_nir_options_v11_merge_wg, 11, true);
+
+uint32_t bifrost_get_compiler_flags(void);
 
 #endif

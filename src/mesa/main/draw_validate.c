@@ -121,7 +121,7 @@ _mesa_update_valid_to_render_state(struct gl_context *ctx)
       return;
 
    if (ctx->Color.BlendEnabled &&
-       ctx->Color._AdvancedBlendMode != BLEND_NONE) {
+       ctx->Color._AdvancedBlendMode != PIPE_ADVANCED_BLEND_NONE) {
       /* The KHR_blend_equation_advanced spec says:
        *
        *    "If any non-NONE draw buffer uses a blend equation found in table
@@ -217,6 +217,27 @@ _mesa_update_valid_to_render_state(struct gl_context *ctx)
    if (shader->CurrentProgram[MESA_SHADER_TESS_CTRL] &&
        !shader->CurrentProgram[MESA_SHADER_TESS_EVAL])
       return;
+
+   /* From the OVR_multiview spec:
+    *
+    *    "* Any attachment of the draw framebuffer is multiview (section 9.2.8)
+    *      and any of the following conditions are true:
+    *
+    *      - There is an active program for tessellation control, tessellation
+    *      evaluation, or geometry stages, or
+    *
+    *      - Transform feedback is active and not paused."
+    */
+   if (shader->CurrentProgram[MESA_SHADER_TESS_CTRL] ||
+       shader->CurrentProgram[MESA_SHADER_TESS_EVAL] ||
+       shader->CurrentProgram[MESA_SHADER_GEOMETRY] ||
+       _mesa_is_xfb_active_and_unpaused(ctx)) {
+      for (unsigned i = 0; i < BUFFER_COUNT; i++) {
+         struct gl_renderbuffer *rb = ctx->DrawBuffer->Attachment[i].Renderbuffer;
+         if (rb && rb->rtt_numviews)
+            return;
+      }
+   }
 
    switch (ctx->API) {
    case API_OPENGLES2:

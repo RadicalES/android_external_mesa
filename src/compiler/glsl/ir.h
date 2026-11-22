@@ -871,6 +871,11 @@ public:
       unsigned pixel_local_storage:2;
 
       /**
+       * Non-zero if the fragment shader output produce YUV color output
+       */
+      unsigned yuv:1;
+
+      /**
        * Emit a warning if this variable is accessed.
        */
    private:
@@ -1466,6 +1471,10 @@ public:
 
    /** List of ir_instruction that make up the body of the loop. */
    ir_exec_list body_instructions;
+   /** List of ir_instruction that make up the continue construct. */
+   ir_exec_list continue_instructions;
+   /** Whether the loop is in do-while form. */
+   bool do_while;
 };
 
 

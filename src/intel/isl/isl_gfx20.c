@@ -227,51 +227,45 @@ isl_gfx20_choose_image_alignment_el(const struct isl_device *dev,
       *image_align_el = tiling == ISL_TILING_LINEAR ?
          isl_extent3d(128, 4, 1) :
          isl_extent3d(16, 4, 1);
-   } else if (_isl_surf_info_supports_ccs(dev, info->format, info->usage) ||
-              tiling == ISL_TILING_LINEAR) {
+   } else if (tiling == ISL_TILING_LINEAR) {
       /* From RENDER_SURFACE_STATE::SurfaceHorizontalAlignment,
        *
-       *    - Losslessly Compressed Surfaces Must be HALIGN=128 for all
-       *      supported Bpp, if other restriction are not applied
        *    - Linear Surfaces surfaces must use HALIGN=128, including 1D which
        *      is always Linear.
        */
       *image_align_el = isl_extent3d(128 * 8 / fmtl->bpb, 4, 1);
-
-      /* WA_22018390030:
-       *
-       * Don't choose VALIGN_4 on Xe2 for color, non-volumetric, Tile4 surfaces
-       * which can be fast cleared. We choose the next smallest option instead,
-       * VALIGN_8.
-       */
-      if (!INTEL_DEBUG(DEBUG_NO_FAST_CLEAR) &&
-          intel_needs_workaround(dev->info, 22018390030) &&
-          tiling == ISL_TILING_4 &&
-          info->dim != ISL_SURF_DIM_3D) {
-         image_align_el->h = 8;
-      }
-   } else if (fmtl->bpb >= 64) {
-      assert(fmtl->bpb == 64 || fmtl->bpb == 128);
+   } else {
       /* From RENDER_SURFACE_STATE::SurfaceHorizontalAlignment,
        *
        *    - 64bpe and 128bpe Surfaces Must Be HALIGN=64Bytes or 128Bytes (4,
        *      8 texels or 16 texels)
        *
-       * HALIGN=128 is used for losslessly compressed or linear surfaces. For
-       * other surface types, pick the smaller alignment of HALIGN=64 to save
-       * space.
-       */
-      *image_align_el = isl_extent3d(64 * 8 / fmtl->bpb, 4, 1);
-   } else {
-      /* From RENDER_SURFACE_STATE::SurfaceHorizontalAlignment,
+       *    - HALIGN=16Bytes(8 texels) is allowed only for 16b Depth, Stencil
+       *      Surfaces (8b) and Tiled 24bpp, 48bpp and 96bpp surfaces
        *
-       *    HALIGN=16Bytes(8 texels) is allowed only for 16b Depth, Stencil
-       *    Surfaces (8b) and Tiled 24bpp, 48bpp and 96bpp surfaces
-       *
-       * HALIGN=16 would save the most space, but it is reserved for the cases
-       * handled earlier in this if-ladder. Choose the next smallest alignment
-       * possible, HALIGN=32.
+       * According to Bspec 57023 (r75452), the second restriction is only
+       * valid on Xe due to HSD 14010837590. This is incorrect.
        */
-      *image_align_el = isl_extent3d(32 * 8 / fmtl->bpb, 4, 1);
+      const uint32_t halign_B = fmtl->bpb >= 64 ? 64 : 32;
+      *image_align_el = isl_extent3d(halign_B * 8 / fmtl->bpb, 4, 1);
+
+      /* WA_22018390030:
+       *
+       * Don't choose VALIGN_4 on Xe2 for color, non-volumetric, Tile4
+       * surfaces which can be fast cleared. We choose the next smallest
+       * option instead, VALIGN_8.
+       *
+       * Bspec 57340 and HSD 22021327133 state that this also applies to
+       * Xe3P+.
+       */
+      if (!INTEL_DEBUG(DEBUG_NO_FAST_CLEAR) &&
+          _isl_surf_info_supports_ccs(dev, info->format, info->usage) &&
+          !isl_format_is_compressed(info->format) &&
+          tiling == ISL_TILING_4 &&
+          info->dim != ISL_SURF_DIM_3D) {
+         assert(intel_needs_workaround(dev->info, 22018390030) ||
+                ISL_GFX_VER(dev) >= 35);
+         image_align_el->h = 8;
+      }
    }
 }

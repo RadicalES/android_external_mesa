@@ -937,6 +937,8 @@ struct _mesa_glsl_parse_state {
    bool EXT_texture_query_lod_warn;
    bool EXT_texture_shadow_lod_enable;
    bool EXT_texture_shadow_lod_warn;
+   bool EXT_YUV_target_enable;
+   bool EXT_YUV_target_warn;
    bool INTEL_conservative_rasterization_enable;
    bool INTEL_conservative_rasterization_warn;
    bool INTEL_shader_atomic_float_minmax_enable;
@@ -1023,6 +1025,7 @@ struct _mesa_glsl_parse_state {
    char *alias_shader_extension;
    bool allow_vertex_texture_bias;
    bool allow_glsl_120_subset_in_110;
+   bool allow_glsl_embedded_structure_declarations;
    bool allow_builtin_variable_redeclaration;
    bool ignore_write_to_readonly_var;
 

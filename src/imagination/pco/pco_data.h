@@ -16,6 +16,7 @@
 #include "common/pvr_limits.h"
 #include "compiler/shader_enums.h"
 #include "nir/nir_lower_blend.h"
+#include "nir/nir_xfb_info.h"
 #include "util/format/u_format.h"
 
 #include <stdbool.h>
@@ -48,6 +49,8 @@ typedef struct _pco_vs_data {
 
    unsigned clip_count;
    unsigned cull_count;
+
+   nir_xfb_info *xfb_info;
 
    unsigned f32_smooth; /** Number of F32 linear varyings. */
    unsigned f32_flat; /** Number of F32 flat varyings. */
@@ -116,7 +119,6 @@ typedef struct _pco_fs_data {
       bool fbfetch; /** Whether the shader fetches from the framebuffer. */
       bool depth_feedback;
       bool discard;
-      bool early_frag;
       bool sample_shading;
       bool sample_locations;
       bool alpha_to_coverage;
@@ -134,6 +136,7 @@ typedef struct _pco_cs_data {
 
    pco_range shmem;
    bool zero_shmem;
+   bool global_shmem;
 } pco_cs_data;
 
 /** PCO image descriptor metadata. */
@@ -163,6 +166,9 @@ typedef struct _pco_binding_data {
 
    /** Whether the descriptor binding is a combined image sampler. */
    bool is_img_smp;
+
+   /** Whether the descriptor binding is an inline uniform block. */
+   bool is_inline_ubo;
 } pco_binding_data;
 
 /** PCO descriptor set data. */
@@ -225,6 +231,7 @@ typedef struct _pco_common_data {
    bool robust_buffer_access;
    bool null_descriptor;
    bool image_2d_view_of_3d;
+   bool image_sliced_view_of_3d;
    bool multiview;
 } pco_common_data;
 
@@ -256,4 +263,6 @@ typedef struct PACKED _pco_precomp_data {
 static_assert(sizeof(pco_precomp_data) == 8, "sizeof(pco_precomp_data) != 8");
 
 pco_precomp_data pco_get_precomp_data(pco_shader *shader);
+
+struct pvr_stats pco_get_pvr_stats(pco_shader *shader);
 #endif /* PCO_DATA_H */

@@ -170,7 +170,7 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         | Op::SuStGa(_) => SideEffect::Memory,
 
         // Memory ops
-        Op::Ipa(_) | Op::Ldc(_) => SideEffect::None,
+        Op::Ipa(_) | Op::Ldc(_) | Op::Ldcg(_) => SideEffect::None,
         Op::Ld(_)
         | Op::Ldsm(_)
         | Op::LdSharedLock(_)
@@ -213,9 +213,11 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         | Op::TexDepBar(_)
         | Op::CS2R(_)
         | Op::Isberd(_)
+        | Op::Isbewr(_)
         | Op::ViLd(_)
         | Op::Kill(_)
-        | Op::S2R(_) => SideEffect::Barrier,
+        | Op::S2R(_)
+        | Op::Nanosleep(_) => SideEffect::Barrier,
         Op::PixLd(_) | Op::Vote(_) | Op::Match(_) => SideEffect::None,
         Op::Nop(OpNop { label, .. }) => {
             if label.is_none() {
@@ -298,7 +300,7 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
         | Op::SuStGa(_) => 32,
 
         // Memory ops
-        Op::Ldc(_) => 4,
+        Op::Ldc(_) | Op::Ldcg(_) => 4,
 
         Op::Ld(_)
         | Op::Ldsm(_)
@@ -329,6 +331,7 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
         | Op::TexDepBar(_)
         | Op::CS2R(_)
         | Op::Isberd(_)
+        | Op::Isbewr(_)
         | Op::ViLd(_)
         | Op::Kill(_)
         | Op::PixLd(_)

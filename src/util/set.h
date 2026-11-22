@@ -89,10 +89,10 @@ struct set *
 _mesa_set_create_u32_keys(void *mem_ctx);
 
 bool
-_mesa_set_copy(struct set *dst, struct set *src, void *dst_mem_ctx);
+_mesa_set_copy(struct set *dst, const struct set *src, void *dst_mem_ctx);
 
 struct set *
-_mesa_set_clone(struct set *set, void *dst_mem_ctx);
+_mesa_set_clone(const struct set *set, void *dst_mem_ctx);
 
 void
 _mesa_set_destroy(struct set *set,
@@ -141,6 +141,15 @@ _mesa_pointer_set_create(void *mem_ctx);
 
 bool
 _mesa_set_intersects(struct set *a, struct set *b);
+
+bool
+_mesa_set_equal(const struct set *a, const struct set *b);
+
+void
+_mesa_set_add_set(struct set *set, const struct set *other);
+
+struct set *
+_mesa_set_union(const struct set *a, const struct set *b, void *dst_mem_ctx);
 
 /**
  * This foreach function is safe against deletion, but not against

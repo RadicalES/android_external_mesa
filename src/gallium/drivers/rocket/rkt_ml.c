@@ -40,7 +40,7 @@ static void
 create_tensor(struct rkt_ml_subgraph *subgraph, unsigned idx,
               unsigned size)
 {
-   struct pipe_context *context = subgraph->base.context;
+   struct pipe_context *context = subgraph->context;
    struct pipe_resource **tensors = util_dynarray_begin(&subgraph->tensors);
 
    assert(idx < util_dynarray_num_elements(&subgraph->tensors,
@@ -76,6 +76,17 @@ rkt_is_depthwise(const struct pipe_ml_operation *poperation)
 }
 
 static unsigned
+calc_raw_input_size(struct rkt_operation *operation)
+{
+   unsigned input_channels_1 =
+      DIV_ROUND_UP(operation->input_channels, FEATURE_ATOMIC_SIZE) * 2;
+   unsigned input_channels_2 = FEATURE_ATOMIC_SIZE;
+
+   return operation->input_width * operation->input_height *
+          input_channels_1 * input_channels_2;
+}
+
+static unsigned
 calc_raw_output_size(struct rkt_operation *operation)
 {
    unsigned output_channels_1 =
@@ -90,7 +101,7 @@ static void
 compile_operation(struct rkt_ml_subgraph *subgraph,
                   struct rkt_operation *operation)
 {
-   struct pipe_context *pcontext = subgraph->base.context;
+   struct pipe_context *pcontext = subgraph->context;
    unsigned regcfg_total_size = 0;
    struct util_dynarray *regcfgs;
    struct pipe_transfer *transfer = NULL;
@@ -171,7 +182,10 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->tasks = UTIL_DYNARRAY_INIT;
 
    operation->depthwise = rkt_is_depthwise(poperation);
-   operation->padding_same = poperation->conv.padding_same;
+   operation->padding_top = poperation->conv.padding_top;
+   operation->padding_bottom = poperation->conv.padding_bottom;
+   operation->padding_left = poperation->conv.padding_left;
+   operation->padding_right = poperation->conv.padding_right;
    operation->stride = poperation->conv.stride_x;
 
    operation->input_index = poperation->input_tensors[0]->index;
@@ -241,6 +255,8 @@ count_tensors(const struct pipe_ml_operation *poperations,
       case PIPE_ML_OPERATION_TYPE_ADD:
          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
          break;
+      case PIPE_ML_OPERATION_TYPE_POOLING:
+         break;
       default:
          DBG("poperation->type %d\n", poperation->type);
          UNREACHABLE("Unsupported ML operation type");
@@ -261,7 +277,7 @@ tensor_quantization_supported(struct pipe_tensor *tensor)
 }
 
 bool
-rkt_ml_operation_supported(struct pipe_context *pcontext,
+rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                            const struct pipe_ml_operation *operation)
 {
    bool supported = false;
@@ -285,9 +301,30 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
       break;
    }
    case PIPE_ML_OPERATION_TYPE_ADD:
-      supported = operation->input_tensors[0]->resource == NULL &&
-                  operation->input_tensors[1]->resource == NULL;
+      supported = operation->input_tensors[0]->data == NULL &&
+                  operation->input_tensors[1]->data == NULL;
       break;
+   case PIPE_ML_OPERATION_TYPE_POOLING: {
+      struct pipe_tensor *input_tensor = operation->input_tensors[0];
+      struct pipe_tensor *output_tensor = operation->output_tensors[0];
+      unsigned filter_width = operation->pooling.filter_width;
+      unsigned filter_height = operation->pooling.filter_height;
+
+      /* Padding is excluded from the average, which a convolution can't do */
+      supported = operation->pooling.type == PIPE_ML_POOLING_TYPE_AVG &&
+                  input_tensor->dims[3] == output_tensor->dims[3] &&
+                  tensor_quantization_supported(input_tensor) &&
+                  tensor_quantization_supported(output_tensor) &&
+                  filter_width == filter_height &&
+                  filter_width <= 31 &&
+                  filter_width % 2 == 1 &&
+                  operation->pooling.stride_x == operation->pooling.stride_y &&
+                  operation->pooling.padding_top == 0 &&
+                  operation->pooling.padding_bottom == 0 &&
+                  operation->pooling.padding_left == 0 &&
+                  operation->pooling.padding_right == 0;
+      break;
+   }
    default:
       supported = false;
    }
@@ -296,15 +333,21 @@ rkt_ml_operation_supported(struct pipe_context *pcontext,
 }
 
 struct pipe_ml_subgraph *
-rkt_ml_subgraph_create(struct pipe_context *pcontext,
+rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
                        const struct pipe_ml_operation *poperations,
                        unsigned count)
 {
+   struct rkt_screen *screen = rkt_ml_device_screen(pdevice);
+   struct rkt_ml_device *dev = rkt_ml_device(pdevice);
    struct rkt_ml_subgraph *subgraph;
    unsigned tensor_count;
 
+   if (!dev->context)
+      dev->context = screen->pscreen.context_create(&screen->pscreen, NULL, 0);
+
    subgraph = calloc(1, sizeof(*subgraph));
-   subgraph->base.context = pcontext;
+   subgraph->base.device = pdevice;
+   subgraph->context = dev->context;
 
    tensor_count = count_tensors(poperations, count);
    subgraph->tensors = UTIL_DYNARRAY_INIT;
@@ -324,6 +367,62 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
          lower_convolution(subgraph, &poperations[i], &operation);
          util_dynarray_append(&subgraph->operations, operation);
          break;
+      case PIPE_ML_OPERATION_TYPE_POOLING: {
+         /* Average pooling is implemented as a depthwise convolution whose
+          * every tap holds the constant weight 1/(fw*fh) -- this is how the
+          * vendor blob does it too, and it reuses the tested convolution path
+          * (and completes on the DPU, so no PPU or kernel changes). The tap is
+          * stored as 16 in the hardware's signed weight domain (uint8 144 with
+          * zero_point 128) and the 1/(fw*fh*16) factor is folded into the
+          * weight scale; the DPU requantization then yields the average. */
+         const struct pipe_ml_operation *poperation = &poperations[i];
+         unsigned fw = poperation->pooling.filter_width;
+         unsigned fh = poperation->pooling.filter_height;
+         unsigned channels = poperation->input_tensors[0]->dims[3];
+         const uint8_t weight_step = 16;
+
+         uint8_t *weights = malloc(fw * fh * channels);
+         memset(weights, 0x80 + weight_step, fw * fh * channels);
+         int32_t *biases = calloc(channels, sizeof(int32_t));
+
+         struct pipe_tensor weight_tensor = {0};
+         weight_tensor.data = weights;
+         weight_tensor.dims[0] = 1;
+         weight_tensor.dims[1] = fh;
+         weight_tensor.dims[2] = fw;
+         weight_tensor.dims[3] = channels;
+         weight_tensor.zero_point = 0x80;
+         weight_tensor.scale = 1.0f / ((float)(fw * fh) * (float)weight_step);
+
+         struct pipe_tensor bias_tensor = {0};
+         bias_tensor.data = (uint8_t *)biases;
+         bias_tensor.dims[0] = channels;
+         bias_tensor.scale =
+            poperation->input_tensors[0]->scale * weight_tensor.scale;
+
+         struct pipe_ml_operation conv = *poperation;
+         conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
+         conv.conv.weight_tensor = &weight_tensor;
+         conv.conv.bias_tensor = &bias_tensor;
+         conv.conv.stride_x = poperation->pooling.stride_x;
+         conv.conv.stride_y = poperation->pooling.stride_y;
+         conv.conv.padding_top = poperation->pooling.padding_top;
+         conv.conv.padding_bottom = poperation->pooling.padding_bottom;
+         conv.conv.padding_left = poperation->pooling.padding_left;
+         conv.conv.padding_right = poperation->pooling.padding_right;
+         conv.conv.depthwise = true;
+         conv.conv.pointwise = fw == 1 && fh == 1;
+         conv.conv.relu = false;
+         conv.conv.dilation_width_factor = 1;
+         conv.conv.dilation_height_factor = 1;
+
+         lower_convolution(subgraph, &conv, &operation);
+         util_dynarray_append(&subgraph->operations, operation);
+
+         free(weights);
+         free(biases);
+         break;
+      }
       case PIPE_ML_OPERATION_TYPE_ADD: {
          /* Fuse tensor addition into convolution*/
          struct rkt_operation *input_op_1 =
@@ -331,7 +430,6 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
          struct rkt_operation *input_op_2 =
             find_producer(subgraph, poperations[i].input_tensors[0]->index);
 
-         assert(input_op_1);
          assert(input_op_2);
 
          if (input_op_1 == NULL) {
@@ -346,6 +444,9 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
          input_op_2->addition_offset =
             0x80 - poperations[i].input_tensors[1]->zero_point;
          input_op_2->addition_scale = poperations[i].input_tensors[1]->scale;
+         input_op_2->output_scale = poperations[i].output_tensors[0]->scale;
+         input_op_2->output_zero_point =
+            poperations[i].output_tensors[0]->zero_point;
 
          break;
       }
@@ -355,28 +456,16 @@ rkt_ml_subgraph_create(struct pipe_context *pcontext,
       }
    }
 
-   /* Create input tensors */
+   /* Create input and output tensors */
    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
                           operation) {
-      unsigned input_channels_1 =
-         DIV_ROUND_UP(operation->input_channels, FEATURE_ATOMIC_SIZE) * 2;
-      unsigned input_channels_2 = FEATURE_ATOMIC_SIZE;
-      unsigned input_size = operation->input_width * operation->input_height *
-                            input_channels_1 * input_channels_2;
+      create_tensor(subgraph, operation->input_index,
+                    calc_raw_input_size(operation));
 
-      create_tensor(subgraph, operation->input_index, input_size);
-   }
-
-   /* Create output tensors */
-   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
-                          operation) {
-      struct rkt_resource *res =
-         rkt_get_tensor(subgraph, operation->output_index);
-      if (res != NULL)
-         continue;
-
-      create_tensor(subgraph, operation->output_index,
-                    calc_raw_output_size(operation));
+      if (rkt_get_tensor(subgraph, operation->output_index) == NULL) {
+         create_tensor(subgraph, operation->output_index,
+                       calc_raw_output_size(operation));
+      }
    }
 
    /* Compile */
@@ -478,20 +567,23 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
                           operation) {
       unsigned num_inputs = operation->add_tensor != -1 ? 2 : 1;
-      uint32_t *in_bo_handles = calloc(num_inputs, sizeof(uint32_t));
-      uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
-
-      in_bo_handles[0] = rkt_get_tensor(subgraph, operation->input_index)->handle;
-
-      if (operation->add_tensor != -1)
-         in_bo_handles[1] =
-            rkt_get_tensor(subgraph, operation->add_tensor)->handle;
-
-      out_bo_handles[0] =
+      uint32_t input_handle =
+         rkt_get_tensor(subgraph, operation->input_index)->handle;
+      uint32_t add_handle =
+         operation->add_tensor != -1
+            ? rkt_get_tensor(subgraph, operation->add_tensor)->handle : 0;
+      uint32_t output_handle =
          rkt_get_tensor(subgraph, operation->output_index)->handle;
 
       if (operation->reuse_weights_cbuf) {
          /* Submit all tasks to the same core, so weights can be reused */
+         uint32_t *in_bo_handles = calloc(num_inputs, sizeof(uint32_t));
+         uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
+         in_bo_handles[0] = input_handle;
+         if (operation->add_tensor != -1)
+            in_bo_handles[1] = add_handle;
+         out_bo_handles[0] = output_handle;
+
          unsigned num_tasks =
             util_dynarray_num_elements(&operation->tasks, struct split_task);
          struct drm_rocket_task *tasks = calloc(num_tasks, sizeof(*tasks));
@@ -513,6 +605,13 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
       } else {
          /* Spread tasks among cores, for parallelism */
          util_dynarray_foreach (&operation->tasks, struct split_task, task) {
+            uint32_t *in_bo_handles = calloc(num_inputs, sizeof(uint32_t));
+            uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
+            in_bo_handles[0] = input_handle;
+            if (operation->add_tensor != -1)
+               in_bo_handles[1] = add_handle;
+            out_bo_handles[0] = output_handle;
+
             struct drm_rocket_task *ktask = calloc(1, sizeof(*ktask));
             ktask->regcmd = task->regcfg_addr;
             ktask->regcmd_count = task->regcfg_amount;
@@ -611,7 +710,7 @@ free_operation(struct rkt_operation *operation)
 }
 
 void
-rkt_ml_subgraph_destroy(struct pipe_context *context,
+rkt_ml_subgraph_destroy(struct pipe_ml_device *pdevice,
                         struct pipe_ml_subgraph *psubgraph)
 {
    struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);

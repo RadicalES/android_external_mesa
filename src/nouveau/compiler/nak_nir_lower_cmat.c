@@ -65,7 +65,7 @@ get_nak_cmat_type_for_muladd(struct glsl_cmat_description a_desc,
 
 enum nak_matrix_type_layout {
    NAK_MAT_16x32_INT8,
-   NAK_MAT_16X16,
+   NAK_MAT_16x16,
 };
 
 static enum nak_matrix_type_layout
@@ -110,7 +110,7 @@ determine_matrix_type(struct glsl_cmat_description desc)
          (desc.rows == 16 && desc.cols ==  8 && is_int32                ) ||
          (desc.rows == 16 && desc.cols == 16 && is_int32                )
       );
-      return NAK_MAT_16X16;
+      return NAK_MAT_16x16;
    }
 }
 
@@ -359,7 +359,7 @@ compute_matrix_offsets(struct nir_builder *b, struct glsl_cmat_description desc,
       compute_mat_16x32_int8(b, lane_id, idx, col_offset, row_offset, alternate_tiling_order);
       break;
 
-   case NAK_MAT_16X16:
+   case NAK_MAT_16x16:
       compute_mat_16x16(b, lane_id, idx, col_offset, row_offset, alternate_tiling_order);
       break;
    }
@@ -546,11 +546,11 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
     */
    if (a_layout != d_layout) {
       nir_def *lane_id = nir_load_subgroup_invocation(b);
-      unsigned mask    = a_layout == NAK_MAT_16X16 ? 0x1 : 0x2;
-      unsigned compare = a_layout == NAK_MAT_16X16 ? 0x2 : 0x1;
+      unsigned mask    = a_layout == NAK_MAT_16x16 ? 0x1 : 0x2;
+      unsigned compare = a_layout == NAK_MAT_16x16 ? 0x2 : 0x1;
 
       nir_def *adj;
-      if (a_layout == NAK_MAT_16X16) {
+      if (a_layout == NAK_MAT_16x16) {
          adj = nir_ishl_imm(b, nir_iand_imm(b, lane_id, mask), 1);
       } else {
          adj = nir_ushr_imm(b, nir_iand_imm(b, lane_id, mask), 1);
@@ -582,7 +582,7 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
             nir_channel(b, zw, 0),
             nir_channel(b, zw, 1)
          );
-      } else if (cmat->num_components == 8 && a_layout == NAK_MAT_16X16) {
+      } else if (cmat->num_components == 8 && a_layout == NAK_MAT_16x16) {
          nir_def *abcd = nir_channels(b, cmat, 0x0f);
          nir_def *efgh = nir_channels(b, cmat, 0xf0);
 
@@ -723,6 +723,7 @@ try_lower_cmat_load_to_ldsm(nir_builder *b, nir_intrinsic_instr *intr)
    nir_def *base = intr->src[1].ssa;
    offset = nir_u2uN(b, offset, base->bit_size);
    nir_def *addr = nir_iadd(b, base, offset);
+   nir_def *zero = nir_imm_zero(b, addr->num_components, addr->bit_size);
 
    /* flip the layout for B matrices */
    if (desc.use == GLSL_CMAT_USE_B) {
@@ -734,7 +735,7 @@ try_lower_cmat_load_to_ldsm(nir_builder *b, nir_intrinsic_instr *intr)
 
    /* Each thread loads 32 bits per matrix */
    assert(length * bit_size == 32 * ldsm_count);
-   return nir_cmat_load_shared_nv(b, length, bit_size, addr,
+   return nir_cmat_load_shared_nv(b, length, bit_size, addr, zero,
                                      .num_matrices = ldsm_count,
                                      .matrix_layout = layout);
 }
@@ -968,11 +969,13 @@ lower_cmat_instr(nir_builder *b,
    case nir_intrinsic_cmat_unary_op: {
       nir_def *src = load_cmat_src(b, intr->src[1]);
       nir_op op = nir_intrinsic_alu_op(intr);
+      b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *ret = nir_build_alu1(b, op, src);
       store_cmat_src(b, intr->src[0], ret);
 
       nir_instr_remove(instr);
+      b->fp_math_ctrl = nir_fp_fast_math;
       return true;
    }
 
@@ -980,22 +983,26 @@ lower_cmat_instr(nir_builder *b,
       nir_def *src_a = load_cmat_src(b, intr->src[1]);
       nir_def *src_b = load_cmat_src(b, intr->src[2]);
       nir_op op = nir_intrinsic_alu_op(intr);
+      b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *ret = nir_build_alu2(b, op, src_a, src_b);
       store_cmat_src(b, intr->src[0], ret);
 
       nir_instr_remove(instr);
+      b->fp_math_ctrl = nir_fp_fast_math;
       return true;
    }
 
    case nir_intrinsic_cmat_scalar_op: {
       nir_def *src_a = load_cmat_src(b, intr->src[1]);
       nir_op op = nir_intrinsic_alu_op(intr);
+      b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *ret = nir_build_alu2(b, op, src_a, intr->src[2].ssa);
       store_cmat_src(b, intr->src[0], ret);
 
       nir_instr_remove(instr);
+      b->fp_math_ctrl = nir_fp_fast_math;
       return true;
    }
 
@@ -1035,12 +1042,14 @@ lower_cmat_instr(nir_builder *b,
    case nir_intrinsic_cmat_convert: {
       struct glsl_cmat_description dst_desc = cmat_src_desc(intr->src[0]);
       struct glsl_cmat_description src_desc = cmat_src_desc(intr->src[1]);
+      b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *cmat = load_cmat_src(b, intr->src[1]);
       nir_def *ret = lower_cmat_convert(b, intr, cmat, src_desc, dst_desc);
       store_cmat_src(b, intr->src[0], ret);
 
       nir_instr_remove(instr);
+      b->fp_math_ctrl = nir_fp_fast_math;
       return true;
    }
 

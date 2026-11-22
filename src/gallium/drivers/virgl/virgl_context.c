@@ -723,7 +723,7 @@ static void *virgl_shader_encoder(struct pipe_context *ctx,
          NIR_PASS(_, shader->ir.nir, nir_lower_tex, &lower_tex_options);
       }
 
-      nir_shader *s = nir_shader_clone(NULL, shader->ir.nir);
+      nir_shader *s = shader->ir.nir;
 
       /* The host can't handle certain IO slots as separable, because we can't assign
        * more than 32 IO locations explicitly, and with varyings and patches we already
@@ -894,6 +894,8 @@ static void virgl_bind_fs_state(struct pipe_context *ctx,
 
 static void virgl_clear(struct pipe_context *ctx,
                                 unsigned buffers,
+                                uint32_t color_clear_mask,
+                                uint8_t stencil_clear_mask,
                                 const struct pipe_scissor_state *scissor_state,
                                 const union pipe_color_union *color,
                                 double depth, unsigned stencil)
@@ -1501,7 +1503,7 @@ static void *virgl_create_compute_state(struct pipe_context *ctx,
          .unoptimized_ra = true,
          .lower_fabs = true
       };
-      nir_shader *s = nir_shader_clone(NULL, state->prog);
+      nir_shader *s = (void *)state->prog;
       ntt_tokens = tokens = nir_to_tgsi_options(s, vctx->base.screen, &options); /* takes ownership */
    } else {
       tokens = state->prog;
@@ -1773,6 +1775,7 @@ struct pipe_context *virgl_context_create(struct pipe_screen *pscreen,
    }
    vctx->base.clear_texture = virgl_clear_texture;
    vctx->base.draw_vbo = virgl_draw_vbo;
+   vctx->base.draw_vbo_buffers = util_draw_vbo_buffers;
    vctx->base.flush = virgl_flush_from_st;
    vctx->base.screen = pscreen;
    vctx->base.create_sampler_view = virgl_create_sampler_view;

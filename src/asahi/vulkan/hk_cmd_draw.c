@@ -128,6 +128,7 @@ hk_cmd_buffer_dirty_render_pass(struct hk_cmd_buffer *cmd)
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_ENABLES);
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS);
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_WRITE_MASKS);
+   BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_ADVANCED);
 
    /* These depend on the depth/stencil format */
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE);
@@ -234,6 +235,7 @@ hk_attachment_init(struct hk_attachment *att,
 
    VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
    *att = (struct hk_attachment){
+      .flags = vk_get_rendering_attachment_flags(info),
       .vk_format = iview->vk.format,
       .iview = iview,
    };
@@ -901,7 +903,8 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 }
 
 VKAPI_ATTR void VKAPI_CALL
-hk_CmdEndRendering(VkCommandBuffer commandBuffer)
+hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+                       const VkRenderingEndInfoKHR *pRenderingEndInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -921,12 +924,18 @@ hk_CmdEndRendering(VkCommandBuffer commandBuffer)
 
    /* Translate render state back to VK for meta */
    VkRenderingAttachmentInfo vk_color_att[HK_MAX_RTS];
+   VkRenderingAttachmentFlagsInfoKHR vk_color_att_flags[HK_MAX_RTS];
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE)
          need_resolve = true;
 
+      vk_color_att_flags[i] = (VkRenderingAttachmentFlagsInfoKHR) {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+         .flags = render->color_att[i].flags,
+      };
       vk_color_att[i] = (VkRenderingAttachmentInfo){
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .pNext = &vk_color_att_flags[i],
          .imageView = hk_image_view_to_handle(render->color_att[i].iview),
          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
          .resolveMode = render->color_att[i].resolve_mode,
@@ -936,8 +945,14 @@ hk_CmdEndRendering(VkCommandBuffer commandBuffer)
       };
    }
 
+
+   const VkRenderingAttachmentFlagsInfoKHR vk_depth_att_flags = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+      .flags = render->depth_att.flags,
+   };
    const VkRenderingAttachmentInfo vk_depth_att = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .pNext = &vk_depth_att_flags,
       .imageView = hk_image_view_to_handle(render->depth_att.iview),
       .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
       .resolveMode = render->depth_att.resolve_mode,
@@ -948,8 +963,13 @@ hk_CmdEndRendering(VkCommandBuffer commandBuffer)
    if (render->depth_att.resolve_mode != VK_RESOLVE_MODE_NONE)
       need_resolve = true;
 
+   const VkRenderingAttachmentFlagsInfoKHR vk_stencil_att_flags = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+      .flags = render->stencil_att.flags,
+   };
    const VkRenderingAttachmentInfo vk_stencil_att = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .pNext = &vk_stencil_att_flags,
       .imageView = hk_image_view_to_handle(render->stencil_att.iview),
       .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
       .resolveMode = render->stencil_att.resolve_mode,
@@ -1410,7 +1430,6 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
                         uint32_t draw_count)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
    perf_debug(cmd, "Unrolling primitive restart due to GS/XFB");
@@ -1429,7 +1448,7 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
       .in_draw = draw.b.ptr,
       .out_draw = hk_pool_alloc(cmd, 5 * sizeof(uint32_t) * draw_count, 4).gpu,
       .max_draws = 1 /* TODO: MDI */,
-      .restart_index = gfx->index.restart,
+      .restart_index = dyn->ia.primitive_restart_index,
       .index_buffer_size_el = agx_draw_index_range_el(draw),
       .index_size_log2 = draw.index_size,
       .flatshade_first =
@@ -2216,7 +2235,7 @@ static void
 hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_api_shader *gs = cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY];
-   uint32_t index = cmd->state.gfx.index.restart;
+   uint32_t index = cmd->vk.dynamic_graphics_state.ia.primitive_restart_index;
 
    if (gs) {
       enum poly_gs_shape shape =
@@ -2796,7 +2815,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        IS_DIRTY(CB_LOGIC_OP_ENABLE) || IS_DIRTY(CB_WRITE_MASKS) ||
        IS_DIRTY(CB_COLOR_WRITE_ENABLES) || IS_DIRTY(CB_ATTACHMENT_COUNT) ||
        IS_DIRTY(CB_BLEND_ENABLES) || IS_DIRTY(CB_BLEND_EQUATIONS) ||
-       IS_DIRTY(CB_BLEND_CONSTANTS) ||
+       IS_DIRTY(CB_BLEND_CONSTANTS) || IS_DIRTY(CB_BLEND_ADVANCED) ||
        desc->root_dirty /* for pipeline stats */ || true) {
 
       unsigned tib_sample_mask = BITFIELD_MASK(dyn->ms.rasterization_samples);
@@ -2890,32 +2909,32 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          if (!dyn->cb.attachments[i].blend_enable) {
             key.epilog.blend.rt[i] = (struct agx_blend_rt_key){
                .colormask = write_mask,
-               .rgb_func = PIPE_BLEND_ADD,
-               .alpha_func = PIPE_BLEND_ADD,
-               .rgb_src_factor = PIPE_BLENDFACTOR_ONE,
-               .alpha_src_factor = PIPE_BLENDFACTOR_ONE,
-               .rgb_dst_factor = PIPE_BLENDFACTOR_ZERO,
-               .alpha_dst_factor = PIPE_BLENDFACTOR_ZERO,
+               .mode = agx_pack_blend_standard(
+                  PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+                  PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO),
             };
+         } else if (cb->color_blend_op >= VK_BLEND_OP_ZERO_EXT) {
+            key.epilog.blend.rt[i] = (struct agx_blend_rt_key){
+               .colormask = write_mask,
+               .advanced_blend = 1,
+               .mode = agx_pack_blend_advanced(
+                  vk_advanced_blend_op_to_pipe(cb->color_blend_op),
+                  vk_blend_overlap_to_pipe(cb->blend_overlap),
+                  cb->src_premultiplied, cb->dst_premultiplied,
+                  cb->clamp_results),
+            };
+
+            assert(cb->clamp_results == false);
          } else {
             key.epilog.blend.rt[i] = (struct agx_blend_rt_key){
                .colormask = write_mask,
-
-               .rgb_src_factor =
+               .mode = agx_pack_blend_standard(
+                  vk_blend_op_to_pipe(cb->color_blend_op),
                   vk_blend_factor_to_pipe(cb->src_color_blend_factor),
-
-               .rgb_dst_factor =
                   vk_blend_factor_to_pipe(cb->dst_color_blend_factor),
-
-               .rgb_func = vk_blend_op_to_pipe(cb->color_blend_op),
-
-               .alpha_src_factor =
+                  vk_blend_op_to_pipe(cb->alpha_blend_op),
                   vk_blend_factor_to_pipe(cb->src_alpha_blend_factor),
-
-               .alpha_dst_factor =
-                  vk_blend_factor_to_pipe(cb->dst_alpha_blend_factor),
-
-               .alpha_func = vk_blend_op_to_pipe(cb->alpha_blend_op),
+                  vk_blend_factor_to_pipe(cb->dst_alpha_blend_factor)),
             };
          }
       }
@@ -3212,6 +3231,9 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
 
+   if (!IS_SHADER_DIRTY(VERTEX) && !IS_SHADER_DIRTY(GEOMETRY))
+      return;
+
    /* If there's an application geometry shader, there's nothing to un/bind */
    if (gs && !gs->is_passthrough)
       return;
@@ -3221,27 +3243,44 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    uint32_t xfb_outputs = last_sw->info.xfb_info.output_count;
    bool needs_gs = xfb_outputs;
 
-   /* If we already have a matching GS configuration, we're done */
-   if ((gs != NULL) == needs_gs)
-      return;
-
    /* If we don't need a GS but we do have a passthrough, unbind it */
-   if (gs) {
-      assert(!needs_gs && gs->is_passthrough);
-      hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, NULL);
+   if (!needs_gs) {
+      if (gs != NULL) {
+         assert(gs->is_passthrough);
+         hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, NULL);
+      }
       return;
    }
 
    /* Else, we need to bind a passthrough GS */
-   size_t key_size = hk_passthrough_gs_key_size(xfb_outputs);
-   struct hk_passthrough_gs_key *key = alloca(key_size);
+   size_t key_size = poly_passthrough_gs_key_size(xfb_outputs);
+   struct poly_passthrough_gs_key *key = alloca(key_size);
 
-   *key = (struct hk_passthrough_gs_key){
+   *key = (struct poly_passthrough_gs_key){
       .prim = u_decomposed_prim(hk_gs_in_prim(cmd)),
       .outputs = last_sw->b.info.outputs,
       .clip_distance_array_size = last_sw->info.clip_distance_array_size,
       .cull_distance_array_size = last_sw->info.cull_distance_array_size,
    };
+
+   for (uint32_t i = 0; i < NUM_TOTAL_VARYING_SLOTS; i++) {
+      unsigned num_comps = 0;
+      switch (i) {
+         case VARYING_SLOT_TESS_LEVEL_OUTER:
+         case VARYING_SLOT_TESS_LEVEL_INNER:
+         case VARYING_SLOT_BOUNDING_BOX1:
+            num_comps = 4;
+            break;
+         default:
+            num_comps = nir_slot_num_components(i, MESA_SHADER_VERTEX);
+            break;
+      }
+      key->output_components[i] = num_comps ?: 4;
+
+      /* We don't care about VS varying types in AGX, just set everything to
+       * uint32 to improve cache hits. */
+      key->output_types[i] = nir_type_uint32;
+   }
 
    if (xfb_outputs) {
       typed_memcpy(key->xfb_stride, last_sw->info.xfb_stride,
@@ -3254,7 +3293,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Binding passthrough GS for%s\n", xfb_outputs ? " XFB" : "");
 
-   gs = hk_meta_shader(dev, hk_nir_passthrough_gs, key, key_size);
+   gs = hk_meta_shader(dev, poly_nir_passthrough_gs, key, key_size);
    gs->is_passthrough = true;
    hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, gs);
 }
@@ -3361,15 +3400,12 @@ hk_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_buffer, buffer, _buffer);
 
+   vk_cmd_set_index_buffer_type(&cmd->vk, indexType);
+
    cmd->state.gfx.index = (struct hk_index_buffer_state){
       .buffer = hk_buffer_addr_range(buffer, offset, size, true),
       .size = agx_translate_index_size(vk_index_type_to_bytes(indexType)),
-      .restart = vk_index_to_restart(indexType),
    };
-
-   /* TODO: check if necessary, blob does this */
-   cmd->state.gfx.index.buffer.range =
-      align(cmd->state.gfx.index.buffer.range, 4);
 }
 
 void
@@ -3464,7 +3500,7 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
       libagx_increment_ia_restart(
          cmd, agx_1d(1024), AGX_BARRIER_ALL | AGX_PREGFX, ia_vertices, ia_prims,
          vs_invocations, c_prims, c_inv, draw_ptr, draw.index_buffer,
-         agx_draw_index_range_el(draw), cmd->state.gfx.index.restart,
+         agx_draw_index_range_el(draw), dyn->ia.primitive_restart_index,
          index_size_B, prim, patch_size);
    } else {
       libagx_increment_ia(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_PREGFX,
@@ -3906,6 +3942,9 @@ hk_begin_end_xfb(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
          params.dest[copies] = gfx->xfb_offsets + copies * sizeof(uint32_t);
       }
    }
+
+   if (pCounterBuffers == NULL)
+      counterBufferCount = 0;
 
    for (unsigned i = 0; i < counterBufferCount; ++i) {
       if (pCounterBuffers[i] == VK_NULL_HANDLE)

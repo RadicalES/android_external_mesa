@@ -1,10 +1,10 @@
 /*
  * Copyright (C) 2022 Collabora Ltd.
+ * Copyright (C) 2026 Arm Ltd.
  * SPDX-License-Identifier: MIT
  */
 
-#include "panfrost/lib/pan_props.h"
-
+#include "bi_debug.h"
 #include "bi_builder.h"
 #include "va_compiler.h"
 #include "valhall_enums.h"
@@ -110,13 +110,11 @@ bi_is_memory_access(const bi_instr *I)
       break;
    }
 
-   /* UBOs are read-only so there are no ordering constriants */
-   if (I->seg == BI_SEG_UBO)
-      return false;
-
    switch (bi_get_opcode_props(I)->message) {
    case BIFROST_MESSAGE_LOAD:
    case BIFROST_MESSAGE_STORE:
+      /* UBOs are read-only so there are no ordering constraints */
+      return I->seg != BI_SEG_UBO;
    case BIFROST_MESSAGE_ATOMIC:
       return true;
    default:
@@ -434,11 +432,11 @@ va_insert_flow_control_nops(bi_context *ctx)
             if (ctx->inputs->is_blend)
                break;
 
-            assert(!I->wait_resource || pan_arch(ctx->inputs->gpu_id) >= 10);
+            assert(!I->wait_resource || ctx->arch >= 10);
             bi_flow(ctx, bi_before_instr(I),
                     I->wait_resource ? VA_FLOW_WAIT_RESOURCE : VA_FLOW_WAIT);
             break;
-	 }
+         }
 
          case BI_OPCODE_ATEST:
             bi_flow(ctx, bi_before_instr(I), VA_FLOW_WAIT0126);

@@ -57,7 +57,8 @@ get_temp_registers(Instruction* instr)
    return demand_after;
 }
 
-RegisterDemand get_temp_reg_changes(Instruction* instr)
+RegisterDemand
+get_temp_reg_changes(Instruction* instr)
 {
    RegisterDemand available_def_space;
 
@@ -67,7 +68,7 @@ RegisterDemand get_temp_reg_changes(Instruction* instr)
    }
 
    for (Operand op : instr->operands) {
-      if (op.isFirstKillBeforeDef() || op.isCopyKill())
+      if (op.isFirstKillBeforeDef() || (op.isCopyKill() && !op.isLateKill()))
          available_def_space -= op.getTemp();
       else if (op.isClobbered() && !op.isKill())
          available_def_space -= op.getTemp();
@@ -420,24 +421,11 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
       }
 
       if (insn->isCall()) {
-         /* For call instructions, definitions are live at the time s_setpc finishes,
-          * which continues execution in the callee. This means that all definitions are
-          * live concurrently with operands.
-          */
-         operand_demand += insn->definitions[0].getTemp();
-
          RegisterDemand limit = get_addr_regs_from_waves(ctx.program, ctx.program->min_waves);
-         insn->call().callee_preserved_limit = RegisterDemand();
+         insn->call().callee_preserved_limit = insn->call().abi.numPreserved(limit);
 
          BITSET_DECLARE(preserved_regs, 512);
          insn->call().abi.preservedRegisters(preserved_regs, limit);
-
-         RegisterDemand preserved_reg_demand;
-         preserved_reg_demand.sgpr =
-            __bitset_prefix_sum(preserved_regs, limit.sgpr, 256 / BITSET_WORDBITS);
-         preserved_reg_demand.vgpr = __bitset_prefix_sum(preserved_regs + 256 / BITSET_WORDBITS,
-                                                         limit.vgpr, 256 / BITSET_WORDBITS);
-         insn->call().callee_preserved_limit += preserved_reg_demand;
 
          /* Killed operands effectively make a preserved register unusable for temporaries which we
           * want to preserve (those included in caller_preserved_demand).
@@ -629,8 +617,8 @@ get_addr_regs_from_waves(Program* program, uint16_t waves)
 
    uint16_t vgprs = program->dev.physical_vgprs / waves;
    vgprs = vgprs / program->dev.vgpr_alloc_granule * program->dev.vgpr_alloc_granule;
-   vgprs -= program->config->num_shared_vgprs / 2;
    vgprs = std::min(vgprs, program->dev.vgpr_limit);
+   vgprs -= program->config->num_shared_vgprs / 2;
    return RegisterDemand(vgprs, sgprs);
 }
 

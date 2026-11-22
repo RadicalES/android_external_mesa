@@ -151,7 +151,9 @@ write_tmu_p0(struct v3d_job *job,
 
         struct v3d_resource *rsc = v3d_resource(sview->texture);
 
-        cl_aligned_reloc(&job->indirect, uniforms, sview->bo,
+        cl_aligned_reloc(&job->indirect, uniforms,
+                         v3d_resource(sview->tex_state)->bo,
+                         sview->tex_state_offset |
                          v3d_unit_data_get_offset(data));
         v3d_job_add_bo(job, rsc->bo);
 }
@@ -337,9 +339,13 @@ v3d_write_uniforms(struct v3d_context *v3d, struct v3d_job *job,
                 }
 
                 case QUNIFORM_GET_UBO_SIZE: {
-                        uint32_t unit = v3d_unit_data_get_unit(data);
+                        /* Unlike QUNIFORM_UBO_ADDR, `data` here is the plain
+                         * NIR UBO index, not a v3d_unit_data. Also, Gallium
+                         * binds UBO `i` at constant buffer slot `1 + i`,
+                         * reserving slot 0 for the default uniform block.
+                         */
                         cl_aligned_u32(&uniforms,
-                                       cb->cb[unit].buffer_size);
+                                       cb->cb[data + 1].buffer_size);
                         break;
                 }
 
@@ -415,11 +421,11 @@ v3d_write_uniforms(struct v3d_context *v3d, struct v3d_job *job,
                 }
 #if 0
                 uint32_t written_val = *((uint32_t *)uniforms - 1);
-                fprintf(stderr, "shader %p[%d]: 0x%08x / 0x%08x (%f) ",
-                        shader, i, __gen_address_offset(&uniform_stream) + i * 4,
-                        written_val, uif(written_val));
-                vir_dump_uniform(uinfo->contents[i], data);
-                fprintf(stderr, "\n");
+                char *str = vir_dump_uniform(uinfo->contents[i], data);
+                mesa_logd("shader %p[%d]: 0x%08x / 0x%08x (%f) %s",
+                          shader, i, __gen_address_offset(&uniform_stream) + i * 4,
+                          written_val, uif(written_val), str);
+                ralloc_free(str);
 #endif
         }
 
@@ -452,7 +458,6 @@ v3d_set_shader_uniform_dirty_flags(struct v3d_compiled_shader *shader)
 
                 case QUNIFORM_TMU_CONFIG_P0:
                 case QUNIFORM_TMU_CONFIG_P1:
-                case QUNIFORM_TEXTURE_CONFIG_P1:
                 case QUNIFORM_TEXTURE_FIRST_LEVEL:
                 case QUNIFORM_TEXRECT_SCALE_X:
                 case QUNIFORM_TEXRECT_SCALE_Y:
@@ -507,9 +512,7 @@ v3d_set_shader_uniform_dirty_flags(struct v3d_compiled_shader *shader)
                         break;
 
                 default:
-                        assert(quniform_contents_is_texture_p0(shader->prog_data.base->uniforms.contents[i]));
-                        dirty |= V3D_DIRTY_FRAGTEX | V3D_DIRTY_VERTTEX |
-                                 V3D_DIRTY_GEOMTEX | V3D_DIRTY_COMPTEX;
+                        UNREACHABLE("Unknown QUNIFORM");
                         break;
                 }
         }

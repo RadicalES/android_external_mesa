@@ -41,7 +41,6 @@
 #include "pvr_job_context.h"
 #include "pvr_job_render.h"
 #include "pvr_macros.h"
-#include "pvr_pds.h"
 #include "pvr_physical_device.h"
 #include "pvr_query.h"
 #include "pvr_rogue_fw.h"
@@ -553,7 +552,7 @@ static void pvr_rt_dataset_ws_create_info_init(
    create_info->layers = rt_dataset->layers;
 
    /* ISP register values. */
-   if (PVR_HAS_ERN(dev_info, 42307) &&
+   if (PVR_HAS_ENHANCEMENT(dev_info, 42307) &&
        !(PVR_HAS_FEATURE(dev_info, roguexe) && mtile_info->tile_size_x == 16)) {
       float value;
 
@@ -1149,10 +1148,11 @@ static void pvr_frag_state_stream_init(struct pvr_render_ctx *ctx,
        * depth bias values and specify them as integers. In this mode a depth
        * bias factor of 1.0 equates to 1 ULP of increase to the depth value.
        */
-      value.dbias_is_int = PVR_HAS_ERN(dev_info, 42307) &&
+      value.dbias_is_int = PVR_HAS_ENHANCEMENT(dev_info, 42307) &&
                            pvr_zls_format_type_is_int(job->ds.zls_format);
 
-      if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support)) {
+      if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support) &&
+          PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format)) {
          value.skip_init_hdrs = true;
 
          if (PVR_HAS_QUIRK(dev_info, 72168)) {
@@ -1504,7 +1504,7 @@ VkResult pvr_arch_render_job_submit(struct pvr_render_ctx *ctx,
          (rt_dataset->rt_data_idx + 1) % ARRAY_SIZE(rt_dataset->rt_datas);
 
       rt_dataset->need_frag = false;
-   } else {
+   } else if (rt_dataset != device->dummy_rt.rt_dataset) {
       rt_dataset->need_frag = true;
    }
 

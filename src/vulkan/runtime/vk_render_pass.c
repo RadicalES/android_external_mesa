@@ -99,8 +99,8 @@ vk_common_CreateRenderPass(VkDevice _device,
 
    const VkRenderPassMultiviewCreateInfo *multiview_info = NULL;
    const VkRenderPassInputAttachmentAspectCreateInfo *aspect_info = NULL;
-   vk_foreach_struct_const(ext, pCreateInfo->pNext) {
-      switch (ext->sType) {
+   vk_foreach_struct_const(sType, ext, pCreateInfo->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO:
          aspect_info = (const VkRenderPassInputAttachmentAspectCreateInfo *)ext;
          /* We don't care about this information */
@@ -115,7 +115,7 @@ vk_common_CreateRenderPass(VkDevice _device,
          break;
 
       default:
-         mesa_logd("%s: ignored VkStructureType %u\n", __func__, ext->sType);
+         mesa_logd("%s: ignored VkStructureType %u\n", __func__, sType);
          break;
       }
    }
@@ -356,6 +356,25 @@ vk_render_pass_attachment_init(struct vk_render_pass_attachment *att,
       .has_external_format =
          vk_android_rp_attachment_has_external_format(desc),
    };
+
+   /* We require separate stencil layouts */
+   if (att->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+      att->initial_layout = vk_image_layout_depth_only(att->initial_layout);
+      att->final_layout = vk_image_layout_depth_only(att->final_layout);
+   } else if (att->aspects == VK_IMAGE_ASPECT_STENCIL_BIT) {
+      att->initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+      att->final_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+   }
+
+   if (att->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+      att->initial_stencil_layout =
+         vk_image_layout_stencil_only(att->initial_stencil_layout);
+      att->final_stencil_layout =
+         vk_image_layout_stencil_only(att->final_stencil_layout);
+   } else {
+      assert(att->initial_stencil_layout == VK_IMAGE_LAYOUT_UNDEFINED);
+      assert(att->final_stencil_layout == VK_IMAGE_LAYOUT_UNDEFINED);
+   }
 }
 
 static void
@@ -384,6 +403,17 @@ vk_subpass_attachment_init(struct vk_subpass_attachment *att,
       .layout =         ref->layout,
       .stencil_layout = vk_att_ref_stencil_layout(ref, attachments),
    };
+
+   /* We require separate stencil layouts */
+   if (att->aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+      att->layout = vk_image_layout_depth_only(att->layout);
+   else if (att->aspects == VK_IMAGE_ASPECT_STENCIL_BIT)
+      att->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+   if (att->aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+      att->stencil_layout = vk_image_layout_stencil_only(att->stencil_layout);
+   else
+      assert(att->stencil_layout == VK_IMAGE_LAYOUT_UNDEFINED);
 
    switch (usage) {
    case VK_IMAGE_USAGE_TRANSFER_DST_BIT:
@@ -435,6 +465,11 @@ vk_common_CreateRenderPass2(VkDevice _device,
    VK_FROM_HANDLE(vk_device, device, _device);
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);
+
+   if (vk_android_is_efr_rp(device, pCreateInfo)) {
+      return vk_android_create_efr_rp(device, pCreateInfo, pAllocator,
+                                      pRenderPass);
+   }
 
    VK_MULTIALLOC(ma);
    VK_MULTIALLOC_DECL(&ma, struct vk_render_pass, pass, 1);
@@ -2673,8 +2708,19 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *    chain must be a VkImageView of an image created with a value of
        *    VkImageViewCreateInfo::format equal to the corresponding value of
        *    VkAttachmentDescription::format in renderPass"
+       *
+       * VK_ANDROID_external_format_resolve is an exception:
+       * - nullColorAttachmentWithExternalFormatResolve == VK_FALSE
+       *   - image_view->format is RGB
+       *   - pass_att->format is VK_FORMAT_UNDEFINED
+       *   - has_external_format is true
+       * - nullColorAttachmentWithExternalFormatResolve == VK_TRUE
+       *   - image_view->format is YUV
+       *   - pass_att->format is RGB
+       *   - has_external_format is false
        */
-      if (!pass_att->has_external_format)
+      if (!pass_att->has_external_format &&
+          !vk_format_get_ycbcr_info(image_view->format))
          assert(image_view->format == pass_att->format);
 
       /* From the Vulkan 1.3.204 spec:

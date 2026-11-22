@@ -178,7 +178,7 @@ impl RegLatencySM75 {
             Op::Tmml(_) => Decoupled,
             Op::Txd(_) => Decoupled,
             Op::Txq(_) => Decoupled,
-            Op::Ldc(_) => Decoupled,
+            Op::Ldc(_) | Op::Ldcg(_) => Decoupled,
             Op::ALd(_) => Decoupled,
             Op::ASt(_) => Decoupled,
             Op::Out(_) => Decoupled,
@@ -194,9 +194,11 @@ impl RegLatencySM75 {
             Op::SuAtom(_) => Decoupled,
             Op::PixLd(_) => Decoupled,
             Op::Isberd(_) => Decoupled,
+            Op::Isbewr(_) => Decoupled,
             Op::LdTram(_) => Decoupled,
             Op::Shfl(_) => Decoupled,
             Op::Ldsm(_) => Decoupled,
+            Op::Nanosleep(_) => Decoupled,
             x => {
                 panic!("Illegal instuction in reg category {}", x);
             }
@@ -925,6 +927,13 @@ impl URegLatencySM75 {
 
             Op::IMad64(_) => vcoupled,
             Op::ISetP(_) => vcoupled,
+            Op::ALd(_)
+            | Op::ASt(_)
+            | Op::Ld(_)
+            | Op::Ldsm(_)
+            | Op::St(_)
+            | Op::Atom(_) => vdecoupled,
+            Op::SuLd(_) | Op::SuSt(_) | Op::SuAtom(_) => vdecoupled,
             Op::Ldc(_) => {
                 if uniform_op {
                     Uldc
@@ -932,6 +941,7 @@ impl URegLatencySM75 {
                     vdecoupled
                 }
             }
+            Op::Ldcg(_) => Uldc,
             Op::Lea(_) => vcoupled,
             Op::LeaX(_) => vcoupled,
             Op::Lop2(_) | Op::Lop3(_) => vcoupled,
@@ -1115,7 +1125,7 @@ impl URegLatencySM75 {
     ) -> u32 {
         use URegLatencySM75::*;
         match reader {
-            Udp => match writer {
+            Udp | Uldc => match writer {
                 Udp => 4,
                 VoteU => 1,
                 _ => {

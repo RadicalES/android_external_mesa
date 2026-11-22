@@ -25,6 +25,7 @@ vulkan_lite_runtime_files = files(
   'vk_device_memory.c',
   'vk_fence.c',
   'vk_framebuffer.c',
+  'vk_frame_pacer.c',
   'vk_graphics_state.c',
   'vk_image.c',
   'vk_log.c',
@@ -203,7 +204,7 @@ libvulkan_lite_runtime = static_library(
   vulkan_lite_runtime_files,
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_lite_runtime_deps,
-  c_args : c_msvc_compat_args,
+  c_args : [c_msvc_compat_args, soong_compat_c_args, '-DMESA_VK_LOG=@0@'.format(get_option('debug').to_int())],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )
@@ -213,7 +214,7 @@ libvulkan_lite_instance = static_library(
   ['vk_instance.c'],
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_lite_runtime_deps,
-  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=1', c_msvc_compat_args],
+  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=1', c_msvc_compat_args, soong_compat_c_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )
@@ -226,15 +227,8 @@ libvulkan_lite_instance = static_library(
 # - idep_vulkan_runtime_headers
 # - idep_vulkan_runtime
 idep_vulkan_lite_runtime_headers = declare_dependency(
-  sources : [
-    spirv_info_h,
-    vk_cmd_enqueue_entrypoints[0],
-    vk_cmd_queue[1],
-    vk_common_entrypoints[0],
-    vk_physical_device_features[1],
-    vk_physical_device_properties[1],
-  ],
   include_directories : include_directories('.'),
+  dependencies : [vulkan_lite_runtime_header_gen_deps]
 )
 
 # This is likely a bug in the Meson VS backend, as MSVC with ninja works fine.
@@ -243,14 +237,14 @@ idep_vulkan_lite_runtime_headers = declare_dependency(
 if get_option('backend').startswith('vs')
   idep_vulkan_lite_runtime = declare_dependency(
     link_with : [libvulkan_lite_runtime, libvulkan_lite_instance],
-    dependencies : idep_vulkan_lite_runtime_headers
+    dependencies : [idep_vulkan_lite_runtime_headers, vulkan_lite_runtime_deps]
   )
 else
   idep_vulkan_lite_runtime = declare_dependency(
     # Instruct users of this library to link with --whole-archive.  Otherwise,
     # our weak function overloads may not resolve properly.
     link_whole : [libvulkan_lite_runtime, libvulkan_lite_instance],
-    dependencies : idep_vulkan_lite_runtime_headers
+    dependencies : [idep_vulkan_lite_runtime_headers, vulkan_lite_runtime_deps]
   )
 endif
 
@@ -262,6 +256,7 @@ vulkan_runtime_files = files(
   'vk_meta_draw_rects.c',
   'vk_nir.c',
   'vk_nir_convert_ycbcr.c',
+  'vk_nir_lower_descriptor_heaps.c',
   'vk_pipeline.c',
   'vk_pipeline_cache.c',
   'vk_shader.c',
@@ -277,9 +272,6 @@ vulkan_runtime_deps = [
 
 if prog_glslang.found()
   if with_bvh
-    subdir('radix_sort')
-    vulkan_runtime_files += radix_sort_files
-    vulkan_runtime_files += radix_sort_spv
     subdir('bvh')
     vulkan_runtime_files += files('vk_acceleration_structure.c')
     vulkan_runtime_files += bvh_spv
@@ -302,7 +294,7 @@ libvulkan_runtime = static_library(
   [vulkan_runtime_files],
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_runtime_deps,
-  c_args : c_msvc_compat_args,
+  c_args : [c_msvc_compat_args, soong_compat_c_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )
@@ -312,7 +304,7 @@ libvulkan_instance = static_library(
   ['vk_instance.c'],
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_runtime_deps,
-  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=0', c_msvc_compat_args],
+  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=0', c_msvc_compat_args, soong_compat_c_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )
@@ -320,10 +312,12 @@ libvulkan_instance = static_library(
 if get_option('backend').startswith('vs')
   idep_vulkan_runtime_body = declare_dependency(
     link_with : [libvulkan_lite_runtime, libvulkan_runtime, libvulkan_instance],
+    dependencies : vulkan_runtime_deps,
   )
 else
   idep_vulkan_runtime_body = declare_dependency(
     link_whole : [libvulkan_lite_runtime, libvulkan_runtime, libvulkan_instance],
+    dependencies : vulkan_runtime_deps,
   )
 endif
 

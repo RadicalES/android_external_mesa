@@ -18,6 +18,7 @@ class LowerSwizzle : public testing::Test {
    LowerSwizzle()
    {
       mem_ctx = ralloc_context(NULL);
+      arch = 7;
 
       reg = bi_register(0);
       x = bi_register(1);
@@ -35,6 +36,7 @@ class LowerSwizzle : public testing::Test {
    }
 
    void *mem_ctx;
+   unsigned arch;
 
    bi_index reg, x, y, z, w;
    bi_index x3210;
@@ -43,7 +45,7 @@ class LowerSwizzle : public testing::Test {
 TEST_F(LowerSwizzle, Csel16)
 {
    CASE(bi_csel_v2f16_to(b, reg, bi_half(x, 0), y, z, w, BI_CMPF_NE),
-        bi_csel_v2f16_to(b, reg, bi_swz_v2i16(b, bi_half(x, 0)), y, z, w,
+        bi_csel_v2f16_to(b, reg, bi_swz_v4i8(b, bi_half(x, 0)), y, z, w,
                          BI_CMPF_NE));
 }
 

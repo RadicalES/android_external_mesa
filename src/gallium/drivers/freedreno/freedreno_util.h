@@ -27,8 +27,7 @@
 #include "util/u_math.h"
 #include "util/u_pack_color.h"
 
-#include "adreno_common.xml.h"
-#include "adreno_pm4.xml.h"
+#include "fd_hw_common.h"
 #include "disasm.h"
 
 #ifdef __cplusplus
@@ -101,7 +100,7 @@ extern bool fd_binning_enabled;
 #define DBG(fmt, ...)                                                          \
    do {                                                                        \
       if (FD_DBG(MSGS))                                                        \
-         mesa_logi("%5d: %s:%d: " fmt, ((pid_t)syscall(SYS_gettid)),           \
+         mesa_logd("%5d: %s:%d: " fmt, ((pid_t)syscall(SYS_gettid)),           \
                                         __func__, __LINE__,                    \
                                         ##__VA_ARGS__);                        \
    } while (0)
@@ -488,13 +487,6 @@ fd4_size2indextype(unsigned index_size)
    DBG("unsupported index size: %d", index_size);
    assert(0);
    return INDEX4_SIZE_32_BIT;
-}
-
-/* Convert 19.2MHz RBBM always-on timer ticks to ns */
-static inline uint64_t
-ticks_to_ns(uint64_t ts)
-{
-   return ts * (1000000000 / 19200000);
 }
 
 #ifdef __cplusplus

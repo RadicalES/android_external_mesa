@@ -42,7 +42,7 @@
 #include "util/u_debug.h"
 #include "util/rand_xor.h"
 #include "util/u_atomic.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/perf/cpu_trace.h"
 #include "util/ralloc.h"
 #include "util/compiler.h"
@@ -162,6 +162,8 @@ disk_cache_type_create(const char *gpu_name,
 
    if (cache->type == DISK_CACHE_DATABASE)
       mesa_cache_db_multipart_set_size_limit(&cache->cache_db, cache->max_size);
+   else if (cache->type == DISK_CACHE_MULTI_FILE && !disk_cache_size_is_valid(cache))
+      disk_cache_recompute_size(cache);
 
    if (!disk_cache_init_queue(cache))
       goto fail;
@@ -466,7 +468,10 @@ cache_put(void *job, void *gdata, int thread_index)
       /* If the cache is too large, evict something else first. */
       while (p_atomic_read_relaxed(&dc_job->cache->size->value) + dc_job->size > dc_job->cache->max_size &&
              i < 8) {
-         disk_cache_evict_lru_item(dc_job->cache);
+         if (!disk_cache_size_is_valid(dc_job->cache) ||
+             !disk_cache_evict_lru_item(dc_job->cache)) {
+            disk_cache_recompute_size(dc_job->cache);
+         }
          i++;
       }
 
@@ -684,13 +689,13 @@ void
 disk_cache_compute_key(struct disk_cache *cache, const void *data, size_t size,
                        cache_key key)
 {
-   struct mesa_sha1 ctx;
+   blake3_hasher ctx;
 
-   _mesa_sha1_init(&ctx);
-   _mesa_sha1_update(&ctx, cache->driver_keys_blob,
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, cache->driver_keys_blob,
                      cache->driver_keys_blob_size);
-   _mesa_sha1_update(&ctx, data, size);
-   _mesa_sha1_final(&ctx, key);
+   _mesa_blake3_update(&ctx, data, size);
+   _mesa_blake3_final(&ctx, key);
 }
 
 void

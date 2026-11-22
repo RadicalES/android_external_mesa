@@ -119,11 +119,11 @@ renderbuffer_alloc_sw_storage(struct gl_context *ctx,
  * This is called to allocate the original drawing surface, and
  * during window resize.
  */
-static GLboolean
-renderbuffer_alloc_storage(struct gl_context * ctx,
-                           struct gl_renderbuffer *rb,
-                           GLenum internalFormat,
-                           GLuint width, GLuint height)
+GLboolean
+_mesa_renderbuffer_alloc_storage(struct gl_context * ctx,
+                                 struct gl_renderbuffer *rb,
+                                 GLenum internalFormat,
+                                 GLuint width, GLuint height)
 {
    struct st_context *st = st_context(ctx);
    struct pipe_screen *screen = ctx->screen;
@@ -273,6 +273,8 @@ renderbuffer_alloc_storage(struct gl_context * ctx,
                     PIPE_BIND_RENDER_TARGET);
    }
 
+   templ.bind |= PIPE_BIND_SAMPLER_VIEW;
+
    rb->texture = screen->resource_create(screen, &templ);
 
    if (!rb->texture)
@@ -297,8 +299,6 @@ _mesa_init_renderbuffer(struct gl_renderbuffer *rb, GLuint name)
    /* The rest of these should be set later by the caller of this function or
     * the AllocStorage method:
     */
-   rb->AllocStorage = NULL;
-
    rb->Width = 0;
    rb->Height = 0;
    rb->Depth = 0;
@@ -320,8 +320,6 @@ _mesa_init_renderbuffer(struct gl_renderbuffer *rb, GLuint name)
    }
 
    rb->Format = MESA_FORMAT_NONE;
-
-   rb->AllocStorage = renderbuffer_alloc_storage;
 }
 
 static void

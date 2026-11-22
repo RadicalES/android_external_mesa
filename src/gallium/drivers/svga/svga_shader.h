@@ -45,6 +45,11 @@ struct svga_compile_key
       unsigned attrib_puint_to_snorm;
       unsigned attrib_puint_to_uscaled;
       unsigned attrib_puint_to_sscaled;
+
+      /* only for passthrough VS */
+      uint64_t passthrough_generic_outputs;
+      int8_t passthrough_color_index;
+      int8_t passthrough_fog_index;
    } vs;
 
    /* geometry shader only */
@@ -66,7 +71,6 @@ struct svga_compile_key
       unsigned white_fragments:1;
       unsigned alpha_to_one:1;
       unsigned flatshade:1;
-      unsigned pstipple:1;
       unsigned alpha_func:4;  /**< SVGA3D_CMP_x */
       unsigned write_color0_to_n_cbufs:4;
       unsigned aa_point:1;
@@ -131,10 +135,10 @@ struct svga_compile_key
       unsigned sampler_index:5;
    } tex[PIPE_MAX_SAMPLERS];
 
-   unsigned uav_splice_index:4;      /* starting uav index */
-   unsigned srv_raw_constbuf_index:8;   /* start index for srv raw buffers */
-   unsigned srv_raw_shaderbuf_index:8;  /* start index for srv raw shader bufs */
-   unsigned image_size_used:1;
+   uint8_t uav_splice_index;         /* starting uav index */
+   uint8_t srv_raw_constbuf_index;   /* start index for srv raw buffers */
+   uint8_t srv_raw_shaderbuf_index;  /* start index for srv raw shader bufs */
+   bool    image_size_used;
 
    uint16_t raw_constbufs;           /* bitmask of raw constant buffers */
    uint64_t raw_shaderbufs;          /* bitmask of raw shader buffers */
@@ -224,10 +228,6 @@ struct svga_fs_variant
     * comparison test in the shader rather than the sampler state.
     */
    unsigned fs_shadow_compare_units;
-
-   /** For FS-based polygon stipple */
-   unsigned pstipple_sampler_unit:8;
-   unsigned pstipple_sampler_state_index:8;
 };
 
 

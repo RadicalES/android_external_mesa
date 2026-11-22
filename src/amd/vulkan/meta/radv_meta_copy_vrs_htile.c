@@ -7,12 +7,14 @@
 #include "nir/radv_meta_nir.h"
 #include "ac_surface.h"
 #include "radv_meta.h"
-#include "vk_format.h"
+#include "radv_tracepoints.h"
+#include "vk_shader_module.h"
 
 static VkResult
 get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *pipeline_out,
              VkPipelineLayout *layout_out)
 {
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    enum radv_meta_object_key_type key = RADV_META_OBJECT_KEY_COPY_VRS_HTILE;
    VkResult result;
 
@@ -34,7 +36,7 @@ get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *p
 
    const VkPushConstantRange pc_range = {
       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      .size = 28,
+      .size = 32,
    };
 
    result = vk_meta_get_pipeline_layout(&device->vk, &device->meta_state.device, &desc_info, &pc_range, &key,
@@ -48,7 +50,8 @@ get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *p
       return VK_SUCCESS;
    }
 
-   nir_shader *cs = radv_meta_nir_build_copy_vrs_htile_shader(device, &image->planes[0].surface);
+   nir_shader *cs = radv_meta_nir_build_copy_vrs_htile_shader(pdev->info.gfx_level, pdev->info.gb_addr_config,
+                                                              &image->planes[0].surface);
 
    const VkPipelineShaderStageCreateInfo stage_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -74,10 +77,10 @@ get_pipeline(struct radv_device *device, struct radv_image *image, VkPipeline *p
 
 void
 radv_copy_vrs_htile(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *vrs_iview, const VkRect2D *rect,
-                    struct radv_image *dst_image, uint64_t htile_va, bool read_htile_value)
+                    struct radv_image *dst_image, uint32_t base_array_layer, uint32_t layer_count, uint64_t htile_va,
+                    bool read_htile_value)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
-   struct radv_meta_saved_state saved_state;
    VkPipelineLayout layout;
    VkPipeline pipeline;
    VkResult result;
@@ -88,16 +91,12 @@ radv_copy_vrs_htile(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *
       return;
    }
 
-   cmd_buffer->state.flush_bits |=
-      radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, 0, NULL, NULL) |
-      radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT, 0, NULL,
-                            NULL);
+   radv_utrace_begin_copy_vrs_htile(cmd_buffer);
 
-   radv_meta_save(&saved_state, cmd_buffer,
-                  RADV_META_SAVE_COMPUTE_PIPELINE | RADV_META_SAVE_CONSTANTS | RADV_META_SAVE_DESCRIPTORS);
+   cmd_buffer->state.flush_bits |= radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, 0, NULL, NULL);
 
-   radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
 
    radv_meta_bind_descriptors(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1,
                               (VkDescriptorGetInfoEXT[]){{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
@@ -110,7 +109,7 @@ radv_copy_vrs_htile(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *
                                                              },
                                                           }}});
 
-   const unsigned constants[7] = {
+   const unsigned constants[8] = {
       htile_va,
       htile_va >> 32,
       rect->offset.x,
@@ -118,27 +117,19 @@ radv_copy_vrs_htile(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *
       dst_image->planes[0].surface.meta_pitch,
       dst_image->planes[0].surface.meta_slice_size,
       read_htile_value,
+      base_array_layer,
    };
 
-   const VkPushConstantsInfoKHR pc_info = {
-      .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
-      .layout = layout,
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      .offset = 0,
-      .size = sizeof(constants),
-      .pValues = constants,
-   };
-
-   radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
+   radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
 
    uint32_t width = DIV_ROUND_UP(rect->extent.width, 8);
    uint32_t height = DIV_ROUND_UP(rect->extent.height, 8);
 
-   radv_unaligned_dispatch(cmd_buffer, width, height, 1);
+   radv_unaligned_dispatch(cmd_buffer, width, height, layer_count);
 
-   radv_meta_restore(&saved_state, cmd_buffer);
-
-   cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE |
+   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CS | AC_BARRIER_INV_VMEM |
                                    radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                                          VK_ACCESS_2_SHADER_WRITE_BIT, 0, NULL, NULL);
+
+   radv_utrace_end_copy_vrs_htile(cmd_buffer);
 }

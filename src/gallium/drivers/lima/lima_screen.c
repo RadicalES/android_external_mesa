@@ -23,6 +23,7 @@
  */
 
 #include <string.h>
+#include <unistd.h>
 
 #include "util/ralloc.h"
 #include "util/u_debug.h"
@@ -67,6 +68,7 @@ lima_screen_destroy(struct pipe_screen *pscreen)
    lima_bo_table_fini(screen);
    disk_cache_destroy(screen->disk_cache);
    lima_resource_screen_destroy(screen);
+   close(screen->fd);
    ralloc_free(screen);
 }
 
@@ -170,6 +172,7 @@ lima_init_screen_caps(struct pipe_screen *screen)
    caps->max_texture_3d_levels =
    caps->max_texture_cube_levels = LIMA_MAX_MIP_LEVELS;
 
+   caps->device_type = PIPE_DEVICE_TYPE_INTEGRATED_GPU;
    caps->vendor_id = ARM_VENDOR_ID;
 
    caps->video_memory = 0;
@@ -564,8 +567,10 @@ lima_screen_create(int fd, const struct pipe_screen_config *config,
    struct lima_screen *screen;
 
    screen = rzalloc(NULL, struct lima_screen);
-   if (!screen)
+   if (!screen) {
+      close(fd);
       return NULL;
+   }
 
    screen->fd = fd;
    screen->ro = ro;
@@ -581,8 +586,8 @@ lima_screen_create(int fd, const struct pipe_screen_config *config,
    lima_plb_pp_stream_cache_size = MAX2(128 * 1024 * lima_ctx_num_plb,
                                         lima_plb_pp_stream_cache_size);
 
-   driParseConfigFiles(config->options, config->options_info, 0,
-                       "lima", NULL, NULL, NULL, 0, NULL, 0);
+   driParseConfigFiles(config->options, config->options_info,
+                       &(driConfigFileParseParams) { .driverName = "lima" });
 
    if (!lima_screen_query_info(screen))
       goto err_out0;
@@ -671,6 +676,7 @@ err_out2:
 err_out1:
    lima_bo_cache_fini(screen);
 err_out0:
+   close(screen->fd);
    ralloc_free(screen);
    return NULL;
 }

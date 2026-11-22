@@ -31,6 +31,7 @@
 #include "main/formats.h"
 #include "main/shaderobj.h"
 #include "util/u_atomic.h" /* for p_atomic_cmpxchg */
+#include "util/u_string.h"
 #include "util/ralloc.h"
 #include "util/disk_cache.h"
 #include "util/log.h"
@@ -83,7 +84,7 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
    this->uses_builtin_functions = false;
 
    /* Set default language version and extensions */
-   this->language_version = 110;
+   this->language_version = ctx->Const.DefaultGLSLVersion;
    this->forced_language_version = ctx->Const.ForceGLSLVersion;
    if (ctx->Const.GLSLZeroInit == 1) {
       this->zero_init = (1u << ir_var_auto) | (1u << ir_var_temporary) | (1u << ir_var_shader_out);
@@ -99,7 +100,6 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
 
    /* OpenGL ES 2.0 has different defaults from desktop GL. */
    if (_mesa_is_gles2(ctx)) {
-      this->language_version = 100;
       this->es_shader = true;
       this->ARB_texture_rectangle_enable = false;
    }
@@ -329,6 +329,8 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
       ctx->Const.AllowVertexTextureBias;
    this->allow_glsl_120_subset_in_110 =
       ctx->Const.AllowGLSL120SubsetIn110;
+   this->allow_glsl_embedded_structure_declarations =
+      ctx->Const.AllowGLSLEmbeddedStructureDeclarations;
    this->allow_builtin_variable_redeclaration =
       ctx->Const.AllowGLSLBuiltinVariableRedeclaration;
    this->ignore_write_to_readonly_var =
@@ -851,6 +853,7 @@ static const _mesa_glsl_extension _mesa_glsl_supported_extensions[] = {
    EXT_AEP(EXT_texture_cube_map_array),
    EXT(EXT_texture_query_lod),
    EXT(EXT_texture_shadow_lod),
+   EXT(EXT_YUV_target),
    EXT(INTEL_conservative_rasterization),
    EXT(INTEL_shader_atomic_float_minmax),
    EXT(INTEL_shader_integer_functions2),
@@ -901,10 +904,12 @@ static const char *find_extension_alias(_mesa_glsl_parse_state *state, const cha
 {
    char *exts, *field, *ext_alias = NULL;
 
-   /* Copy alias_shader_extension because strtok() is destructive. */
+   /* Copy alias_shader_extension because strtok_r() is destructive. */
    exts = strdup(state->alias_shader_extension);
    if (exts) {
-      for (field = strtok(exts, ","); field != NULL; field = strtok(NULL, ",")) {
+      char *saveptr;
+      for (field = strtok_r(exts, ",", &saveptr); field != NULL;
+           field = strtok_r(NULL, ",", &saveptr)) {
          if(strncmp(name, field, strlen(name)) == 0) {
             field = strstr(field, ":");
             if(field) {
@@ -1353,6 +1358,8 @@ _mesa_ast_type_qualifier_print(const struct ast_type_qualifier *q)
       printf("noperspective ");
    if (q->flags.q.per_primitive)
       printf("per_primitive ");
+   if (q->flags.q.yuv)
+      printf("yuv ");
 }
 
 
@@ -1534,6 +1541,20 @@ ast_expression::print(void) const
       printf("} ");
       break;
    }
+
+   case ast_csc_standard:
+      switch (primary_expression.csc_standard) {
+      case YUV_CSC_STANDARD_601:
+         printf("itu_601 ");
+         break;
+      case YUV_CSC_STANDARD_601_FULL_RANGE:
+         printf("itu_601_full_range ");
+         break;
+      case YUV_CSC_STANDARD_709:
+         printf("itu_709 ");
+         break;
+      }
+      break;
 
    default:
       assert(0);
@@ -2320,6 +2341,9 @@ opt_shader(const struct pipe_screen *screen,
 
    do_vec_index_to_cond_assign(shader->ir);
 
+   /* Lowering can introduce temporaries used by invariant or precise outputs. */
+   propagate_invariance(shader->ir);
+
    validate_ir_tree(shader->ir);
 }
 
@@ -2330,13 +2354,13 @@ can_skip_compile(struct gl_context *ctx, struct gl_shader *shader,
 {
    if (!force_recompile) {
       if (ctx->Cache) {
-         char buf[SHA1_DIGEST_STRING_LENGTH];
+         char buf[BLAKE3_HEX_LEN];
          disk_cache_compute_key(ctx->Cache, source, strlen(source),
-                                shader->disk_cache_sha1);
-         if (disk_cache_has_key(ctx->Cache, shader->disk_cache_sha1)) {
+                                shader->disk_cache_blake3);
+         if (disk_cache_has_key(ctx->Cache, shader->disk_cache_blake3)) {
             /* We've seen this shader before and know it compiles */
             if (ctx->_Shader->Flags & GLSL_CACHE_INFO) {
-               _mesa_sha1_format(buf, shader->disk_cache_sha1);
+               _mesa_blake3_format(buf, shader->disk_cache_blake3);
                fprintf(stderr, "deferring compile of shader: %s\n", buf);
             }
             shader->CompileStatus = COMPILE_SKIPPED;
@@ -2542,11 +2566,11 @@ _mesa_glsl_compile_shader(struct gl_context *ctx, struct gl_shader *shader,
    ralloc_free(state);
 
    if (ctx->Cache && shader->CompileStatus == COMPILE_SUCCESS) {
-      char sha1_buf[SHA1_DIGEST_STRING_LENGTH];
-      disk_cache_put_key(ctx->Cache, shader->disk_cache_sha1);
+      char blake3_buf[BLAKE3_HEX_LEN];
+      disk_cache_put_key(ctx->Cache, shader->disk_cache_blake3);
       if (ctx->_Shader->Flags & GLSL_CACHE_INFO) {
-         _mesa_sha1_format(sha1_buf, shader->disk_cache_sha1);
-         fprintf(stderr, "marking shader: %s\n", sha1_buf);
+         _mesa_blake3_format(blake3_buf, shader->disk_cache_blake3);
+         fprintf(stderr, "marking shader: %s\n", blake3_buf);
       }
    }
 }

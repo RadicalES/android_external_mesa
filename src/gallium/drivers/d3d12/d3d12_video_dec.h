@@ -95,11 +95,6 @@ int d3d12_video_decoder_fence_wait(struct pipe_video_codec *codec,
 // We need enough to so next item in pipeline doesn't ask for a fence value we lost
 const uint64_t D3D12_VIDEO_DEC_ASYNC_DEPTH = 36;
 
-struct d3d12_video_decoder_reference_poc_entry {
-   uint8_t refpicset_index;
-   int32_t poc_value;
-};
-
 struct d3d12_video_decoder
 {
    struct pipe_video_codec base;
@@ -199,11 +194,11 @@ struct d3d12_video_decoder
    // Holds pointers to current decode output target texture and reference textures from upper layer
    struct pipe_video_buffer *m_pCurrentDecodeTarget;
    struct pipe_video_buffer **m_pCurrentReferenceTargets;
+   // AV1 film grain applied-output surface (distinct from the grain-free reconstruction target)
+   struct pipe_video_buffer *m_pCurrentFilmGrainTarget = nullptr;
 
    // Indicates if GPU commands have not been flushed and are pending.
    bool m_needsGPUFlush = false;
-
-   std::vector<d3d12_video_decoder_reference_poc_entry> m_ReferencesConversionStorage;
 };
 
 bool

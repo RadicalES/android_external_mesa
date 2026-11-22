@@ -1,7 +1,7 @@
 /*
 ************************************************************************************************************************
 *
-*  Copyright (C) 2022-2024 Advanced Micro Devices, Inc. All rights reserved.
+*  Copyright (C) 2022-2026 Advanced Micro Devices, Inc. All rights reserved.
 *  SPDX-License-Identifier: MIT
 *
 ***********************************************************************************************************************/
@@ -71,10 +71,14 @@ const SwizzleModeFlags Gfx12Lib::SwizzleModeTable[ADDR3_MAX_TYPE] =
 Gfx12Lib::Gfx12Lib(
     const Client* pClient)
     :
-    Lib(pClient),
-    m_numSwizzleBits(0)
+    Lib(pClient)
 {
     memcpy(m_swizzleModeTable, SwizzleModeTable, sizeof(SwizzleModeTable));
+
+    m_maxDims.extent.width  = MaxImageDim;
+    m_maxDims.extent.height = MaxImageDim;
+    m_maxDims.extent.depth  = 16384;
+    m_maxDims.mipLevels     = MaxMipLevels;
 }
 
 /**
@@ -252,7 +256,6 @@ VOID Gfx12Lib::InitBlockDimensionTable()
 
     ADDR3_COMPUTE_SURFACE_INFO_INPUT surfaceInfo {};
 
-
     for (UINT_32 swModeIdx = 0; swModeIdx < ADDR3_MAX_TYPE; swModeIdx++)
     {
         const Addr3SwizzleMode swMode = static_cast<Addr3SwizzleMode>(swModeIdx);
@@ -295,15 +298,11 @@ VOID Gfx12Lib::GetMipOrigin(
 {
     const ADDR3_COMPUTE_SURFACE_INFO_INPUT* pSurfInfo = pIn->pSurfInfo;
     const BOOL_32        is3d             = (pSurfInfo->resourceType == ADDR_RSRC_TEX_3D);
-    const UINT_32        bytesPerPixel    = pSurfInfo->bpp >> 3;
-    const UINT_32        elementBytesLog2 = Log2(bytesPerPixel);
-    const UINT_32        samplesLog2      = Log2(pSurfInfo->numSamples);
 
     // Calculate the width/height/depth for the given microblock, because the mip offset calculation
     // is in units of microblocks but we want it in elements.
     ADDR_EXTENT3D        microBlockExtent = HwlGetMicroBlockSize(pIn);
     const ADDR_EXTENT3D  tailMaxDim       = GetMipTailDim(pIn, pOut->blockExtent);
-    const UINT_32        blockSizeLog2    = GetBlockSizeLog2(pSurfInfo->swizzleMode);
 
     UINT_32 pitch  = tailMaxDim.width;
     UINT_32 height = tailMaxDim.height;
@@ -316,13 +315,9 @@ VOID Gfx12Lib::GetMipOrigin(
         const INT_32  mipInTail = CalcMipInTail(pIn, pOut, i);
         const UINT_32 mipOffset = CalcMipOffset(pIn, mipInTail);
 
-        pOut->pMipInfo[i].offset           = mipOffset * tailMaxDepth;
+        pOut->pMipInfo[i].offset           = static_cast<UINT_64>(mipOffset) * tailMaxDepth;
         pOut->pMipInfo[i].mipTailOffset    = mipOffset;
         pOut->pMipInfo[i].macroBlockOffset = 0;
-
-        pOut->pMipInfo[i].pitch  = pitch;
-        pOut->pMipInfo[i].height = height;
-        pOut->pMipInfo[i].depth  = depth;
         if (IsLinear(pSurfInfo->swizzleMode))
         {
             pOut->pMipInfo[i].mipTailCoordX = mipOffset >> 8;
@@ -382,7 +377,6 @@ VOID Gfx12Lib::GetMipOffset(
 {
     const ADDR3_COMPUTE_SURFACE_INFO_INPUT* pSurfInfo = pIn->pSurfInfo;
     const UINT_32        bytesPerPixel    = pSurfInfo->bpp >> 3;
-    const UINT_32        elementBytesLog2 = Log2(bytesPerPixel);
     const UINT_32        blockSizeLog2    = GetBlockSizeLog2(pSurfInfo->swizzleMode);
     const UINT_32        blockSize        = 1 << blockSizeLog2;
     const ADDR_EXTENT3D  tailMaxDim       = GetMipTailDim(pIn, pOut->blockExtent);;
@@ -554,7 +548,7 @@ VOID Gfx12Lib::GetMipOffset(
                 // Mip tails are stored in "reverse" order -- i.e., the mip-tail itself is stored first, so the
                 // first mip level outside the tail has an offset that's the dimension of the tail itself, or one
                 // swizzle block in size.
-                offset         = blockSize * hwSlices;
+                offset         = static_cast<UINT_64>(blockSize * hwSlices);
                 macroBlkOffset = blockSize;
 
                 // And determine the per-mip information for everything inside the mip tail.
@@ -758,9 +752,10 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlComputeSurfaceAddrFromCoordLinear(
 
     if (returnCode == ADDR_OK)
     {
-        pOut->addr        = (surfInfoOut.sliceSize * pIn->slice) +
-                            mipInfo[pIn->mipId].offset +
-                            (pIn->y * mipInfo[pIn->mipId].pitch + pIn->x) * (pIn->bpp >> 3);
+        pOut->addr        = static_cast<UINT_64>(
+                                (surfInfoOut.sliceSize * pIn->slice) +
+                                mipInfo[pIn->mipId].offset +
+                                (pIn->y * static_cast<UINT_64>(mipInfo[pIn->mipId].pitch) + pIn->x) * (pIn->bpp >> 3));
 
         pOut->bitPosition = 0;
     }
@@ -836,7 +831,8 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlComputeSurfaceAddrFromCoordTiled(
 
             // Technically, the addition of "mipTailCoordX" is only necessary if we're in the mip-tail.
             // The "mipTailCoordXYZ" values should be zero if we're not in the mip-tail.
-            const BOOL_32 inTail = ((mipInfo[pIn->mipId].mipTailOffset != 0) && (blkSizeLog2 != Log2Size256));
+            [[maybe_unused]] const BOOL_32 inTail =
+                                ((mipInfo[pIn->mipId].mipTailOffset != 0) && (blkSizeLog2 != Log2Size256));
 
             ADDR_ASSERT((inTail == TRUE) ||
                         // If we're not in the tail, then all of these must be zero.
@@ -878,7 +874,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlComputeSurfaceAddrFromCoordTiled(
 *   Gfx12Lib::HwlCopyMemToSurface
 *
 *   @brief
-*       Copy multiple regions from memory to a non-linear surface. 
+*       Copy multiple regions from memory to a non-linear surface.
 *
 *   @return
 *       Error or success.
@@ -900,7 +896,6 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopyMemToSurface(
 
     if (pIn->numSamples > 1)
     {
-        // TODO: MSAA
         returnCode = ADDR_NOTIMPLEMENTED;
     }
 
@@ -925,7 +920,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopyMemToSurface(
     }
 
     LutAddresser addresser = LutAddresser();
-    UnalignedCopyMemImgFunc pfnCopyUnaligned = nullptr; 
+    UnalignedCopyMemImgFunc pfnCopyUnaligned = nullptr;
     if (returnCode == ADDR_OK)
     {
         const UINT_32 blkSizeLog2 = GetBlockSizeLog2(pIn->swizzleMode);
@@ -936,7 +931,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopyMemToSurface(
         ADDR_BIT_SETTING fullSwizzlePattern[Log2Size256K] = {};
         GetSwizzlePatternFromPatternInfo(pPatInfo, fullSwizzlePattern);
         addresser.Init(fullSwizzlePattern, Log2Size256K, localOut.blockExtent, blkSizeLog2);
-        pfnCopyUnaligned = addresser.GetCopyMemImgFunc();
+        pfnCopyUnaligned = addresser.GetCopyMemImgFunc(pIn->copyFlags);
         if (pfnCopyUnaligned == nullptr)
         {
             ADDR_ASSERT_ALWAYS(); // What format is this?
@@ -952,35 +947,28 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopyMemToSurface(
             const ADDR3_MIP_INFO* pMipInfo = &mipInfo[pCurRegion->mipId];
             UINT_64 mipOffset = pIn->singleSubres ? 0 : pMipInfo->macroBlockOffset;
             UINT_32 yBlks = pMipInfo->pitch / localOut.blockExtent.width;
+            UINT_32 zBlks = static_cast<UINT_32>(localOut.sliceSize >>
+                                                 (addresser.GetBlockBits() - addresser.GetBlockZBits()));
 
-            UINT_32 xStart = pCurRegion->x + pMipInfo->mipTailCoordX;
-            UINT_32 yStart = pCurRegion->y + pMipInfo->mipTailCoordY;
-            UINT_32 sliceStart = pCurRegion->slice + pMipInfo->mipTailCoordZ;
+            ADDR_COORD3D rawOrigin = {
+                pCurRegion->x + pMipInfo->mipTailCoordX,
+                pCurRegion->y + pMipInfo->mipTailCoordY,
+                pCurRegion->slice + pMipInfo->mipTailCoordZ
+            };
 
-            for (UINT_32 slice = sliceStart; slice < (sliceStart + pCurRegion->copyDims.depth); slice++)
-            {
-                // The copy functions take the base address of the hardware slice, not the logical slice. Those are
-                // not the same thing in 3D swizzles. Logical slices within 3D swizzles are handled by sliceXor
-                // for unaligned copies.
-                UINT_32 sliceBlkStart = PowTwoAlignDown(slice, localOut.blockExtent.depth);
-                UINT_32 sliceXor = pIn->pbXor ^ addresser.GetAddressZ(slice);
-
-                UINT_64 memOffset = ((slice - pCurRegion->slice) * pCurRegion->memSlicePitch);
-                UINT_64 imgOffset = mipOffset + (sliceBlkStart * localOut.sliceSize);
-
-                ADDR_COORD2D sliceOrigin = { xStart, yStart };
-                ADDR_EXTENT2D sliceExtent = { pCurRegion->copyDims.width, pCurRegion->copyDims.height };
-
-                pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, imgOffset),
-                                 VoidPtrInc(pCurRegion->pMem, memOffset),
-                                 pCurRegion->memRowPitch,
-                                 yBlks,
-                                 sliceOrigin,
-                                 sliceExtent,
-                                 sliceXor,
-                                 addresser);
-            }
+            pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, mipOffset),
+                             pCurRegion->pMem,
+                             pCurRegion->memRowPitch,
+                             pCurRegion->memSlicePitch,
+                             yBlks,
+                             zBlks,
+                             rawOrigin,
+                             pCurRegion->copyDims,
+                             pIn->pbXor,
+                             (pCurRegion->mipId >= localOut.firstMipIdInTail),
+                             addresser);
         }
+        addresser.DoCopyMemImgPostFlushes(pIn->copyFlags);
     }
     return returnCode;
 }
@@ -990,7 +978,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopyMemToSurface(
 *   Gfx12Lib::HwlCopySurfaceToMem
 *
 *   @brief
-*       Copy multiple regions from a non-linear surface to memory. 
+*       Copy multiple regions from a non-linear surface to memory.
 *
 *   @return
 *       Error or success.
@@ -1012,7 +1000,6 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopySurfaceToMem(
 
     if (pIn->numSamples > 1)
     {
-        // TODO: MSAA
         returnCode = ADDR_NOTIMPLEMENTED;
     }
 
@@ -1037,7 +1024,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopySurfaceToMem(
     }
 
     LutAddresser addresser = LutAddresser();
-    UnalignedCopyMemImgFunc pfnCopyUnaligned = nullptr; 
+    UnalignedCopyMemImgFunc pfnCopyUnaligned = nullptr;
     if (returnCode == ADDR_OK)
     {
         const UINT_32 blkSizeLog2 = GetBlockSizeLog2(pIn->swizzleMode);
@@ -1048,7 +1035,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopySurfaceToMem(
         ADDR_BIT_SETTING fullSwizzlePattern[Log2Size256K] = {};
         GetSwizzlePatternFromPatternInfo(pPatInfo, fullSwizzlePattern);
         addresser.Init(fullSwizzlePattern, Log2Size256K, localOut.blockExtent, blkSizeLog2);
-        pfnCopyUnaligned = addresser.GetCopyImgMemFunc();
+        pfnCopyUnaligned = addresser.GetCopyImgMemFunc(pIn->copyFlags);
         if (pfnCopyUnaligned == nullptr)
         {
             ADDR_ASSERT_ALWAYS(); // What format is this?
@@ -1058,76 +1045,36 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlCopySurfaceToMem(
 
     if (returnCode == ADDR_OK)
     {
+        addresser.DoCopyImgMemPreFlushes(pIn->copyFlags);
         for (UINT_32  regionIdx = 0; regionIdx < regionCount; regionIdx++)
         {
             const ADDR3_COPY_MEMSURFACE_REGION* pCurRegion = &pRegions[regionIdx];
             const ADDR3_MIP_INFO* pMipInfo = &mipInfo[pCurRegion->mipId];
             UINT_64 mipOffset = pIn->singleSubres ? 0 : pMipInfo->macroBlockOffset;
             UINT_32 yBlks = pMipInfo->pitch / localOut.blockExtent.width;
+            UINT_32 zBlks = static_cast<UINT_32>(localOut.sliceSize >>
+                                                 (addresser.GetBlockBits() - addresser.GetBlockZBits()));
 
-            UINT_32 xStart = pCurRegion->x + pMipInfo->mipTailCoordX;
-            UINT_32 yStart = pCurRegion->y + pMipInfo->mipTailCoordY;
-            UINT_32 sliceStart = pCurRegion->slice + pMipInfo->mipTailCoordZ;
+            ADDR_COORD3D rawOrigin = {
+                pCurRegion->x + pMipInfo->mipTailCoordX,
+                pCurRegion->y + pMipInfo->mipTailCoordY,
+                pCurRegion->slice + pMipInfo->mipTailCoordZ
+            };
 
-            for (UINT_32 slice = sliceStart; slice < (sliceStart + pCurRegion->copyDims.depth); slice++)
-            {
-                // The copy functions take the base address of the hardware slice, not the logical slice. Those are
-                // not the same thing in 3D swizzles. Logical slices within 3D swizzles are handled by sliceXor
-                // for unaligned copies.
-                UINT_32 sliceBlkStart = PowTwoAlignDown(slice, localOut.blockExtent.depth);
-                UINT_32 sliceXor = pIn->pbXor ^ addresser.GetAddressZ(slice);
-
-                UINT_64 memOffset = ((slice - pCurRegion->slice) * pCurRegion->memSlicePitch);
-                UINT_64 imgOffset = mipOffset + (sliceBlkStart * localOut.sliceSize);
-
-                ADDR_COORD2D sliceOrigin = { xStart, yStart };
-                ADDR_EXTENT2D sliceExtent = { pCurRegion->copyDims.width, pCurRegion->copyDims.height };
-
-                pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, imgOffset),
-                                 VoidPtrInc(pCurRegion->pMem, memOffset),
-                                 pCurRegion->memRowPitch,
-                                 yBlks,
-                                 sliceOrigin,
-                                 sliceExtent,
-                                 sliceXor,
-                                 addresser);
-            }
+            pfnCopyUnaligned(VoidPtrInc(pIn->pMappedSurface, mipOffset),
+                             pCurRegion->pMem,
+                             pCurRegion->memRowPitch,
+                             pCurRegion->memSlicePitch,
+                             yBlks,
+                             zBlks,
+                             rawOrigin,
+                             pCurRegion->copyDims,
+                             pIn->pbXor,
+                             (pCurRegion->mipId >= localOut.firstMipIdInTail),
+                             addresser);
         }
     }
     return returnCode;
-}
-
-
-/**
-************************************************************************************************************************
-*   Gfx12Lib::HwlComputePipeBankXor
-*
-*   @brief
-*       Generate a PipeBankXor value to be ORed into bits above numSwizzleBits of address
-*
-*   @return
-*       PipeBankXor value
-************************************************************************************************************************
-*/
-ADDR_E_RETURNCODE Gfx12Lib::HwlComputePipeBankXor(
-    const ADDR3_COMPUTE_PIPEBANKXOR_INPUT* pIn,     ///< [in] input structure
-    ADDR3_COMPUTE_PIPEBANKXOR_OUTPUT*      pOut     ///< [out] output structure
-    ) const
-{
-    if ((m_numSwizzleBits != 0)               && // does this configuration support swizzling
-        //         base address XOR in GFX12 will be applied to all blk_size = 4KB, 64KB, or 256KB swizzle modes,
-        //         Note that Linear and 256B are excluded.
-        (IsLinear(pIn->swizzleMode) == FALSE) &&
-        (IsBlock256b(pIn->swizzleMode) == FALSE))
-    {
-        pOut->pipeBankXor = pIn->surfIndex % (1 << m_numSwizzleBits);
-    }
-    else
-    {
-        pOut->pipeBankXor = 0;
-    }
-
-    return ADDR_OK;
 }
 
 /**
@@ -1263,72 +1210,13 @@ const ADDR_SW_PATINFO* Gfx12Lib::GetSwizzlePatternInfo(
 BOOL_32 Gfx12Lib::HwlInitGlobalParams(
     const ADDR_CREATE_INPUT* pCreateIn) ///< [in] create input
 {
-    BOOL_32              valid = TRUE;
-    GB_ADDR_CONFIG_GFX12 gbAddrConfig;
-
-    gbAddrConfig.u32All = pCreateIn->regValue.gbAddrConfig;
-
-    switch (gbAddrConfig.bits.NUM_PIPES)
-    {
-        case ADDR_CONFIG_1_PIPE:
-            m_pipesLog2 = 0;
-            break;
-        case ADDR_CONFIG_2_PIPE:
-            m_pipesLog2 = 1;
-            break;
-        case ADDR_CONFIG_4_PIPE:
-            m_pipesLog2 = 2;
-            break;
-        case ADDR_CONFIG_8_PIPE:
-            m_pipesLog2 = 3;
-            break;
-        case ADDR_CONFIG_16_PIPE:
-            m_pipesLog2 = 4;
-            break;
-        case ADDR_CONFIG_32_PIPE:
-            m_pipesLog2 = 5;
-            break;
-        case ADDR_CONFIG_64_PIPE:
-            m_pipesLog2 = 6;
-            break;
-        default:
-            ADDR_ASSERT_ALWAYS();
-            valid = FALSE;
-            break;
-    }
-
-    switch (gbAddrConfig.bits.PIPE_INTERLEAVE_SIZE)
-    {
-        case ADDR_CONFIG_PIPE_INTERLEAVE_256B:
-            m_pipeInterleaveLog2 = 8;
-            break;
-        case ADDR_CONFIG_PIPE_INTERLEAVE_512B:
-            m_pipeInterleaveLog2 = 9;
-            break;
-        case ADDR_CONFIG_PIPE_INTERLEAVE_1KB:
-            m_pipeInterleaveLog2 = 10;
-            break;
-        case ADDR_CONFIG_PIPE_INTERLEAVE_2KB:
-            m_pipeInterleaveLog2 = 11;
-            break;
-        default:
-            ADDR_ASSERT_ALWAYS();
-            valid = FALSE;
-            break;
-    }
-
-    m_numSwizzleBits = ((m_pipesLog2 >= 3) ? m_pipesLog2 - 2 : 0);
-
     // Gfx10+ chips treat packed 8-bit 422 formats as 32bpe with 2pix/elem.
     m_configFlags.use32bppFor422Fmt = TRUE;
 
-    if (valid)
-    {
-        InitEquationTable();
-        InitBlockDimensionTable();
-    }
+    InitEquationTable();
+    InitBlockDimensionTable();
 
-    return valid;
+    return TRUE;
 }
 
 /**
@@ -1579,10 +1467,10 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlComputeSlicePipeBankXor(
                                                                             pIn->slice,
                                                                             0);
 
-                const UINT_32 pipeBankXor = pipeBankXorOffset >> m_pipeInterleaveLog2;
+                const UINT_32 pipeBankXor = pipeBankXorOffset >> PipeInterleaveLog2;
 
                 // Should have no bit set under pipe interleave
-                ADDR_ASSERT((pipeBankXor << m_pipeInterleaveLog2) == pipeBankXorOffset);
+                ADDR_ASSERT((pipeBankXor << PipeInterleaveLog2) == pipeBankXorOffset);
 
                 pOut->pipeBankXor = pIn->basePipeBankXor ^ pipeBankXor;
             }
@@ -1915,6 +1803,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlGetPossibleSwizzleModes(
         pOut->validModes.sw2d64kB  = 1;
         pOut->validModes.sw2d256kB = 1;
     }
+
     // The organization of elements in the hierarchical surface is the same as any other surface, and it can support
     // any 2D swizzle mode (SW_256_2D, SW_4KB_2D, SW_64KB_2D, or SW_256KB_2D).  The swizzle mode can be selected
     // orthogonally to the underlying z or stencil surface.
@@ -1954,7 +1843,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlGetPossibleSwizzleModes(
              // There could be more multimedia formats that require more hw specific tiling modes...
              flags.nv12                            || flags.p010)
     {
-        // Linear is not allowed for VRS images.
+        // According to HW architects, Linear is not allowed for VRS images.
         if (flags.isVrsImage == 0)
         {
             pOut->validModes.swLinear = 1;
@@ -1971,7 +1860,6 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlGetPossibleSwizzleModes(
     }
     else if (IsTex3d(pIn->resourceType))
     {
-        // An eventual determination would be based on pal setting of height_watermark and depth_watermark.
         // However, we just adopt the simpler logic currently.
         // For 3D images w/ view3dAs2dArray = 0, SW_3D is preferred.
         // For 3D images w/ view3dAs2dArray = 1, it should go to 2D path above.
@@ -2043,7 +1931,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlComputeStereoInfo(
         UINT_32 yPosMask = 0;
 
         // First get "max y bit"
-        for (UINT_32 i = m_pipeInterleaveLog2; i < blkSizeLog2; i++)
+        for (UINT_32 i = PipeInterleaveLog2; i < blkSizeLog2; i++)
         {
             ADDR_ASSERT(m_equationTable[eqIndex].addr[i].valid == 1);
 
@@ -2055,7 +1943,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlComputeStereoInfo(
         }
 
         // Then loop again for populating a position mask of "max Y bit"
-        for (UINT_32 i = m_pipeInterleaveLog2; i < blkSizeLog2; i++)
+        for (UINT_32 i = PipeInterleaveLog2; i < blkSizeLog2; i++)
         {
             if ((m_equationTable[eqIndex].addr[i].channel == 1) &&
                 (m_equationTable[eqIndex].addr[i].index == yMax))
@@ -2074,7 +1962,7 @@ ADDR_E_RETURNCODE Gfx12Lib::HwlComputeStereoInfo(
 
             if ((alignedHeight >> yMax) & 1)
             {
-                *pRightXor = yPosMask >> m_pipeInterleaveLog2;
+                *pRightXor = yPosMask >> PipeInterleaveLog2;
             }
         }
     }

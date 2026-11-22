@@ -16,6 +16,7 @@
 #include "pan_pool.h"
 #include "pan_shader.h"
 #include "pan_texture.h"
+#include "pan_trace.h"
 #include "compiler/pan_compiler.h"
 #include "compiler/pan_nir.h"
 
@@ -353,18 +354,6 @@ lower_sampler_parameters(nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 static uint32_t
-sampler_hw_index(uint32_t index)
-{
-   return PAN_ARCH >= 9 ? pan_res_handle(PAN_BLIT_TABLE_SAMPLER, index) : index;
-}
-
-static uint32_t
-tex_hw_index(uint32_t index)
-{
-   return PAN_ARCH >= 9 ? pan_res_handle(PAN_BLIT_TABLE_TEXTURE, index) : index;
-}
-
-static uint32_t
 attr_hw_index(uint32_t index)
 {
    return PAN_ARCH >= 9 ? pan_res_handle(PAN_BLIT_TABLE_ATTRIBUTE, index)
@@ -438,9 +427,11 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
                   key->surfaces[i].samples);
    }
 
+   const nir_shader_compiler_options *compiler_options =
+      pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_FRAGMENT,
+                                          false);
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_FRAGMENT, pan_get_nir_shader_compiler_options(PAN_ARCH),
-      "pan_preload(%s)", sig);
+      MESA_SHADER_FRAGMENT, compiler_options, "pan_preload(%s)", sig);
 
    nir_def *barycentric = nir_load_barycentric(
       &b, nir_intrinsic_load_barycentric_pixel, INTERP_MODE_SMOOTH);
@@ -474,32 +465,43 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
          UNREACHABLE("Invalid dimension");
       }
 
-      nir_tex_instr *tex = nir_tex_instr_create(b.shader, ms ? 3 : 1);
+      unsigned num_srcs = (PAN_ARCH >= 9 ? 2 : 0) + (ms ? 3 : 1);
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, num_srcs);
+      unsigned src_idx = 0;
 
       tex->dest_type = key->surfaces[i].type;
-      tex->texture_index = tex_hw_index(active_count);
-      tex->sampler_index = sampler_hw_index(0);
+      if (PAN_ARCH >= 9) {
+         tex->src[src_idx++] = nir_tex_src_for_ssa(nir_tex_src_texture_handle,
+            pan_nir_res_handle(&b, PAN_BLIT_TABLE_TEXTURE, active_count, NULL));
+         tex->src[src_idx++] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle,
+            pan_nir_res_handle(&b, PAN_BLIT_TABLE_SAMPLER, 0, NULL));
+      } else {
+         tex->texture_index = active_count;
+         tex->sampler_index = 0;
+      }
       tex->is_array = key->surfaces[i].array;
       tex->sampler_dim = sampler_dim;
 
       if (ms) {
          tex->op = nir_texop_txf_ms;
 
-         tex->src[0] =
+         tex->src[src_idx++] =
             nir_tex_src_for_ssa(nir_tex_src_coord, nir_f2i32(&b, coord));
          tex->coord_components = coord_comps;
 
-         tex->src[1] =
+         tex->src[src_idx++] =
             nir_tex_src_for_ssa(nir_tex_src_ms_index, nir_load_sample_id(&b));
 
-         tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(&b, 0));
+         tex->src[src_idx++] =
+            nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(&b, 0));
       } else {
          tex->op = nir_texop_txl;
 
-         tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+         tex->src[src_idx++] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
          tex->coord_components = coord_comps;
       }
 
+      assert(src_idx == num_srcs);
       nir_def_init(&tex->instr, &tex->def, 4, 32);
       nir_builder_instr_insert(&b, &tex->instr);
 
@@ -524,8 +526,8 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
    }
 
    struct pan_compile_inputs inputs = {
-      .gpu_id = cache->gpu_id,
-      .gpu_variant = cache->gpu_variant,
+      .arch = PAN_ARCH,
+      .model = cache->model,
       .is_blit = true,
       .no_idvs = true,
    };
@@ -538,9 +540,8 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
    for (unsigned i = 0; i < active_count; ++i)
       BITSET_SET(b.shader->info.textures_used, i);
 
-   pan_preprocess_nir(b.shader, inputs.gpu_id);
-   pan_nir_lower_texture_early(b.shader, inputs.gpu_id);
-   pan_postprocess_nir(b.shader, inputs.gpu_id);
+   pan_preprocess_nir(b.shader, PAN_ARCH);
+   pan_postprocess_nir(b.shader, &inputs, &shader->info);
 
    if (PAN_ARCH == 4) {
       NIR_PASS(_, b.shader, nir_shader_intrinsics_pass,
@@ -582,7 +583,7 @@ pan_preload_get_key(struct pan_preload_views *views)
       key.surfaces[0].type = nir_type_float32;
       key.surfaces[0].samples = pan_image_view_get_nr_samples(views->z);
       key.surfaces[0].dim = views->z->dim;
-      key.surfaces[0].array = views->z->first_layer != views->z->last_layer;
+      key.surfaces[0].array = pan_image_view_layer_count(views->z) > 1;
    }
 
    if (views->s) {
@@ -590,7 +591,7 @@ pan_preload_get_key(struct pan_preload_views *views)
       key.surfaces[1].type = nir_type_uint32;
       key.surfaces[1].samples = pan_image_view_get_nr_samples(views->s);
       key.surfaces[1].dim = views->s->dim;
-      key.surfaces[1].array = views->s->first_layer != views->s->last_layer;
+      key.surfaces[1].array = pan_image_view_layer_count(views->s) > 1;
    }
 
    for (unsigned i = 0; i < views->rt_count; i++) {
@@ -606,8 +607,7 @@ pan_preload_get_key(struct pan_preload_views *views)
       key.surfaces[i].samples =
          pan_image_view_get_nr_samples(views->rts[i]);
       key.surfaces[i].dim = views->rts[i]->dim;
-      key.surfaces[i].array =
-         views->rts[i]->first_layer != views->rts[i]->last_layer;
+      key.surfaces[i].array = pan_image_view_layer_count(views->rts[i]) > 1;
    }
 
    return key;
@@ -1017,8 +1017,7 @@ pan_preload_emit_viewport(struct pan_pool *pool, uint16_t minx, uint16_t miny,
 static void
 pan_preload_emit_dcd(struct pan_fb_preload_cache *cache, struct pan_pool *pool,
                      struct pan_fb_info *fb, bool zs, uint64_t coordinates,
-                     uint64_t tsd, struct mali_draw_packed *out,
-                     bool always_write)
+                     uint64_t tsd, struct mali_draw_packed *out)
 {
    unsigned tex_count = 0;
    uint64_t textures = pan_preload_emit_textures(pool, fb, zs, &tex_count);
@@ -1030,7 +1029,7 @@ pan_preload_emit_dcd(struct pan_fb_preload_cache *cache, struct pan_pool *pool,
    /* Tiles updated by preload shaders are still considered clean (separate
     * for colour and Z/S), allowing us to suppress unnecessary writeback
     */
-   UNUSED bool clean_fragment_write = !always_write;
+   UNUSED bool clean_fragment_write = true;
 
    /* Image view used when patching stencil formats for combined
     * depth/stencil preloads.
@@ -1185,27 +1184,8 @@ pan_preload_emit_pre_frame_dcd(struct pan_fb_preload_cache *cache,
 
    void *dcd = fb->bifrost.pre_post.dcds.cpu + (dcd_idx * pan_size(DRAW));
 
-   /* We only use crc_rt to determine whether to force writes for updating
-    * the CRCs, so use a conservative tile size (16x16).
-    */
-   int crc_rt = GENX(pan_select_crc_rt)(fb, 16 * 16);
+   pan_preload_emit_dcd(cache, desc_pool, fb, zs, coords, tsd, dcd);
 
-   bool always_write = false;
-
-   /* If CRC data is currently invalid and this batch will make it valid,
-    * write even clean tiles to make sure CRC data is updated. */
-   if (crc_rt >= 0) {
-      bool *valid = fb->rts[crc_rt].crc_valid;
-      bool full = !fb->draw_extent.minx && !fb->draw_extent.miny &&
-                  fb->draw_extent.maxx == (fb->width - 1) &&
-                  fb->draw_extent.maxy == (fb->height - 1);
-
-      if (full && !(*valid))
-         always_write = true;
-   }
-
-   pan_preload_emit_dcd(cache, desc_pool, fb, zs, coords, tsd, dcd,
-                        always_write);
    if (zs) {
       enum pipe_format fmt = fb->zs.view.zs
                                 ? fb->zs.view.zs->planes[0].image->props.format
@@ -1222,7 +1202,7 @@ pan_preload_emit_pre_frame_dcd(struct pan_fb_preload_cache *cache,
 
       /* If we're dealing with a combined ZS resource and only one
        * component is cleared, we need to reload the whole surface
-       * because the zs_clean_pixel_write_enable flag is set in that
+       * because the zs_clean_tile_write_enable flag is set in that
        * case.
        */
       if (util_format_is_depth_and_stencil(fmt) &&
@@ -1253,7 +1233,8 @@ pan_preload_emit_pre_frame_dcd(struct pan_fb_preload_cache *cache,
        * The PAN_ARCH check is redundant but allows the compiler to optimize
        * when PAN_ARCH < 7.
        */
-      if (PAN_ARCH >= 7 && (cache->gpu_id >> 16) >= 0x7200)
+      unsigned arch_minor = (cache->model->gpu_prod_id >> 8) & 0xff;
+      if (PAN_ARCH >= 7 && (PAN_ARCH == 7 && arch_minor >= 2))
          fb->bifrost.pre_post.modes[dcd_idx] =
             MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
       else
@@ -1263,8 +1244,7 @@ pan_preload_emit_pre_frame_dcd(struct pan_fb_preload_cache *cache,
 #endif
    } else {
       fb->bifrost.pre_post.modes[dcd_idx] =
-         always_write ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS
-                      : MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
+         MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
    }
 }
 #else
@@ -1279,7 +1259,7 @@ pan_preload_emit_tiler_job(struct pan_fb_preload_cache *cache,
       return (struct pan_ptr){0};
 
    pan_preload_emit_dcd(cache, desc_pool, fb, zs, coords, tsd,
-                        pan_section_ptr(job.cpu, TILER_JOB, DRAW), false);
+                        pan_section_ptr(job.cpu, TILER_JOB, DRAW));
 
    pan_section_pack(job.cpu, TILER_JOB, PRIMITIVE, cfg) {
       cfg.draw_mode = MALI_DRAW_MODE_TRIANGLE_STRIP;
@@ -1317,6 +1297,8 @@ unsigned
 GENX(pan_preload_fb)(struct pan_fb_preload_cache *cache, struct pan_pool *pool,
                      struct pan_fb_info *fb, uint64_t tsd, struct pan_ptr *jobs)
 {
+   PAN_TRACE_FUNC(PAN_TRACE_GL_FB_PRELOAD);
+
    bool preload_zs = pan_preload_needed(fb, true);
    bool preload_rts = pan_preload_needed(fb, false);
    uint64_t coords;
@@ -1393,12 +1375,12 @@ pan_preload_prefill_preload_shader_cache(struct pan_fb_preload_cache *cache)
 
 void
 GENX(pan_fb_preload_cache_init)(
-   struct pan_fb_preload_cache *cache, unsigned gpu_id, uint32_t gpu_variant,
+   struct pan_fb_preload_cache *cache, const struct pan_model *model,
    struct pan_blend_shader_cache *blend_shader_cache, struct pan_pool *bin_pool,
    struct pan_pool *desc_pool)
 {
-   cache->gpu_id = gpu_id;
-   cache->gpu_variant = gpu_variant;
+   assert(model != NULL);
+   cache->model = model;
    cache->shaders.preload = pan_preload_shader_key_table_create(NULL);
    cache->shaders.pool = bin_pool;
    pthread_mutex_init(&cache->shaders.lock, NULL);

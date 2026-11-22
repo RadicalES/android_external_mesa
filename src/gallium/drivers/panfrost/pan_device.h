@@ -167,7 +167,7 @@ panfrost_device_fd(const struct panfrost_device *dev)
    return dev->kmod.dev->fd;
 }
 
-static inline uint32_t
+static inline uint64_t
 panfrost_device_gpu_id(const struct panfrost_device *dev)
 {
    return dev->kmod.dev->props.gpu_id;
@@ -176,13 +176,13 @@ panfrost_device_gpu_id(const struct panfrost_device *dev)
 static inline uint32_t
 panfrost_device_gpu_prod_id(const struct panfrost_device *dev)
 {
-   return dev->kmod.dev->props.gpu_id >> 16;
+   return pan_prod_id(dev->kmod.dev->props.gpu_id);
 }
 
 static inline uint32_t
 panfrost_device_gpu_rev(const struct panfrost_device *dev)
 {
-   return dev->kmod.dev->props.gpu_id & BITFIELD_MASK(16);
+   return pan_rev(dev->kmod.dev->props.gpu_id);
 }
 
 static inline int
@@ -219,8 +219,7 @@ pan_is_bifrost(const struct panfrost_device *dev)
 static inline uint64_t
 pan_gpu_time_to_ns(struct panfrost_device *dev, uint64_t gpu_time)
 {
-   assert(dev->kmod.dev->props.timestamp_frequency > 0);
-   return (gpu_time * NSEC_PER_SEC) / dev->kmod.dev->props.timestamp_frequency;
+   return pan_kmod_timestamp_cycles_to_ns(dev->kmod.dev, gpu_time);
 }
 
 static inline uint32_t

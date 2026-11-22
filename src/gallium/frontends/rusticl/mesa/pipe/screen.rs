@@ -469,8 +469,9 @@ impl PipeScreen {
         &self,
         format: pipe_format,
         target: pipe_texture_target,
-        bindings: u32,
+        mut bindings: u32,
     ) -> bool {
+        bindings |= PIPE_BIND_OPENCL;
         unsafe {
             self.screen().is_format_supported.unwrap()(self.pipe(), format, target, 0, 0, bindings)
         }
@@ -482,6 +483,14 @@ impl PipeScreen {
                 .get_timestamp
                 .unwrap_or(u_default_get_timestamp)(self.pipe())
         }
+    }
+
+    pub fn is_convert_timestamp_supported(&self) -> bool {
+        self.screen().convert_timestamp.is_some()
+    }
+
+    pub fn convert_timestamp(&self, raw_timestamp: u64) -> u64 {
+        unsafe { self.screen().convert_timestamp.unwrap()(self.pipe(), raw_timestamp) }
     }
 
     pub fn is_res_handle_supported(&self) -> bool {

@@ -164,8 +164,8 @@ nv50_miptree_destroy(struct pipe_screen *pscreen, struct pipe_resource *pt)
    struct nv50_miptree *mt = nv50_miptree(pt);
 
    nouveau_fence_work(mt->base.fence, nouveau_fence_unref_bo, mt->base.bo);
-   nouveau_fence_ref(NULL, &mt->base.fence);
-   nouveau_fence_ref(NULL, &mt->base.fence_wr);
+   nouveau_fence_ref(NULL, &mt->base.fence, nouveau_screen(pscreen));
+   nouveau_fence_ref(NULL, &mt->base.fence_wr, nouveau_screen(pscreen));
 
    NOUVEAU_DRV_STAT(nouveau_screen(pscreen), tex_obj_current_count, -1);
    NOUVEAU_DRV_STAT(nouveau_screen(pscreen), tex_obj_current_bytes,
@@ -484,6 +484,19 @@ nv50_surface_from_miptree(struct nv50_miptree *mt,
    ns->height = u_minify(mt->base.base.height0, ps->level);
    ns->depth = ps->last_layer - ps->first_layer + 1;
    ns->offset = mt->level[templ->level].offset;
+
+   /* A view in a format with another block size, such as RGBA8 on a
+    * subsampled R8G8_R8B8 video buffer, covers the same blocks.
+    */
+   if (util_format_get_blockwidth(ps->format) !=
+       util_format_get_blockwidth(mt->base.base.format) ||
+       util_format_get_blockheight(ps->format) !=
+       util_format_get_blockheight(mt->base.base.format)) {
+      ns->width = util_format_get_nblocksx(mt->base.base.format, ns->width) *
+                  util_format_get_blockwidth(ps->format);
+      ns->height = util_format_get_nblocksy(mt->base.base.format, ns->height) *
+                   util_format_get_blockheight(ps->format);
+   }
 
    ns->width <<= mt->ms_x;
    ns->height <<= mt->ms_y;

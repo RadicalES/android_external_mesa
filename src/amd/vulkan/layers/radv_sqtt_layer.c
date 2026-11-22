@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "tools/radv_spm.h"
+#include "tools/radv_sqtt.h"
 #include "ac_shader_util.h"
 #include "radv_cmd_buffer.h"
 #include "radv_cs.h"
@@ -11,10 +13,9 @@
 #include "radv_pipeline_rt.h"
 #include "radv_queue.h"
 #include "radv_shader.h"
-#include "radv_spm.h"
-#include "radv_sqtt.h"
 #include "vk_semaphore.h"
 
+#include "util/u_memory.h"
 #include "ac_rgp.h"
 #include "ac_sqtt.h"
 
@@ -165,6 +166,11 @@ static void
 radv_write_begin_general_api_marker(struct radv_cmd_buffer *cmd_buffer, enum rgp_sqtt_marker_general_api_type api_type)
 {
    struct rgp_sqtt_marker_general_api marker = {0};
+
+   /* Flush any delayed RGP barrier-end marker before writing the next general API marker
+    * so no-op barriers cannot incorrectly cover subsequent draw or dispatch events.
+    */
+   radv_describe_barrier_end_delayed(cmd_buffer);
 
    marker.identifier = RGP_SQTT_MARKER_IDENTIFIER_GENERAL_API;
    marker.api_type = api_type;
@@ -339,7 +345,7 @@ radv_gfx12_write_draw_marker(struct radv_cmd_buffer *cmd_buffer, const struct ra
 }
 
 void
-radv_describe_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *draw_info, bool use_gang_cs)
+radv_describe_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info draw_info, bool use_gang_cs)
 {
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -350,7 +356,7 @@ radv_describe_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_in
                            RADV_SQTT_USERDATA_MAIN_CS | (use_gang_cs ? RADV_SQTT_USERDATA_GANG_CS : 0));
 
    if (pdev->info.gfx_level >= GFX12)
-      radv_gfx12_write_draw_marker(cmd_buffer, draw_info);
+      radv_gfx12_write_draw_marker(cmd_buffer, &draw_info);
 }
 
 void
@@ -411,38 +417,7 @@ radv_describe_barrier_end_delayed(struct radv_cmd_buffer *cmd_buffer)
 
    marker.num_layout_transitions = cmd_buffer->state.num_layout_transitions;
 
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_WAIT_ON_EOP_TS)
-      marker.wait_on_eop_ts = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_VS_PARTIAL_FLUSH)
-      marker.vs_partial_flush = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_PS_PARTIAL_FLUSH)
-      marker.ps_partial_flush = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_CS_PARTIAL_FLUSH)
-      marker.cs_partial_flush = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_PFP_SYNC_ME)
-      marker.pfp_sync_me = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_SYNC_CP_DMA)
-      marker.sync_cp_dma = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_INVAL_VMEM_L0)
-      marker.inval_tcp = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_INVAL_ICACHE)
-      marker.inval_sqI = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_INVAL_SMEM_L0)
-      marker.inval_sqK = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_FLUSH_L2)
-      marker.flush_tcc = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_INVAL_L2)
-      marker.inval_tcc = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_FLUSH_CB)
-      marker.flush_cb = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_INVAL_CB)
-      marker.inval_cb = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_FLUSH_DB)
-      marker.flush_db = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_INVAL_DB)
-      marker.inval_db = true;
-   if (cmd_buffer->state.sqtt_flush_bits & RGP_FLUSH_INVAL_L1)
-      marker.inval_gl1 = true;
+   ac_rgp_flush_bits_to_barrier_marker(cmd_buffer->state.rgp_flush_bits, &marker);
 
    radv_emit_sqtt_userdata(cmd_buffer, &marker, sizeof(marker) / 4, RADV_SQTT_USERDATA_MAIN_CS);
 
@@ -464,7 +439,7 @@ radv_describe_barrier_start(struct radv_cmd_buffer *cmd_buffer, enum rgp_barrier
    }
 
    radv_describe_barrier_end_delayed(cmd_buffer);
-   cmd_buffer->state.sqtt_flush_bits = 0;
+   cmd_buffer->state.rgp_flush_bits = 0;
    cmd_buffer->state.in_barrier = true;
 
    marker.identifier = RGP_SQTT_MARKER_IDENTIFIER_BARRIER_START;
@@ -647,7 +622,8 @@ radv_handle_sqtt(VkQueue _queue)
    if (device->sqtt_enabled) {
       if (!radv_sqtt_stop_capturing(queue)) {
          /* Try to capture the next frame if the buffer was too small initially. */
-         trigger = true;
+         if (!device->sqtt.capture_cancelled)
+            trigger = true;
       }
    }
 
@@ -682,10 +658,8 @@ radv_sqtt_wsi_submit(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *
    VK_FROM_HANDLE(radv_queue, queue, _queue);
    struct radv_device *device = radv_queue_device(queue);
    VkCommandBufferSubmitInfo *new_cmdbufs = NULL;
-   struct radeon_winsys_bo *gpu_timestamp_bo;
-   uint32_t gpu_timestamp_offset;
+   struct radv_sqtt_gpu_timestamp gpu_timestamp;
    VkCommandBuffer timed_cmdbuf;
-   void *gpu_timestamp_ptr;
    uint64_t cpu_timestamp;
    VkResult result = VK_SUCCESS;
 
@@ -707,12 +681,27 @@ radv_sqtt_wsi_submit(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *
       /* Sample the current CPU time before building the GPU timestamp cmdbuf. */
       cpu_timestamp = os_time_get_nano();
 
-      result = radv_sqtt_acquire_gpu_timestamp(device, &gpu_timestamp_bo, &gpu_timestamp_offset, &gpu_timestamp_ptr);
+      result = radv_sqtt_acquire_gpu_timestamp(device, &gpu_timestamp);
       if (result != VK_SUCCESS)
          goto fail;
 
-      result = radv_sqtt_get_timed_cmdbuf(queue, gpu_timestamp_bo, gpu_timestamp_offset,
-                                          VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, &timed_cmdbuf);
+      result = radv_sqtt_allocate_cmdbuf(device, queue->state.qf, &timed_cmdbuf);
+      if (result != VK_SUCCESS)
+         goto fail;
+
+      const VkCommandBufferBeginInfo begin_info = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+      };
+
+      result = radv_BeginCommandBuffer(timed_cmdbuf, &begin_info);
+      if (result != VK_SUCCESS)
+         goto fail;
+
+      radv_sqtt_write_gpu_timestamp(radv_cmd_buffer_from_handle(timed_cmdbuf), &gpu_timestamp,
+                                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+
+      result = radv_EndCommandBuffer(timed_cmdbuf);
       if (result != VK_SUCCESS)
          goto fail;
 
@@ -727,7 +716,7 @@ radv_sqtt_wsi_submit(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *
       sqtt_submit.commandBufferInfoCount = new_cmdbuf_count;
       sqtt_submit.pCommandBufferInfos = new_cmdbufs;
 
-      radv_describe_queue_present(queue, cpu_timestamp, gpu_timestamp_ptr);
+      radv_describe_queue_present(queue, cpu_timestamp, gpu_timestamp.ptr);
 
       result = device->layer_dispatch.rgp.QueueSubmit2(_queue, 1, &sqtt_submit,
                                                        i + 1 == submitCount ? _fence : VK_NULL_HANDLE);
@@ -737,9 +726,6 @@ radv_sqtt_wsi_submit(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *
 
       FREE(new_cmdbufs);
    }
-
-   if (submitCount == 0 && _fence != VK_NULL_HANDLE)
-      result = device->layer_dispatch.rgp.QueueSubmit2(_queue, 0, NULL, _fence);
 
    return result;
 
@@ -756,8 +742,17 @@ sqtt_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *pSu
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
    const bool is_gfx_or_ace = queue->state.qf == RADV_QUEUE_GENERAL || queue->state.qf == RADV_QUEUE_COMPUTE;
+   struct util_dynarray gpu_timestamps, timed_cmdbufs;
    VkCommandBufferSubmitInfo *new_cmdbufs = NULL;
    VkResult result = VK_SUCCESS;
+
+   /* Vulkan apps use vkQueueSubmit2(submitCount=0, fence) to signal per-image
+    * throttle fences. During SQTT capture, our wrap loop iterates 0 times
+    * and would never forward this call, leaving the fence unsignaled and
+    * hanging the next frame's vkWaitForFences. Always forward such calls.
+    */
+   if (submitCount == 0 && _fence != VK_NULL_HANDLE)
+      return device->layer_dispatch.rgp.QueueSubmit2(_queue, 0, NULL, _fence);
 
    /* Only consider queue events on graphics/compute when enabled. */
    if (((!device->sqtt_enabled || !radv_sqtt_queue_events_enabled()) && !instance->vk.trace_per_submit) ||
@@ -784,55 +779,102 @@ sqtt_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *pSu
       radv_sqtt_start_capturing(queue);
    }
 
+   util_dynarray_init(&gpu_timestamps, NULL);
+   util_dynarray_init(&timed_cmdbufs, NULL);
+
    for (uint32_t i = 0; i < submitCount; i++) {
       const VkSubmitInfo2 *pSubmit = &pSubmits[i];
       VkSubmitInfo2 sqtt_submit = *pSubmit;
 
       /* Command buffers */
-      uint32_t new_cmdbuf_count = sqtt_submit.commandBufferInfoCount * 3;
+      uint32_t new_cmdbuf_count =
+         sqtt_submit.commandBufferInfoCount > 0 ? sqtt_submit.commandBufferInfoCount * 2 + 1 : 0;
       uint32_t cmdbuf_idx = 0;
 
       new_cmdbufs = malloc(new_cmdbuf_count * sizeof(*new_cmdbufs));
       if (!new_cmdbufs)
          return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+      /* Allocate timed cmdbuf. */
+      const uint32_t num_timed_cmdbufs =
+         sqtt_submit.commandBufferInfoCount > 0 ? sqtt_submit.commandBufferInfoCount + 1 : 0;
+      for (uint32_t j = 0; j < num_timed_cmdbufs; j++) {
+         VkCommandBuffer cmdbuf;
+
+         result = radv_sqtt_allocate_cmdbuf(device, queue->state.qf, &cmdbuf);
+         if (result != VK_SUCCESS)
+            goto fail;
+
+         util_dynarray_append(&timed_cmdbufs, cmdbuf);
+      }
+
+      /* Acquire GPU timestamp objects. */
+      const uint32_t num_gpu_timestamps = sqtt_submit.commandBufferInfoCount * 2;
+      for (uint32_t j = 0; j < num_gpu_timestamps; j++) {
+         struct radv_sqtt_gpu_timestamp gpu_timestamp;
+
+         result = radv_sqtt_acquire_gpu_timestamp(device, &gpu_timestamp);
+         if (result != VK_SUCCESS)
+            goto fail;
+
+         util_dynarray_append(&gpu_timestamps, gpu_timestamp);
+      }
+
       for (uint32_t j = 0; j < sqtt_submit.commandBufferInfoCount; j++) {
          const VkCommandBufferSubmitInfo *pCommandBufferInfo = &sqtt_submit.pCommandBufferInfos[j];
-         struct radeon_winsys_bo *gpu_timestamps_bo[2];
-         uint32_t gpu_timestamps_offset[2];
-         VkCommandBuffer pre_timed_cmdbuf, post_timed_cmdbuf;
-         void *gpu_timestamps_ptr[2];
          uint64_t cpu_timestamp;
 
          /* Sample the current CPU time before building the timed cmdbufs. */
          cpu_timestamp = os_time_get_nano();
 
-         result = radv_sqtt_acquire_gpu_timestamp(device, &gpu_timestamps_bo[0], &gpu_timestamps_offset[0],
-                                                  &gpu_timestamps_ptr[0]);
-         if (result != VK_SUCCESS)
-            goto fail;
+         struct radv_sqtt_gpu_timestamp *pre_gpu_timestamp =
+            util_dynarray_element(&gpu_timestamps, struct radv_sqtt_gpu_timestamp, j * 2);
+         struct radv_sqtt_gpu_timestamp *post_gpu_timestamp =
+            util_dynarray_element(&gpu_timestamps, struct radv_sqtt_gpu_timestamp, j * 2 + 1);
+         VkCommandBuffer pre_timed_cmdbuf = *util_dynarray_element(&timed_cmdbufs, VkCommandBuffer, j);
+         VkCommandBuffer post_timed_cmdbuf = *util_dynarray_element(&timed_cmdbufs, VkCommandBuffer, j + 1);
 
-         result = radv_sqtt_get_timed_cmdbuf(queue, gpu_timestamps_bo[0], gpu_timestamps_offset[0],
-                                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, &pre_timed_cmdbuf);
-         if (result != VK_SUCCESS)
-            goto fail;
-
-         new_cmdbufs[cmdbuf_idx++] = (VkCommandBufferSubmitInfo){
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-            .commandBuffer = pre_timed_cmdbuf,
+         const VkCommandBufferBeginInfo begin_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
          };
+
+         /* Pre timed cmdbuf. */
+         if (j == 0) {
+            result = radv_BeginCommandBuffer(pre_timed_cmdbuf, &begin_info);
+            if (result != VK_SUCCESS)
+               goto fail;
+         }
+
+         radv_sqtt_write_gpu_timestamp(radv_cmd_buffer_from_handle(pre_timed_cmdbuf), pre_gpu_timestamp,
+                                       VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+
+         result = radv_EndCommandBuffer(pre_timed_cmdbuf);
+         if (result != VK_SUCCESS)
+            goto fail;
+
+         if (j == 0) {
+            new_cmdbufs[cmdbuf_idx++] = (VkCommandBufferSubmitInfo){
+               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+               .commandBuffer = pre_timed_cmdbuf,
+            };
+         }
 
          new_cmdbufs[cmdbuf_idx++] = *pCommandBufferInfo;
 
-         result = radv_sqtt_acquire_gpu_timestamp(device, &gpu_timestamps_bo[1], &gpu_timestamps_offset[1],
-                                                  &gpu_timestamps_ptr[1]);
+         /* Post timed cmdbuf. */
+         result = radv_BeginCommandBuffer(post_timed_cmdbuf, &begin_info);
          if (result != VK_SUCCESS)
             goto fail;
 
-         result = radv_sqtt_get_timed_cmdbuf(queue, gpu_timestamps_bo[1], gpu_timestamps_offset[1],
-                                             VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, &post_timed_cmdbuf);
-         if (result != VK_SUCCESS)
-            goto fail;
+         radv_sqtt_write_gpu_timestamp(radv_cmd_buffer_from_handle(post_timed_cmdbuf), post_gpu_timestamp,
+                                       VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+
+         if (j == sqtt_submit.commandBufferInfoCount - 1) {
+            result = radv_EndCommandBuffer(post_timed_cmdbuf);
+            if (result != VK_SUCCESS)
+               goto fail;
+         }
 
          new_cmdbufs[cmdbuf_idx++] = (VkCommandBufferSubmitInfo){
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
@@ -840,8 +882,11 @@ sqtt_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *pSu
          };
 
          VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, pCommandBufferInfo->commandBuffer);
-         radv_describe_queue_submit(queue, cmd_buffer, j, cpu_timestamp, gpu_timestamps_ptr[0], gpu_timestamps_ptr[1]);
+         radv_describe_queue_submit(queue, cmd_buffer, j, cpu_timestamp, pre_gpu_timestamp->ptr,
+                                    post_gpu_timestamp->ptr);
       }
+
+      assert(cmdbuf_idx == new_cmdbuf_count);
 
       sqtt_submit.commandBufferInfoCount = new_cmdbuf_count;
       sqtt_submit.pCommandBufferInfos = new_cmdbufs;
@@ -857,6 +902,8 @@ sqtt_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *pSu
          radv_describe_queue_semaphore(queue, sem, SQTT_QUEUE_TIMING_EVENT_SIGNAL_SEMAPHORE);
       }
 
+      util_dynarray_clear(&gpu_timestamps);
+      util_dynarray_clear(&timed_cmdbufs);
       FREE(new_cmdbufs);
    }
 
@@ -864,14 +911,21 @@ sqtt_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *pSu
       if (!radv_sqtt_stop_capturing(queue)) {
          fprintf(stderr,
                  "radv: Failed to capture RGP for this submit because the buffer is too small and auto-resizing "
-                 "is disabled. See RADV_THREAD_TRACE_BUFFER_SIZE for increasing the size.\n");
+                 "is disabled. See RADV_THREAD_TRACE_BUFFER_SIZE/RADV_CACHE_COUNTERS_BUFFER_SIZE for increasing the "
+                 "size.\n");
       }
+      device->rgp_num_submits++;
+
       simple_mtx_unlock(&device->sqtt.lock);
    }
 
+   util_dynarray_fini(&gpu_timestamps);
+   util_dynarray_fini(&timed_cmdbufs);
    return result;
 
 fail:
+   util_dynarray_fini(&gpu_timestamps);
+   util_dynarray_fini(&timed_cmdbufs);
    FREE(new_cmdbufs);
 
    if (instance->vk.trace_per_submit) {
@@ -1522,32 +1576,32 @@ radv_add_rt_record(struct radv_device *device, struct rgp_code_object *code_obje
 }
 
 static void
-compute_unique_rt_sha(uint64_t pipeline_hash, unsigned index, unsigned char sha1[SHA1_DIGEST_LENGTH])
+compute_unique_rt_sha(uint64_t pipeline_hash, unsigned index, unsigned char blake3[BLAKE3_KEY_LEN])
 {
-   struct mesa_sha1 ctx;
-   _mesa_sha1_init(&ctx);
-   _mesa_sha1_update(&ctx, &pipeline_hash, sizeof(pipeline_hash));
-   _mesa_sha1_update(&ctx, &index, sizeof(index));
-   _mesa_sha1_final(&ctx, sha1);
+   blake3_hasher ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, &pipeline_hash, sizeof(pipeline_hash));
+   _mesa_blake3_update(&ctx, &index, sizeof(index));
+   _mesa_blake3_final(&ctx, blake3);
 }
 
 static VkResult
 radv_register_rt_stage(struct radv_device *device, struct radv_ray_tracing_pipeline *pipeline, uint32_t index,
                        uint32_t stack_size, struct radv_shader *shader)
 {
-   unsigned char sha1[SHA1_DIGEST_LENGTH];
+   unsigned char blake3[BLAKE3_KEY_LEN];
    VkResult result;
 
-   compute_unique_rt_sha(pipeline->base.base.pipeline_hash, index, sha1);
+   compute_unique_rt_sha(pipeline->base.base.pipeline_hash, index, blake3);
 
-   result = ac_sqtt_add_pso_correlation(&device->sqtt, *(uint64_t *)sha1, pipeline->base.base.pipeline_hash);
+   result = ac_sqtt_add_pso_correlation(&device->sqtt, *(uint64_t *)blake3, pipeline->base.base.pipeline_hash);
    if (!result)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   result = ac_sqtt_add_code_object_loader_event(&device->sqtt, *(uint64_t *)sha1, shader->va);
+   result = ac_sqtt_add_code_object_loader_event(&device->sqtt, *(uint64_t *)blake3, shader->va);
    if (!result)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   result =
-      radv_add_rt_record(device, &device->sqtt.rgp_code_object, pipeline, shader, stack_size, index, *(uint64_t *)sha1);
+   result = radv_add_rt_record(device, &device->sqtt.rgp_code_object, pipeline, shader, stack_size, index,
+                               *(uint64_t *)blake3);
    return result;
 }
 
@@ -1796,10 +1850,10 @@ sqtt_DestroyPipeline(VkDevice _device, VkPipeline _pipeline, const VkAllocationC
    if (pipeline->type == RADV_PIPELINE_RAY_TRACING) {
       /* We have one record for each stage, plus one for the traversal shader and one for the prolog */
       uint32_t record_count = radv_pipeline_to_ray_tracing(pipeline)->stage_count + 2;
-      unsigned char sha1[SHA1_DIGEST_LENGTH];
+      unsigned char blake3[BLAKE3_KEY_LEN];
       for (uint32_t i = 0; i < record_count; ++i) {
-         compute_unique_rt_sha(pipeline->pipeline_hash, i, sha1);
-         radv_unregister_records(device, *(uint64_t *)sha1);
+         compute_unique_rt_sha(pipeline->pipeline_hash, i, blake3);
+         radv_unregister_records(device, *(uint64_t *)blake3);
       }
    } else
       radv_unregister_records(device, pipeline->pipeline_hash);

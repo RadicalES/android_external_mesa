@@ -22,20 +22,15 @@
  * IN THE SOFTWARE.
  */
 
-#include "tu_buffer.h"
-#include "tu_device.h"
-#include "tu_cmd_buffer.h"
-
-#include "vk_acceleration_structure.h"
 #include "tu_acceleration_structure.h"
-#include "radix_sort/radix_sort_u64.h"
-
-
-#include "common/freedreno_gpu_event.h"
 
 #include "util/u_hexdump.h"
+#include "vk_acceleration_structure.h"
 
-#include "bvh/tu_build_interface.h"
+#include "bvh/tu_bvh_defines.h"
+#include "tu_buffer.h"
+#include "tu_cmd_buffer.h"
+#include "tu_device.h"
 
 static const uint32_t encode_spv[] = {
 #include "bvh/encode.spv.h"
@@ -144,7 +139,7 @@ get_bvh_layout(VkGeometryTypeKHR geometry_type,
    layout->size = offset;
 }
 
-VkDeviceSize
+static VkDeviceSize
 get_bvh_size(VkDevice device,
              const struct vk_acceleration_structure_build_state *state)
 {
@@ -154,104 +149,74 @@ get_bvh_size(VkDevice device,
    return layout.size;
 }
 
-/* Don't bother copying over the compacted size using a compute shader if
- * compaction is never going to happen.
- */
-enum tu_header_key {
-   HEADER_NO_DISPATCH,
-   HEADER_USE_DISPATCH,
-};
-
 static void
 tu_get_build_config(VkDevice device,
                     struct vk_acceleration_structure_build_state *state)
 {
-   state->config.encode_key[1] =
-      (state->build_info->flags &
-       VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR)
-         ? HEADER_USE_DISPATCH
-         : HEADER_NO_DISPATCH;
-}
-
-static VkResult
-encode_bind_pipeline(VkCommandBuffer commandBuffer,
-                     const struct vk_acceleration_structure_build_state *state)
-{
-   VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
-   struct tu_device *device = cmdbuf->device;
-
-   VkPipeline pipeline;
-   VkPipelineLayout layout;
-   VkResult result =
-      get_pipeline_spv(device, "encode", encode_spv, sizeof(encode_spv),
-                       sizeof(encode_args), &pipeline, &layout);
-
-   if (result != VK_SUCCESS)
-      return result;
-
-   tu_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-   return VK_SUCCESS;
 }
 
 static void
-encode(VkCommandBuffer commandBuffer,
-       const struct vk_acceleration_structure_build_state *state)
+tu_encode(VkCommandBuffer commandBuffer,
+          struct vk_device *vk_device,
+          struct vk_meta_device *meta,
+          const struct vk_acceleration_structure_build_args *args,
+          struct vk_acceleration_structure_build_state *states,
+          uint32_t build_count, bool flushed_compute_after_init_update_scratch)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
-   VK_FROM_HANDLE(vk_acceleration_structure, dst,
-                  state->build_info->dstAccelerationStructure);
    struct tu_device *device = cmdbuf->device;
-   VkGeometryTypeKHR geometry_type =
-      vk_get_as_geometry_type(state->build_info);
-
-   uint64_t intermediate_header_addr =
-      state->build_info->scratchData.deviceAddress +
-      state->scratch.header_offset;
-   uint64_t intermediate_bvh_addr =
-      state->build_info->scratchData.deviceAddress + state->scratch.ir_offset;
-
+   VkResult result;
    VkPipeline pipeline;
    VkPipelineLayout layout;
-   get_pipeline_spv(device, "encode", encode_spv, sizeof(encode_spv),
-                    sizeof(encode_args), &pipeline, &layout);
 
-   struct bvh_layout bvh_layout;
-   get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
+   /* Insert barrier so that build data gets reflected properly for encode pass */
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, true);
 
-   const struct encode_args args = {
-      .intermediate_bvh = intermediate_bvh_addr,
-      .output_bvh =
-         vk_acceleration_structure_get_va(dst) + bvh_layout.bvh_offset,
-      .header = intermediate_header_addr,
-      .output_bvh_offset = bvh_layout.bvh_offset,
-      .leaf_node_count = state->leaf_node_count,
-      .geometry_type = geometry_type,
-   };
-   vk_common_CmdPushConstants(commandBuffer, layout,
-                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args),
-                              &args);
+   result = get_pipeline_spv(device, "encode", encode_spv, sizeof(encode_spv), sizeof(encode_args), &pipeline, &layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmdbuf->vk, result);
+      return;
+   }
 
-   tu_dispatch_unaligned_indirect(commandBuffer,
-                                  intermediate_header_addr +
-                                  offsetof(struct vk_ir_header, ir_internal_node_count));
-}
+   tu_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
-static VkResult
-header_bind_pipeline(VkCommandBuffer commandBuffer,
-                     const struct vk_acceleration_structure_build_state *state)
-{
-   VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
-   struct tu_device *device = cmdbuf->device;
+   bool has_compaction = false;
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
 
-   if (state->config.encode_key[1] == HEADER_USE_DISPATCH) {
-      VkPipeline pipeline;
-      VkPipelineLayout layout;
-      VkResult result =
-         get_pipeline_spv(device, "header", header_spv, sizeof(header_spv),
-                          sizeof(header_args), &pipeline, &layout);
+      if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR)
+         has_compaction = true;
 
-      if (result != VK_SUCCESS)
-         return result;
+      VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
+      VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
+
+      uint64_t intermediate_header_addr = state->build_info->scratchData.deviceAddress + state->scratch.header_offset;
+      uint64_t intermediate_bvh_addr = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset;
+
+      struct bvh_layout bvh_layout;
+      get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
+
+      const struct encode_args args = {
+         .intermediate_bvh = intermediate_bvh_addr,
+         .output_bvh = vk_acceleration_structure_get_va(dst) + bvh_layout.bvh_offset,
+         .header = intermediate_header_addr,
+         .output_bvh_offset = bvh_layout.bvh_offset,
+         .leaf_node_count = state->leaf_node_count,
+         .geometry_type = geometry_type,
+      };
+      vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args);
+
+      tu_dispatch_unaligned_indirect(commandBuffer,
+                                     intermediate_header_addr + offsetof(struct vk_ir_header, ir_internal_node_count));
+   }
+
+   if (has_compaction) {
+      result =
+         get_pipeline_spv(device, "header", header_spv, sizeof(header_spv), sizeof(header_args), &pipeline, &layout);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return;
+      }
 
       static const VkMemoryBarrier mb = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -259,167 +224,77 @@ header_bind_pipeline(VkCommandBuffer commandBuffer,
          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
       };
 
-      vk_common_CmdPipelineBarrier(commandBuffer,
-                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   0, 1, &mb, 0, NULL, 0, NULL);
+      vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 
       tu_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    }
 
-   return VK_SUCCESS;
-}
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
 
-static void
-header(VkCommandBuffer commandBuffer,
-       const struct vk_acceleration_structure_build_state *state)
-{
-   VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
-   VK_FROM_HANDLE(vk_acceleration_structure, dst,
-                  state->build_info->dstAccelerationStructure);
-   struct tu_device *device = cmdbuf->device;
-   VkGeometryTypeKHR geometry_type =
-      vk_get_as_geometry_type(state->build_info);
+      VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
+      VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
 
-   struct bvh_layout bvh_layout;
-   get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
+      struct bvh_layout bvh_layout;
+      get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
 
-   uint64_t intermediate_header_addr =
-      state->build_info->scratchData.deviceAddress +
-      state->scratch.header_offset;
-   VkDeviceAddress header_addr = vk_acceleration_structure_get_va(dst);
+      uint64_t intermediate_header_addr = state->build_info->scratchData.deviceAddress + state->scratch.header_offset;
+      VkDeviceAddress header_addr = vk_acceleration_structure_get_va(dst);
 
-   size_t base = offsetof(struct tu_accel_struct_header, copy_dispatch_size);
+      size_t base = offsetof(struct tu_accel_struct_header, copy_dispatch_size);
 
-   uint32_t instance_count = geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
-                                ? state->leaf_node_count
-                                : 0;
+      uint32_t instance_count = geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR ? state->leaf_node_count : 0;
 
-   if (state->config.encode_key[1] == HEADER_USE_DISPATCH) {
-      base = offsetof(struct tu_accel_struct_header, instance_count);
-      VkPipeline pipeline;
-      VkPipelineLayout layout;
-      get_pipeline_spv(device, "header", header_spv, sizeof(header_spv),
-                       sizeof(header_args), &pipeline, &layout);
+      if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) {
+         base = offsetof(struct tu_accel_struct_header, instance_count);
 
-      struct header_args args = {
-         .src = intermediate_header_addr,
-         .dst = vk_acceleration_structure_get_va(dst),
-         .bvh_offset = bvh_layout.bvh_offset,
-         .instance_count = instance_count,
-      };
+         struct header_args args = {
+            .src = intermediate_header_addr,
+            .dst = vk_acceleration_structure_get_va(dst),
+            .bvh_offset = bvh_layout.bvh_offset,
+            .instance_count = instance_count,
+         };
 
-      vk_common_CmdPushConstants(commandBuffer, layout,
-                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args),
-                                 &args);
+         vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args);
 
-      vk_common_CmdDispatch(commandBuffer, 1, 1, 1);
+         vk_common_CmdDispatch(commandBuffer, 1, 1, 1);
+      }
+
+      struct tu_accel_struct_header header = {};
+
+      header.instance_count = instance_count;
+      header.self_ptr = header_addr;
+      header.compacted_size = bvh_layout.size;
+
+      header.copy_dispatch_size[0] = DIV_ROUND_UP(header.compacted_size, 16 * 128);
+      header.copy_dispatch_size[1] = 1;
+      header.copy_dispatch_size[2] = 1;
+
+      header.serialization_size = header.compacted_size + sizeof(struct vk_accel_struct_serialization_header) +
+                                  sizeof(uint64_t) * header.instance_count;
+
+      header.size = header.serialization_size - sizeof(struct vk_accel_struct_serialization_header) -
+                    sizeof(uint64_t) * header.instance_count;
+
+      struct tu_cs *cs = &cmdbuf->cs;
+
+      size_t header_size = sizeof(struct tu_accel_struct_header) - base;
+      assert(base % sizeof(uint32_t) == 0);
+      assert(header_size % sizeof(uint32_t) == 0);
+      uint32_t *header_ptr = reinterpret_cast<uint32_t *>(reinterpret_cast<char *>(&header) + base);
+
+      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + header_size / sizeof(uint32_t));
+      tu_cs_emit_qw(cs, header_addr + base);
+      tu_cs_emit_array(cs, header_ptr, header_size / sizeof(uint32_t));
    }
-
-   struct tu_accel_struct_header header = {};
-
-   header.instance_count = instance_count;
-   header.self_ptr = header_addr;
-   header.compacted_size = bvh_layout.size;
-
-   header.copy_dispatch_size[0] = DIV_ROUND_UP(header.compacted_size, 16 * 128);
-   header.copy_dispatch_size[1] = 1;
-   header.copy_dispatch_size[2] = 1;
-
-   header.serialization_size =
-      header.compacted_size +
-      sizeof(struct vk_accel_struct_serialization_header) + sizeof(uint64_t) * header.instance_count;
-
-   header.size = header.serialization_size - sizeof(struct vk_accel_struct_serialization_header) -
-                 sizeof(uint64_t) * header.instance_count;
-
-   struct tu_cs *cs = &cmdbuf->cs;
-
-   size_t header_size = sizeof(struct tu_accel_struct_header) - base;
-   assert(base % sizeof(uint32_t) == 0);
-   assert(header_size % sizeof(uint32_t) == 0);
-   uint32_t *header_ptr = (uint32_t *)((char *)&header + base);
-
-   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + header_size / sizeof(uint32_t));
-   tu_cs_emit_qw(cs, header_addr + base);
-   tu_cs_emit_array(cs, header_ptr, header_size / sizeof(uint32_t));
 }
 
 const struct vk_acceleration_structure_build_ops tu_as_build_ops = {
    .get_build_config = tu_get_build_config,
    .get_as_size = get_bvh_size,
-   .encode_bind_pipeline = { encode_bind_pipeline, header_bind_pipeline },
-   .encode_as = { encode, header },
+   .encode = tu_encode,
 };
-
-const struct radix_sort_vk_target_config tu_radix_sort_config_128 = {
-   .keyval_dwords = 2,
-   .init = { .workgroup_size_log2 = 8, },
-   .fill = { .workgroup_size_log2 = 8, .block_rows = 8 },
-   .histogram = {
-      .workgroup_size_log2 = 8,
-      .subgroup_size_log2 = 7,
-      .block_rows = 14, /* TODO tune this */
-   },
-   .prefix = {
-      .workgroup_size_log2 = 8,
-      .subgroup_size_log2 = 7,
-   },
-   .scatter = {
-      .workgroup_size_log2 = 8,
-      .subgroup_size_log2 = 7,
-      .block_rows = 14, /* TODO tune this */
-   },
-   .nonsequential_dispatch = false,
-};
-
-const struct radix_sort_vk_target_config tu_radix_sort_config_64 = {
-   .keyval_dwords = 2,
-   .init = { .workgroup_size_log2 = 8, },
-   .fill = { .workgroup_size_log2 = 8, .block_rows = 8 },
-   .histogram = {
-      .workgroup_size_log2 = 8,
-      .subgroup_size_log2 = 6,
-      .block_rows = 14, /* TODO tune this */
-   },
-   .prefix = {
-      .workgroup_size_log2 = 8,
-      .subgroup_size_log2 = 6,
-   },
-   .scatter = {
-      .workgroup_size_log2 = 8,
-      .subgroup_size_log2 = 6,
-      .block_rows = 14, /* TODO tune this */
-   },
-   .nonsequential_dispatch = false,
-};
-
-static VkResult
-init_radix_sort(struct tu_device *device)
-{
-   if (!device->radix_sort) {
-      mtx_lock(&device->radix_sort_mutex);
-      if (!device->radix_sort) {
-         const struct radix_sort_vk_target_config *cfg =
-            device->physical_device->info->props.supports_double_threadsize ?
-            &tu_radix_sort_config_128 :
-            &tu_radix_sort_config_64;
-         device->radix_sort =
-            vk_create_radix_sort_u64(tu_device_to_handle(device),
-                                     &device->vk.alloc,
-                                     VK_NULL_HANDLE, *cfg);
-         if (!device->radix_sort) {
-            /* TODO plumb through the error here */
-            mtx_unlock(&device->radix_sort_mutex);
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
-         }
-
-      }
-      mtx_unlock(&device->radix_sort_mutex);
-   }
-
-   return VK_SUCCESS;
-}
 
 struct tu_saved_compute_state {
    uint32_t push_constants[MAX_PUSH_CONSTANTS_SIZE / 4];
@@ -455,19 +330,15 @@ tu_CmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t inf
    struct tu_device *device = cmd->device;
    struct tu_saved_compute_state state;
 
-   VkResult result = init_radix_sort(device);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
-      return;
-   }
-
    tu_save_compute_state(cmd, &state);
 
    struct vk_acceleration_structure_build_args args = {
-      .subgroup_size = device->physical_device->info->props.supports_double_threadsize ? 128 : 64,
+      .subgroup_size = device->physical_device->info->threadsize_base *
+                       (device->physical_device->expose_double_threadsize ? 2 : 1),
       .bvh_bounds_offset = offsetof(tu_accel_struct_header, aabb),
+      .morton_sort_workgroup_size = 512,
+      .morton_sort_kvs_per_thread = 2,
       .emit_markers = false,
-      .radix_sort = device->radix_sort,
    };
 
    vk_cmd_build_acceleration_structures(commandBuffer,
@@ -615,11 +486,11 @@ tu_GetAccelerationStructureBuildSizesKHR(VkDevice _device, VkAccelerationStructu
 {
    VK_FROM_HANDLE(tu_device, device, _device);
 
-   init_radix_sort(device);
-
    struct vk_acceleration_structure_build_args args = {
-      .subgroup_size = device->physical_device->info->props.supports_double_threadsize ? 128 : 64,
-      .radix_sort = device->radix_sort,
+      .subgroup_size = device->physical_device->info->threadsize_base *
+                       (device->physical_device->expose_double_threadsize ? 2 : 1),
+      .morton_sort_workgroup_size = 512,
+      .morton_sort_kvs_per_thread = 2,
    };
 
    vk_get_as_build_sizes(_device, buildType, pBuildInfo, pMaxPrimitiveCounts,
@@ -674,9 +545,9 @@ tu_init_null_accel_struct(struct tu_device *device)
       node.mantissas[i][0][2] = 0xff;
    }
 
-   memcpy(device->null_accel_struct_bo->map, (void *)&header, sizeof(header));
-   memcpy((char *)device->null_accel_struct_bo->map + sizeof(header),
-          (void *)&node, sizeof(node));
+   memcpy(device->null_accel_struct_bo->map, &header, sizeof(header));
+   memcpy(static_cast<char *>(device->null_accel_struct_bo->map) + sizeof(header),
+          &node, sizeof(node));
    return VK_SUCCESS;
 }
 
@@ -720,7 +591,7 @@ dump_internal(struct tu_internal_node *node, uint32_t *max_child)
             unsigned mantissa = node->mantissas[i][vert][coord];
             if (coord != 0)
                fprintf(stderr, ", ");
-            fprintf(stderr, "%f", base[coord] + ldexp((float)mantissa,
+            fprintf(stderr, "%f", base[coord] + ldexp(static_cast<float>(mantissa),
                                                       exponents[coord]));
          }
          fprintf(stderr, ")\n");
@@ -734,28 +605,28 @@ dump_as(struct vk_acceleration_structure *as)
    VK_FROM_HANDLE(tu_buffer, buf, vk_buffer_to_handle(as->buffer));
 
    struct tu_accel_struct_header *hdr =
-      (struct tu_accel_struct_header *)((char *)buf->bo->map + as->offset);
+      reinterpret_cast<struct tu_accel_struct_header *>(static_cast<char *>(buf->bo->map) + as->offset);
 
    fprintf(stderr, "dumping AS at %" PRIx64 "\n",
            vk_buffer_address(&buf->vk, as->offset));
-   u_hexdump(stderr, (uint8_t *)hdr, sizeof(*hdr), false);
+   u_hexdump(stderr, reinterpret_cast<uint8_t *>(hdr), sizeof(*hdr), false);
 
-   char *base = ((char *)buf->bo->map + (hdr->bvh_ptr - buf->vk.device_address));
-   struct tu_node *node = (struct tu_node *)base;
+   char *base = (static_cast<char *>(buf->bo->map) + (hdr->bvh_ptr - buf->vk.device_address));
+   struct tu_node *node = reinterpret_cast<struct tu_node *>(base);
 
    fprintf(stderr, "dumping nodes at %" PRIx64 "\n", hdr->bvh_ptr);
 
    uint32_t max_child = 1;
    for (unsigned i = 0; i < max_child; i++) {
-      uint32_t *parent_ptr = (uint32_t*)(base - (4 + 4 * i));
+      uint32_t *parent_ptr = reinterpret_cast<uint32_t*>(base - (4 + 4 * i));
       uint32_t parent = *parent_ptr;
       fprintf(stderr, "node %d parent %d\n", i, parent);
-      u_hexdump(stderr, (uint8_t *)node, sizeof(*node), false);
+      u_hexdump(stderr, reinterpret_cast<uint8_t *>(node), sizeof(*node), false);
       if (node->data[15] & TU_NODE_TYPE_LEAF) {
          /* TODO compressed leaves */
-         dump_leaf((struct tu_leaf_node *)node);
+         dump_leaf(reinterpret_cast<struct tu_leaf_node *>(node));
       } else {
-         dump_internal((struct tu_internal_node *)node, &max_child);
+         dump_internal(reinterpret_cast<struct tu_internal_node *>(node), &max_child);
       }
 
       node++;
@@ -769,7 +640,7 @@ as_finished(struct tu_device *dev, struct vk_acceleration_structure *as)
    tu_bo_map(dev, buf->bo, NULL);
 
    struct tu_accel_struct_header *hdr =
-      (struct tu_accel_struct_header *)((char *)buf->bo->map + as->offset);
+      reinterpret_cast<struct tu_accel_struct_header *>(static_cast<char *>(buf->bo->map) + as->offset);
    return hdr->self_ptr == vk_buffer_address(&buf->vk, as->offset);
 }
 

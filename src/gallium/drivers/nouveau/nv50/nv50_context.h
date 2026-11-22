@@ -268,9 +268,11 @@ nv50_resource_validate(struct nv50_context *context, struct nv04_resource *res, 
          res->status |= NOUVEAU_BUFFER_STATUS_GPU_READING;
 
       if (res->mm) {
-         nouveau_fence_ref(context->base.fence, &res->fence);
+         nouveau_fence_ref(context->base.fence, &res->fence,
+                           context->base.screen);
          if (flags & NOUVEAU_BO_WR)
-            nouveau_fence_ref(context->base.fence, &res->fence_wr);
+            nouveau_fence_ref(context->base.fence, &res->fence_wr,
+                              context->base.screen);
       }
    }
 }
@@ -280,7 +282,7 @@ struct pipe_context *nv50_create(struct pipe_screen *, void *, unsigned flags);
 
 void nv50_bufctx_fence(struct nv50_context *, struct nouveau_bufctx *, bool on_flush);
 
-void nv50_default_kick_notify(struct nouveau_context *);
+MUST_CHECK bool nv50_default_kick_notify(struct nouveau_context *);
 
 /* nv50_draw.c */
 extern struct draw_stage *nv50_draw_render_stage(struct nv50_context *);
@@ -312,9 +314,16 @@ bool nv50_state_validate_3d(struct nv50_context *, uint32_t);
 
 /* nv50_surface.c */
 extern void nv50_clear(struct pipe_context *, unsigned buffers,
+                       uint32_t color_clear_mask, uint8_t stencil_clear_mask,
                        const struct pipe_scissor_state *scissor_state,
                        const union pipe_color_union *color,
                        double depth, unsigned stencil);
+extern void nv50_clear_render_target_internal(struct pipe_context *,
+                                              struct nv50_surface *,
+                                              const union pipe_color_union *color,
+                                              unsigned dstx, unsigned dsty,
+                                              unsigned width, unsigned height,
+                                              bool render_condition_enabled);
 extern void nv50_init_surface_functions(struct nv50_context *);
 
 /* nv50_tex.c */

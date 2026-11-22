@@ -262,7 +262,7 @@ stats_buffer_manager::stats_buffer_manager( void *logId,
    {
       if( buffer_count < initial_pool_size )
       {
-         HRESULT hr = stats_buffer_manager::CreateSample( entry );
+         hr = stats_buffer_manager::CreateSample( entry );
          if( FAILED( hr ) )
          {
             MFE_ERROR( "[dx12 hmft 0x%p] CreateSample failed", m_logId );
@@ -275,8 +275,7 @@ stats_buffer_manager::stats_buffer_manager( void *logId,
 }
 
 stats_buffer_manager::~stats_buffer_manager()
-{
-}
+{ }
 
 // callback from IMFTrackSample (i.e. application)
 IFACEMETHODIMP

@@ -20,8 +20,10 @@ Capability about the features and limits of the driver/GPU.
 
 * ``pipe_caps.graphics``: Whether graphics is supported. If not, contexts can
   only be created with PIPE_CONTEXT_COMPUTE_ONLY.
-* ``pipe_caps.npot_textures``: Whether :term:`NPOT` textures may have repeat modes,
-  normalized coordinates, and mipmaps.
+* ``pipe_caps.npot_textures``: Whether :term:`NPOT` textures may be sampled
+  with mipmap filtering and wrap modes other than clamp-to-edge. Sampling the
+  base level without mipmap filtering and with clamp-to-edge is always
+  supported.
 * ``pipe_caps.max_dual_source_render_targets``: How many dual-source blend RTs are support.
   :ref:`Blend` for more information.
 * ``pipe_caps.anisotropic_filter``: Whether textures can be filtered anisotropically.
@@ -303,6 +305,8 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.depth_bounds_test``: Whether bounds_test, bounds_min, and
   bounds_max states of pipe_depth_stencil_alpha_state behave according
   to the :ext:`GL_EXT_depth_bounds_test` specification.
+* ``pipe_caps.native_fp32_depth``: Whether the hardware has a true
+  floating-point depth buffer. Defaults to true.
 * ``pipe_caps.texture_query_samples``: Whether the ``TXQS`` opcode is supported
 * ``pipe_caps.force_persample_interp``: If the driver can force per-sample
   interpolation for all fragment shader inputs if
@@ -422,8 +426,6 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.doubles``: Whether double precision floating-point operations
   are supported.
 * ``pipe_caps.int64``: Whether 64-bit integer operations are supported.
-* ``pipe_caps.tgsi_tex_txf_lz``: Whether TEX_LZ and TXF_LZ opcodes are
-  supported.
 * ``pipe_caps.shader_clock``: Whether the CLOCK opcode is supported.
 * ``pipe_caps.polygon_mode_fill_rectangle``: Whether the
   PIPE_POLYGON_MODE_FILL_RECTANGLE mode is supported for
@@ -590,6 +592,10 @@ Capability about the features and limits of the driver/GPU.
     fragment shader.
 * ``pipe_caps.point_size_fixed``: Driver supports point-sizes that are fixed,
   as opposed to writing gl_PointSize for every point.
+* ``pipe_caps.polygon_stipple``: Driver supports polygon stipple. If unset,
+  mesa/st emulates polygon stipple by sampling a stipple texture and doing
+  discard_if in the fragment shader, and set_polygon_stipple() will not be
+  called.
 * ``pipe_caps.two_sided_color``: Driver supports two-sided coloring.  Must be 1
     for non-NIR drivers.  If set, pipe_rasterizer_state may be set to indicate
     that back-facing primitives should use the back-side color as the FS input
@@ -613,7 +619,7 @@ Capability about the features and limits of the driver/GPU.
 * ``pipe_caps.viewport_mask``: Whether ``TGSI_SEMANTIC_VIEWPORT_MASK`` and ``TGSI_PROPERTY_LAYER_VIEWPORT_RELATIVE`` are supported (see :ext:`GL_NV_viewport_array2`).
 * ``pipe_caps.map_unsynchronized_thread_safe``: Whether mapping a buffer as unsynchronized from any thread is safe.
 * ``pipe_caps.glsl_zero_init``: Choose a default zero initialization some GLSL variables. If ``1``, then all GLSL shader variables and gl_FragColor are initialized to zero. If ``2``, then shader out variables are not initialized but function out variables are.
-* ``pipe_caps.blend_equation_advanced``: Driver supports blend equation advanced without necessarily supporting FBFETCH.
+* ``pipe_caps.blend_equation_advanced``: Bitmask of ``enum pipe_advanced_blend_mode`` modes the driver blends natively through ``pipe_blend_state::advanced_blend_func``, without necessarily supporting FBFETCH. Modes not in the mask are lowered into the fragment shader, which requires FBFETCH. :ext:`GL_KHR_blend_equation_advanced` is exposed when the mask covers all its modes (``PIPE_ADVANCED_BLEND_KHR_MODES_MASK``) or FBFETCH fills the gap.
 * ``pipe_caps.nir_atomics_as_deref``: Whether NIR atomics instructions should reference atomics as NIR derefs instead of by indices.
 * ``pipe_caps.no_clip_on_copy_tex``: Driver doesn't want x/y/width/height clipped based on src size when doing a copy texture operation (e.g.: may want out-of-bounds reads that produce 0 instead of leaving the texture content undefined)
 * ``pipe_caps.max_texture_mb``: Maximum texture size in MB (default is 1024)
@@ -674,6 +680,13 @@ Capability about the features and limits of the driver/GPU.
   dilation.
 * ``pipe_caps.conservative_raster_dilate_granularity``: The conservative rasterization
   dilation granularity for values relative to the minimum dilation.
+* ``pipe_caps.clear_masked``: Whether ``clear`` can accept a color_clear_mask for all color buffers and stencil_clear_mask.
+* ``pipe_caps.prefer_persp``: Whether the driver prefers perspective correct
+  or linear interpolation. This is a performance hint.
+* ``pipe_caps.blit_3d``: Whether pipe_context::blit can have depth > 1.
+* ``pipe_caps.needs_split_planar_samplers``: Whether sampling a natively stored
+  planar YUV format needs one sampler view per plane. The state tracker then
+  adds the plane views and converts to RGB in the shader.
 
 
 .. _pipe_shader_caps:
@@ -835,6 +848,12 @@ resources might be created and handled quite differently.
   to a shader and can be used with load, store, and atomic instructions.
 * ``PIPE_BIND_SHADER_IMAGE``: A buffer or texture with a format that can be
   bound to a shader and can be used with load, store, and atomic instructions.
+* ``PIPE_BIND_OPENCL``: Potentially higher precision requirements than gl/vk.
+  Float values need to be 1.5 (FULL_PROFILE) or 2.0 (EMBEDDED_PROFILE) ULPs
+  precise. For float to int conversion, the preferred rounding mode is "to
+  nearest" and if a different rounding mode is chosen, the absolute error
+  must be <= 0.6. Details can be found here:
+  https://registry.khronos.org/OpenCL/specs/3.0-unified/html/OpenCL_C.html#conversion-rules
 * ``PIPE_BIND_COMMAND_ARGS_BUFFER``: A buffer that may be sourced by the
   GPU command processor. It can contain, for example, the arguments to
   indirect draw calls.

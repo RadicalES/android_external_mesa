@@ -1,24 +1,6 @@
 /*
  * Copyright © 2015 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 /** @file
@@ -102,7 +84,7 @@ validate_memory_logical(const brw_shader &s, const brw_mem_inst *inst)
    enum memory_logical_mode mode = inst->mode;
 
    enum lsc_data_size data_size = inst->data_size;
-   unsigned data_size_B = lsc_data_size_bytes(data_size);
+   unsigned data_size_B = lsc_data_size_register_bytes(data_size);
 
    if (!devinfo->has_lsc) {
       VAL_ASSERT(data_size == LSC_DATA_SIZE_D8U32 ||
@@ -146,8 +128,10 @@ validate_memory_logical(const brw_shader &s, const brw_mem_inst *inst)
    if (mode == MEMORY_MODE_TYPED)
       VAL_ASSERT_EQ(inst->as_mem()->address_offset, 0);
 
-   /* Offset must be DWord aligned */
-   VAL_ASSERT_EQ((inst->as_mem()->address_offset % 4), 0);
+   if (!s.key->use_efficient_64bit) {
+      /* Offset must be DWord aligned */
+      VAL_ASSERT_EQ((inst->as_mem()->address_offset % 4), 0);
+   }
 
    switch (inst->opcode) {
    case SHADER_OPCODE_MEMORY_LOAD_LOGICAL:
@@ -394,6 +378,70 @@ brw_validate(const brw_shader &s)
                      break;
                   }
                }
+
+               /* Page 493 (page 497 of the PDF), section "Accumulator
+                * Restrictions," of the Tiger Lake PRM Volume 9: Rendering
+                * Engine says:
+                *
+                *    5. Src2 cannot use accumulator for 3 source instructions.
+                *
+                * The Xe2 Bspec 56619 (r63543) contains similar language, but
+                * it also says:
+                *
+                *    There is one exception that when all source and dst are
+                *    float data type, Src2 can be accumulator.
+                */
+               if (devinfo->verx10 < 120) {
+                  /* Page 475 (page 481 of the PDF) of the Ice Lake PRM Volume
+                   * 9: Render Engine says:
+                   *
+                   *    The 3-source instructions have the following
+                   *    restrictions:
+                   *
+                   *    - Only GRF registers can be sources and only GRF
+                   *      registers can be the destination.
+                   *
+                   * This does not match the Bspec. It appears to be a
+                   * copy-and-paste of the Skylake PRM. The Bspec contains
+                   * explicit references to using the accumulator as
+                   * destination and src0. From other experiments (as
+                   * mentioned in brw_opt_combine_constants.cpp), we have
+                   * found that src0 and src2 can be immediate values with
+                   * some limitations.
+                   *
+                   * Page 496 (page 502 of the PDF) of the Ice Lake PRM Volume
+                   * 9: Render Engine says:
+                   *
+                   *    Src0Regfile
+                   *        0 - GRF
+                   *        1 - (Src0.Type == Native Float) ? ARF : Immediate.
+                   *        (Restriction : Only valid ARF type is Accumulator)
+                   *
+                   *    Src1Regfile
+                   *        0 - GRF
+                   *        1 - ARF (Restriction : Only valid ARF type is Accumulator)
+                   *
+                   *    Src2Regfile
+                   *        0 - GRF
+                   *        1 - Immediate
+                   *
+                   * Bspec 3092 r149981 has the same table marked specifically
+                   * for Ice Lake platforms.
+                   *
+                   * Src0 can be ARF only if the type is NF. NF was only ever
+                   * used to emulate the removed PLN instruction. Support for
+                   * this was removed from BRW ages ago.
+                   */
+                  VAL_ASSERT_NE(inst->src[0].file, ARF);
+                  VAL_ASSERT_NE(inst->src[2].file, ARF);
+               } else if (devinfo->verx10 < 200) {
+                  VAL_ASSERT_NE(inst->src[2].file, ARF);
+               } else {
+                  VAL_ASSERT(float_sources == 3 || inst->src[2].file != ARF);
+               }
+
+               if (s.grf_used != 0)
+                  VAL_ASSERT_NE(inst->src[1].file, IMM);
             } else if (s.grf_used != 0) {
                /* Only perform the pre-Gfx10 checks after register allocation
                 * has occured.
@@ -403,8 +451,19 @@ brw_validate(const brw_shader &s)
                 * expectation that later passes (e.g., combine constants) will
                 * fix them.
                 */
+               VAL_ASSERT_NE(inst->dst.file, ARF);
+
                for (unsigned i = 0; i < 3; i++) {
+                  /* Page 850 (page 885 of the PDF) of the Skylake PRM Volume
+                   * 7: 3D-Media-GPGPU says:
+                   *
+                   *    The 3-source instructions have the following restrictions:
+                   *
+                   *    - Only GRF registers can be sources and only GRF
+                   *      registers can be the destination.
+                   */
                   VAL_ASSERT_NE(inst->src[i].file, IMM);
+                  VAL_ASSERT_NE(inst->src[i].file, ARF);
 
                   /* A stride of 1 (the usual case) or 0, with a special
                    * "repctrl" bit, is allowed. The repctrl bit doesn't work
@@ -464,6 +523,16 @@ brw_validate(const brw_shader &s)
              inst->dst.is_accumulator() &&
              phys_subnr(devinfo, inst->dst) == 0) {
             VAL_ASSERT_EQ(inst->dst.hstride, 1);
+         }
+
+         /* Bspec 47367 (r63640) says:
+          *
+          *    Instructions that specify an implicit accumulator source cannot
+          *    specify an explicit accumulator source operand.
+          */
+         if (inst->reads_accumulator_implicitly()) {
+            for (unsigned i = 0; i < inst->sources; i++)
+               VAL_ASSERT(!brw_reg_is_arf(inst->src[i], BRW_ARF_ACCUMULATOR));
          }
 
          if (inst->is_math() && intel_needs_workaround(devinfo, 22016140776)) {

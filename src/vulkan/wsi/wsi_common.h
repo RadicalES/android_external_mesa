@@ -62,6 +62,9 @@ struct wsi_device {
    VkPhysicalDeviceMemoryProperties memory_props;
    uint32_t queue_family_count;
    uint64_t queue_supports_blit;
+   uint64_t queue_supports_timestamps;
+   float timestamp_period;
+   uint32_t timestamp_bits;
 
    VkPhysicalDeviceDrmPropertiesEXT drm_info;
    VkPhysicalDevicePCIBusInfoPropertiesEXT pci_bus_info;
@@ -71,6 +74,15 @@ struct wsi_device {
 
    bool has_import_memory_host;
    bool has_timeline_semaphore;
+   bool has_host_query_reset;
+
+   /** Whether the device uses 32bpp formats for 24bpp
+    *
+    * If true, VkImages created with R8G8B8/B8G8R8 formats will be
+    * exported as 32bpp to the window system, as if they were B8G8R8A8
+    * or R8G8B8A8
+    */
+   bool emulate_24as32;
 
    /** Indicates if wsi_image_create_info::scanout is supported
     *
@@ -118,11 +130,6 @@ struct wsi_device {
        */
       bool ensure_minImageCount;
 
-      /* Wait for fences before submitting buffers to Xwayland. Defaults to
-       * true.
-       */
-      bool xwaylandWaitReady;
-
       /* adds an extra minImageCount when running under xwayland */
       bool extra_xwayland_image;
 
@@ -141,10 +148,18 @@ struct wsi_device {
    } win32;
 
    struct {
+      /* Metal4 requires making CAMetalLayer's residencySet resident for the
+       * queue that will render to it. We need a way to query the queue to
+       * make it possible. */
+      void *(*get_mtl4_command_queue)(VkDevice device);
       VkResult (*bind_drawable_to_vkimage)(VkImage image, void *drawable);
       /* Does not transfer the ownership to the command buffer. The command
        * buffer must retain the drawable to ensure lifespan. */
       void (*encode_drawable_present)(VkCommandBuffer cmd, void *drawable);
+      /* Required to work around Metal4 presentation bug. */
+      void (*cmd_blit_image)(VkCommandBuffer cmd,
+                             const VkBlitImageInfo2 *blit_info,
+                             bool opaque_alpha);
    } metal;
 
 
@@ -201,28 +216,38 @@ struct wsi_device {
    WSI_CB(CmdPipelineBarrier);
    WSI_CB(CmdCopyImage);
    WSI_CB(CmdCopyImageToBuffer);
+   WSI_CB(CmdResetQueryPool);
+   WSI_CB(ResetQueryPoolEXT);
+   WSI_CB(CmdWriteTimestamp);
    WSI_CB(CreateBuffer);
    WSI_CB(CreateCommandPool);
    WSI_CB(CreateFence);
    WSI_CB(CreateImage);
+   WSI_CB(CreateQueryPool);
    WSI_CB(CreateSemaphore);
    WSI_CB(DestroyBuffer);
    WSI_CB(DestroyCommandPool);
    WSI_CB(DestroyFence);
    WSI_CB(DestroyImage);
+   WSI_CB(DestroyQueryPool);
    WSI_CB(DestroySemaphore);
    WSI_CB(EndCommandBuffer);
    WSI_CB(FreeMemory);
    WSI_CB(FreeCommandBuffers);
    WSI_CB(GetBufferMemoryRequirements);
+   WSI_CB(GetCalibratedTimestampsKHR);
    WSI_CB(GetFenceStatus);
    WSI_CB(GetImageDrmFormatModifierPropertiesEXT);
    WSI_CB(GetImageMemoryRequirements);
    WSI_CB(GetImageSubresourceLayout);
    WSI_CB(GetMemoryFdKHR);
+   WSI_CB(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
+   WSI_CB(GetPhysicalDeviceProperties);
    WSI_CB(GetPhysicalDeviceFormatProperties);
    WSI_CB(GetPhysicalDeviceFormatProperties2);
    WSI_CB(GetPhysicalDeviceImageFormatProperties2);
+   WSI_CB(GetPhysicalDeviceQueueFamilyProperties);
+   WSI_CB(GetQueryPoolResults);
    WSI_CB(GetSemaphoreFdKHR);
    WSI_CB(ResetFences);
    WSI_CB(QueueSubmit2);
@@ -241,6 +266,7 @@ typedef PFN_vkVoidFunction (VKAPI_PTR *WSI_FN_GetPhysicalDeviceProcAddr)(VkPhysi
 struct wsi_device_options {
    bool sw_device;
    bool extra_xwayland_image;
+   bool emulate_24as32;
 };
 
 VkResult
@@ -315,7 +341,23 @@ VkImageUsageFlags
 wsi_caps_get_image_usage(void);
 
 bool
+wsi_instance_supports_google_display_timing(const struct vk_instance *instance,
+                                            const struct driOptionCache *dri_options);
+
+bool
 wsi_device_supports_explicit_sync(struct wsi_device *device);
+
+static inline VkImageUsageFlags2KHR
+vk_swapchain_usage_flags(const VkSwapchainCreateInfoKHR *info)
+{
+   const VkImageUsageFlags2CreateInfoKHR *usage2 =
+      vk_find_struct_const(info->pNext,
+                           IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR);
+   if (usage2)
+      return usage2->usage;
+   else
+      return info->imageUsage;
+}
 
 #define wsi_common_vk_warn_once(warning) \
    do { \

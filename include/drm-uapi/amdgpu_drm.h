@@ -494,7 +494,11 @@ struct drm_amdgpu_userq_signal {
 	 * @bo_write_handles.
 	 */
 	__u32	num_bo_write_handles;
-
+	/**
+	 * @syncobj_points: The list of syncobj points submitted by the user queue job
+	 * for the corresponding @syncobj_handles.
+	 */
+	__u64	syncobj_points;
 };
 
 struct drm_amdgpu_userq_fence_info {
@@ -1365,6 +1369,8 @@ struct drm_amdgpu_info_vbios {
 #define AMDGPU_VRAM_TYPE_DDR5  10
 #define AMDGPU_VRAM_TYPE_LPDDR4 11
 #define AMDGPU_VRAM_TYPE_LPDDR5 12
+#define AMDGPU_VRAM_TYPE_HBM3E 13
+#define AMDGPU_VRAM_TYPE_HBM4 14
 
 struct drm_amdgpu_info_device {
 	/** PCI Device ID */

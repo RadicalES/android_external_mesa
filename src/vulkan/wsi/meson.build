@@ -12,13 +12,14 @@ endif
 if with_platform_x11
   files_vulkan_wsi += files('wsi_common_x11.c')
   links_vulkan_wsi += libloader_x11
+  links_vulkan_wsi += libloader
 endif
 
 if with_platform_wayland
   files_vulkan_wsi += files('wsi_common_wayland.c')
   files_vulkan_wsi += wp_files['fifo-v1']
   files_vulkan_wsi += wp_files['commit-timing-v1']
-  files_vulkan_wsi += wp_files['linux-dmabuf-unstable-v1']
+  files_vulkan_wsi += wp_files['linux-dmabuf-v1']
   files_vulkan_wsi += wp_files['presentation-time']
   files_vulkan_wsi += wp_files['tearing-control-v1']
   links_vulkan_wsi += libloader_wayland_helper

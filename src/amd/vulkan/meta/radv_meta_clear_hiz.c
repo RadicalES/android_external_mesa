@@ -7,11 +7,12 @@
 #include "nir/radv_meta_nir.h"
 #include "radv_entrypoints.h"
 #include "radv_meta.h"
+#include "vk_shader_module.h"
 
 static VkResult
-get_clear_hiz_pipeline_layout(struct radv_device *device, VkPipelineLayout *layout_out)
+get_compute_clear_hiz_pipeline_layout(struct radv_device *device, VkPipelineLayout *layout_out)
 {
-   enum radv_meta_object_key_type key = RADV_META_OBJECT_KEY_CLEAR_HIZ;
+   enum radv_meta_object_key_type key = RADV_META_OBJECT_KEY_CLEAR_HIZ_CS;
 
    const VkDescriptorSetLayoutBinding binding = {
       .binding = 0,
@@ -36,25 +37,25 @@ get_clear_hiz_pipeline_layout(struct radv_device *device, VkPipelineLayout *layo
                                       layout_out);
 }
 
-struct radv_clear_hiz_key {
+struct radv_compute_clear_hiz_key {
    enum radv_meta_object_key_type type;
    uint8_t samples;
 };
 
 static VkResult
-get_clear_hiz_pipeline(struct radv_device *device, const struct radv_image *image, VkPipeline *pipeline_out,
-                       VkPipelineLayout *layout_out)
+get_compute_clear_hiz_pipeline(struct radv_device *device, const struct radv_image *image, VkPipeline *pipeline_out,
+                               VkPipelineLayout *layout_out)
 {
    const uint32_t samples = image->vk.samples;
-   struct radv_clear_hiz_key key;
+   struct radv_compute_clear_hiz_key key;
    VkResult result;
 
-   result = get_clear_hiz_pipeline_layout(device, layout_out);
+   result = get_compute_clear_hiz_pipeline_layout(device, layout_out);
    if (result != VK_SUCCESS)
       return result;
 
    memset(&key, 0, sizeof(key));
-   key.type = RADV_META_OBJECT_KEY_CLEAR_HIZ;
+   key.type = RADV_META_OBJECT_KEY_CLEAR_HIZ_CS;
    key.samples = samples;
 
    VkPipeline pipeline_from_cache = vk_meta_lookup_pipeline(&device->meta_state.device, &key, sizeof(key));
@@ -63,7 +64,7 @@ get_clear_hiz_pipeline(struct radv_device *device, const struct radv_image *imag
       return VK_SUCCESS;
    }
 
-   nir_shader *cs = radv_meta_nir_build_clear_hiz_compute_shader(device, samples);
+   nir_shader *cs = radv_meta_nir_build_clear_hiz_compute_shader(samples);
 
    const VkPipelineShaderStageCreateInfo stage_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -87,35 +88,24 @@ get_clear_hiz_pipeline(struct radv_device *device, const struct radv_image *imag
    return result;
 }
 
-void
-radv_clear_hiz(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, const VkImageSubresourceRange *range,
-               uint32_t value)
+static void
+radv_compute_clear_hiz(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
+                       const VkImageSubresourceRange *range, uint32_t value)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radeon_surf *surf = &image->planes[0].surface;
-   struct radv_meta_saved_state saved_state;
    struct radv_image_view iview;
    VkPipelineLayout layout;
    VkPipeline pipeline;
    VkResult result;
 
-   /* Clearing HiZ should only be needed to implement a workaround on GFX12. */
-   assert(image->hiz_valid_offset);
-
-   result = get_clear_hiz_pipeline(device, image, &pipeline, &layout);
+   result = get_compute_clear_hiz_pipeline(device, image, &pipeline, &layout);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd_buffer->vk, result);
       return;
    }
 
-   cmd_buffer->state.flush_bits |=
-      radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, 0, image, range);
-
-   radv_meta_save(&saved_state, cmd_buffer,
-                  RADV_META_SAVE_COMPUTE_PIPELINE | RADV_META_SAVE_DESCRIPTORS | RADV_META_SAVE_CONSTANTS);
-
-   radv_CmdBindPipeline(radv_cmd_buffer_to_handle(cmd_buffer), VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
 
    const uint32_t base_width = surf->u.gfx9.zs.hiz.width_in_tiles;
    const uint32_t base_height = surf->u.gfx9.zs.hiz.height_in_tiles;
@@ -132,7 +122,7 @@ radv_clear_hiz(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, con
                                      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
                                      .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                                      .image = radv_image_to_handle(image),
-                                     .viewType = radv_meta_get_view_type(image),
+                                     .viewType = radv_meta_get_view_type(image, false),
                                      .format = image->vk.format,
                                      .subresourceRange =
                                         {
@@ -160,26 +150,65 @@ radv_clear_hiz(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, con
                                        },
                                     });
 
-         const VkPushConstantsInfo pc_info = {
-            .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
-            .layout = layout,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0,
-            .size = sizeof(value),
-            .pValues = &value,
-         };
-
-         radv_CmdPushConstants2(radv_cmd_buffer_to_handle(cmd_buffer), &pc_info);
+         radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(value), &value);
 
          radv_unaligned_dispatch(cmd_buffer, width, height, 1);
 
          radv_image_view_finish(&iview);
       }
    }
+}
 
-   radv_meta_restore(&saved_state, cmd_buffer);
+static void
+radv_sdma_clear_hiz(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, const VkImageSubresourceRange *range,
+                    uint32_t value)
+{
+   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_cmd_stream *cs = cmd_buffer->cs;
+   const struct gfx12_hiz_layout *hiz = &image->planes[0].surface.u.gfx9.zs.hiz;
+   const uint32_t level_count = vk_image_subresource_level_count(&image->vk, range);
+   const uint32_t layer_count = vk_image_subresource_layer_count(&image->vk, range);
+   const uint32_t last_level = range->baseMipLevel + level_count - 1;
+   const uint64_t clear_offset = hiz->mip_levels[range->baseMipLevel].offset;
+   const uint64_t clear_end = hiz->mip_levels[last_level].offset + hiz->mip_levels[last_level].size;
+
+   radv_cs_add_buffer(device->ws, cs->b, image->bindings[0].bo);
+
+   for (uint32_t layer = 0; layer < layer_count; layer++) {
+      const uint64_t va = image->bindings[0].addr + hiz->offset +
+                          (uint64_t)(range->baseArrayLayer + layer) * hiz->slice_size + clear_offset;
+
+      radv_fill_memory(cmd_buffer, va, clear_end - clear_offset, value, 0, false);
+   }
+}
+
+uint32_t
+radv_clear_hiz(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, const VkImageSubresourceRange *range,
+               uint32_t value)
+{
+   uint32_t flush_bits = 0;
+
+   if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
+      radv_sdma_clear_hiz(cmd_buffer, image, range, value);
+   } else {
+      radv_compute_clear_hiz(cmd_buffer, image, range, value);
+
+      flush_bits |= AC_BARRIER_SYNC_CS | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                                               VK_ACCESS_2_SHADER_WRITE_BIT, 0, image, range);
+   }
+
+   return flush_bits;
+}
+
+void
+radv_expand_hiz_range(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image,
+                      const VkImageSubresourceRange *subresourceRange)
+{
+   struct radv_barrier_data barrier = {0};
+
+   barrier.layout_transitions.htile_hiz_range_expand = 1;
+   radv_describe_layout_transition(cmd_buffer, &barrier);
 
    cmd_buffer->state.flush_bits |=
-      RADV_CMD_FLAG_CS_PARTIAL_FLUSH | radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                                             VK_ACCESS_2_SHADER_WRITE_BIT, 0, image, range);
+      radv_clear_hiz(cmd_buffer, image, subresourceRange, radv_gfx12_get_hiz_initial_value());
 }

@@ -5,6 +5,7 @@
 kk_device_dispatch_table_dependencies = declare_dependency(
   sources : [
     kk_dispatch_trampolines[1],
+    kk_dispatch_cmd[1],
   ],
 )
 
@@ -18,6 +19,7 @@ kk_device_dispatch_table_dependencies_list = [
   idep_vulkan_util,
   idep_vulkan_wsi,
   idep_vulkan_wsi_headers,
+  idep_libkk_shaders_h,
 ]
 
 libkk_device_dispatch_table = static_library(
@@ -30,10 +32,21 @@ libkk_device_dispatch_table = static_library(
   build_by_default : false,
 )
 
+
+libkk_device_cmd_dispatch_table = static_library(
+  'kk_device_cmd_dispatch_table',
+  kk_dispatch_cmd,
+  include_directories : [inc_include, inc_src],
+  dependencies : kk_device_dispatch_table_dependencies_list,
+  c_args : c_msvc_compat_args,
+  gnu_symbol_visibility : 'hidden',
+  build_by_default : false,
+)
+
 idep_kk_device_dispatch_table = declare_dependency(
   # Instruct users of this library to link with --whole-archive.  Otherwise,
   # our weak function overloads may not resolve properly.
-  link_whole : [libkk_device_dispatch_table]
+  link_whole : [libkk_device_dispatch_table, libkk_device_cmd_dispatch_table]
 )
 
 kk_files = files(
@@ -63,8 +76,6 @@ kk_files = files(
   'kk_device_memory.c',
   'kk_device.h',
   'kk_device.c',
-  'kk_encoder.h',
-  'kk_encoder.c',
   'kk_event.h',
   'kk_event.c',
   'kk_format.h',
@@ -77,8 +88,11 @@ kk_files = files(
   'kk_image.c',
   'kk_instance.h',
   'kk_instance.c',
+  'kk_nir_lower_custom_border.c',
   'kk_nir_lower_descriptors.c',
+  'kk_nir_lower_image_view_min_lod.c',
   'kk_nir_lower_multiview.c',
+  'kk_nir_lower_null_images.c',
   'kk_nir_lower_textures.c',
   'kk_nir_lower_vbo.h',
   'kk_nir_lower_vbo.c',
@@ -100,11 +114,6 @@ kk_files = files(
   'kk_wsi.c',
 )
 
-kkcl_files = files(
-  'cl/kk_query.cl',
-  'cl/kk_triangle_fan.cl',
-)
-
 kk_entrypoints = custom_target(
   'kk_entrypoints',
   input : [vk_entrypoints_gen, vk_api_xml],
@@ -119,25 +128,6 @@ kk_entrypoints = custom_target(
 
 relative_dir = fs.relative_to(meson.global_source_root(), meson.global_build_root())
 
-kkcl_spv = custom_target(
-  input : kkcl_files,
-  output : 'kkcl.spv',
-  command : [
-    prog_mesa_clc, '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', kkcl_files, '--',
-    '-I' + join_paths(meson.project_source_root(), 'src/compiler/libcl'),
-    '-I' + join_paths(meson.current_source_dir(), '.'),
-    '-I' + join_paths(meson.project_source_root(), 'src'),
-    cl_args,
-    ],
-  depfile : 'libkk_shaders.h.d',
-)
-
-kkcl = custom_target(
-  input : kkcl_spv,
-  output : ['kkcl.cpp', 'kkcl.h'],
-  command : [prog_vtn_bindgen2, '@INPUT@', '@OUTPUT@'],
-)
-
 kk_deps = [
   idep_nir,
   idep_mesautil,
@@ -148,7 +138,9 @@ kk_deps = [
   kk_device_dispatch_table_dependencies,
   idep_kk_device_dispatch_table,
   idep_msl_to_nir,
-  idep_mtl_bridge
+  idep_mtl_bridge,
+  idep_libkk,
+  idep_libkk_shaders_h,
 ]
 
 libkk = static_library(
@@ -156,7 +148,6 @@ libkk = static_library(
   [
     kk_files,
     kk_entrypoints,
-    kkcl,
     sha1_h,
   ],
   include_directories : [
@@ -185,7 +176,7 @@ kosmickrisp_mesa_icd = custom_target(
   output : 'kosmickrisp_mesa_icd.' + vulkan_manifest_suffix,
   command : [
     prog_python, '@INPUT0@',
-    '--api-version', '1.3', '--xml', '@INPUT1@',
+    '--api-version', '1.4', '--xml', '@INPUT1@',
     '--icd-lib-path', vulkan_icd_lib_path,
     '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
@@ -202,7 +193,7 @@ kosmickrisp_icd = custom_target(
   output : 'kosmickrisp_mesa_devenv_icd.@0@.json'.format(host_machine.cpu()),
   command : [
     prog_python, '@INPUT0@',
-    '--api-version', '1.3', '--xml', '@INPUT1@',
+    '--api-version', '1.4', '--xml', '@INPUT1@',
     '--icd-lib-path', meson.current_build_dir(),
     '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',

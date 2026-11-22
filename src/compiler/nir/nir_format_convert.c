@@ -248,6 +248,38 @@ nir_format_unorm_to_float_precise(nir_builder *b, nir_def *u, const unsigned *bi
    return nir_f2f32(b, nir_fdiv(b, nir_u2f64(b, u), factor));
 }
 
+/*
+ * Exact unorm24 to float conversion
+ *
+ * Since float has 24 bits of mantissa (23 real, 1 implied) we can just barely
+ * represent 24-bit unorm exactly as long as we're careful with the conversion.
+ */
+nir_def *
+nir_format_unorm24_to_float(nir_builder *b, nir_def *u)
+{
+   ASSERTED double factor = 1.0 / ((1 << 24) - 1);
+   float factor_a = 0x1p-24;
+   float factor_b = 0x1p-48;
+   ASSERTED float factor_c = 0x1p-72;
+   assert(factor == (double)factor_a + factor_b + factor_c);
+
+   unsigned old_fp_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_no_reassoc | nir_fp_no_transform;
+
+   nir_def *f = nir_u2f32(b, u);
+   /* f * factor = f * (factor_a + factor_b + factor_c)
+    *            = f * factor_a + f * factor_b + f * factor_c
+    * factor_c is small enough that it will not affect the result.
+    * factor_b does affect the rounding though, so we must include it.
+    */
+   nir_def *res = nir_ffma_weak_imm1(b, f, factor_a,
+                                     nir_fmul_imm(b, f, factor_b));
+
+   b->fp_math_ctrl = old_fp_math_ctrl;
+
+   return res;
+}
+
 nir_def *
 nir_format_snorm_to_float(nir_builder *b, nir_def *s, const unsigned *bits)
 {
@@ -403,7 +435,7 @@ nir_format_unpack_11f11f10f(nir_builder *b, nir_def *packed)
    chans[2] = nir_mask_shift(b, packed, 0xffc00000, -17);
 
    for (unsigned i = 0; i < 3; i++)
-      chans[i] = nir_unpack_half_2x16_split_x(b, chans[i]);
+      chans[i] = nir_f2f32(b, nir_u2u16(b, chans[i]));
 
    return nir_vec(b, chans, 3);
 }
@@ -446,7 +478,7 @@ nir_format_unpack_r9g9b9e5(nir_builder *b, nir_def *packed)
    exp = nir_iadd_imm(b, exp, 127 - RGB9E5_EXP_BIAS - RGB9E5_MANTISSA_BITS);
    nir_def *scale = nir_ishl_imm(b, exp, 23);
 
-   return nir_fmul(b, rgb, scale);
+   return nir_fmul(b, nir_u2f32(b, rgb), scale);
 }
 
 nir_def *
@@ -455,11 +487,10 @@ nir_format_pack_r9g9b9e5(nir_builder *b, nir_def *color)
    /* See also float3_to_rgb9e5 */
 
    /* First, we need to clamp it to range. The fmax(color, 0) will also flush
-    * NaN to 0.  We set exact to ensure that nothing optimizes this behavior
-    * away from us.
+    * NaN to 0.  We set fp_math_ctrl to ensure this.
     */
    unsigned old_fp_math_ctrl = b->fp_math_ctrl;
-   b->fp_math_ctrl |= nir_fp_exact;
+   b->fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
    nir_def *clamped =
       nir_fmin(b, nir_fmax(b, color, nir_imm_float(b, 0)),
                nir_imm_float(b, MAX_RGB9E5));
@@ -608,7 +639,7 @@ nir_format_unpack_rgba(nir_builder *b, nir_def *packed,
       case UTIL_FORMAT_TYPE_FLOAT:
          switch (chan->size) {
          case 16:
-            comps[c] = nir_unpack_half_2x16_split_x(b, raw);
+            comps[c] = nir_f2f32(b, nir_u2u16(b, raw));
             break;
 
          case 32:

@@ -1,24 +1,6 @@
 /*
  * Copyright © 2014 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 /** @file
@@ -229,19 +211,19 @@ negation_exists(nir_const_value v, unsigned bit_size,
 
    case 16:
       if (base_type == float_only)
-         return !util_is_half_nan(v.i16);
+         return !util_is_half_nan(v.i16) && !util_is_half_subnormal(v.i16);
       else
          return v.i16 != 0 && v.i16 != INT16_MIN;
 
    case 32:
       if (base_type == float_only)
-         return !isnan(v.f32);
+         return !isnan(v.f32) && fpclassify(v.f32) != FP_SUBNORMAL;
       else
          return v.i32 != 0 && v.i32 != INT32_MIN;
 
    case 64:
       if (base_type == float_only)
-         return !isnan(v.f64);
+         return !isnan(v.f64) && fpclassify(v.f64) != FP_SUBNORMAL;
       else
          return v.i64 != 0 && v.i64 != INT64_MIN;
 
@@ -1000,7 +982,8 @@ supports_src_as_imm(const struct intel_device_info *devinfo, const brw_inst *ins
 
    case BRW_OPCODE_CSEL:
       /* While MAD can mix F and HF sources on some platforms, CSEL cannot. */
-      return devinfo->ver >= 12 && inst->src[0].type != BRW_TYPE_F;
+      return devinfo->ver >= 12 && src_idx != 1 &&
+             inst->src[0].type != BRW_TYPE_F;
 
    case BRW_OPCODE_MAD:
       switch (devinfo->verx10) {
@@ -1073,15 +1056,17 @@ can_promote_src_as_imm(const struct intel_device_info *devinfo, brw_inst *inst,
    }
    case BRW_TYPE_D:
    case BRW_TYPE_UD: {
-      /* ADD3, CSEL, and MAD can mix signed and unsiged types. Only BFE
-       * cannot. BFN only supports unsigned types.
+      /* ADD3 and MAD can mix signed and unsiged types. Only BFE cannot. BFN
+       * only supports unsigned types.
        */
       if (inst->src[src_idx].type == BRW_TYPE_D ||
           (inst->opcode != BRW_OPCODE_BFE &&
            inst->opcode != BRW_OPCODE_BFN)) {
          int16_t w;
          if (representable_as_w(inst->src[src_idx].d, &w)) {
-            inst->src[src_idx] = brw_imm_w(w);
+            /* CSEL cannot mix type sizes, so use D. */
+            inst->src[src_idx] = inst->opcode == BRW_OPCODE_CSEL ?
+               brw_imm_d(w) : brw_imm_w(w);
             can_promote = true;
             break;
          }
@@ -1096,7 +1081,9 @@ can_promote_src_as_imm(const struct intel_device_info *devinfo, brw_inst *inst,
           inst->opcode != BRW_OPCODE_BFE) {
          uint16_t uw;
          if (representable_as_uw(inst->src[src_idx].ud, &uw)) {
-            inst->src[src_idx] = brw_imm_uw(uw);
+            /* CSEL cannot mix type sizes, so use UD. */
+            inst->src[src_idx] = inst->opcode == BRW_OPCODE_CSEL ?
+               brw_imm_ud(uw) : brw_imm_uw(uw);
             can_promote = true;
             break;
          }
@@ -1126,8 +1113,8 @@ add_candidate_immediate(struct table *table, brw_inst *inst, unsigned ip,
 
    unsigned box_idx = box_instruction(table, const_ctx, inst, ip);
 
-   v->value.u64 = inst->src[i].d64;
    v->bit_size = brw_type_size_bits(inst->src[i].type);
+   v->value = nir_const_value_for_raw_uint(inst->src[i].d64, v->bit_size);
    v->instr_index = box_idx;
    v->src = i;
    v->allow_one_constant = allow_one_constant;
@@ -1167,14 +1154,18 @@ add_candidate_immediate(struct table *table, brw_inst *inst, unsigned ip,
    }
 
    /* It is safe to change the type of the operands of a select instruction
-    * that has no conditional modifier, no source modifiers, and no saturate
-    * modifer.
+    * that has no conditional modifier, no source modifiers, no saturate
+    * modifier, and no accumulators are used. The types of accumulator accesses
+    * cannot be arbitrarily changed.
     */
    if (inst->opcode == BRW_OPCODE_SEL &&
        inst->conditional_mod == BRW_CONDITIONAL_NONE &&
        !inst->src[0].negate && !inst->src[0].abs &&
        !inst->src[1].negate && !inst->src[1].abs &&
-       !inst->saturate) {
+       !inst->saturate &&
+       !inst->src[0].is_accumulator() &&
+       !inst->src[1].is_accumulator() &&
+       !inst->dst.is_accumulator()) {
       v->type = either_type;
    }
 }
@@ -1649,7 +1640,7 @@ brw_opt_combine_constants(brw_shader &s)
             assert(reg->d == table.imm[i].d);
             break;
          case BRW_TYPE_W:
-            assert(abs((int16_t) (reg->d & 0xffff)) == table.imm[i].w);
+            assert(abs((int16_t) (reg->d & 0xffff)) == abs(table.imm[i].w));
             break;
          case BRW_TYPE_UW:
             assert(!link->negate);

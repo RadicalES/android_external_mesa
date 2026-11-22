@@ -238,15 +238,24 @@ static bool lower_resinfo(nir_builder *b, nir_instr *instr, void *data)
    nir_def *result = NULL;
 
    if (instr->type == nir_instr_type_intrinsic &&
-       nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_get_ssbo_size) {
-      /* Lower get_ssbo_size to ssbo_descriptor_amd. */
+       (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_get_ssbo_size ||
+        nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_ssbo_address)) {
+      /* Lower get_ssbo_size/load_ssbo_address to ssbo_descriptor_amd. */
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
 
       b->cursor = nir_before_instr(instr);
 
       nir_def *desc = nir_ssbo_descriptor_amd(b, intr->src[0].ssa,
                                               .access = nir_intrinsic_access(intr));
-      result = nir_channel(b, desc, 2);
+
+      if (intr->intrinsic == nir_intrinsic_get_ssbo_size) {
+         result = nir_u2uN(b, nir_channel(b, desc, 2), nir_instr_def(instr)->bit_size);
+      } else {
+         nir_def *addr_lo = nir_channel(b, desc, 0);
+         nir_def *addr_hi = nir_ibfe_imm(b, nir_channel(b, desc, 1), 0, 16);
+         nir_def *addr = nir_pack_64_2x32_split(b, addr_lo, addr_hi);
+         result = nir_iadd_nuw(b, addr, nir_u2u64(b, intr->src[1].ssa));
+      }
    } else if (instr->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       const struct glsl_type *type;
@@ -288,6 +297,16 @@ static bool lower_resinfo(nir_builder *b, nir_instr *instr, void *data)
                                                   .image_array = is_array);
          break;
 
+      case nir_intrinsic_image_heap_size:
+      case nir_intrinsic_image_heap_samples:
+         dim = nir_intrinsic_image_dim(intr);
+         is_array = nir_intrinsic_image_array(intr);
+         desc = nir_image_heap_descriptor_amd(b, dim == GLSL_SAMPLER_DIM_BUF ? 4 : 8,
+                                              32, intr->src[0].ssa,
+                                              .image_dim = dim,
+                                              .image_array = is_array);
+         break;
+
       default:
          return false;
       }
@@ -296,12 +315,14 @@ static bool lower_resinfo(nir_builder *b, nir_instr *instr, void *data)
       case nir_intrinsic_image_size:
       case nir_intrinsic_image_deref_size:
       case nir_intrinsic_bindless_image_size:
+      case nir_intrinsic_image_heap_size:
          result = lower_query_size(b, desc, NULL, dim, is_array, gfx_level);
          break;
 
       case nir_intrinsic_image_samples:
       case nir_intrinsic_image_deref_samples:
       case nir_intrinsic_bindless_image_samples:
+      case nir_intrinsic_image_heap_samples:
          result = query_samples(b, desc, dim, gfx_level);
          break;
 
@@ -325,6 +346,7 @@ static bool lower_resinfo(nir_builder *b, nir_instr *instr, void *data)
             switch (tex->src[i].src_type) {
             case nir_tex_src_texture_deref:
             case nir_tex_src_texture_handle:
+            case nir_tex_src_texture_heap_offset:
                new_tex = nir_tex_instr_create(b->shader, 1);
                new_tex->op = nir_texop_descriptor_amd;
                new_tex->sampler_dim = tex->sampler_dim;
@@ -374,7 +396,7 @@ static bool lower_resinfo(nir_builder *b, nir_instr *instr, void *data)
       return false;
 
    nir_def *dst = nir_instr_def(instr);
-   assert(dst->bit_size == 32 || dst->bit_size == 16);
+   assert(dst->bit_size >= 16);
    if (dst->bit_size == 16)
       result = nir_u2u16(b, result);
 

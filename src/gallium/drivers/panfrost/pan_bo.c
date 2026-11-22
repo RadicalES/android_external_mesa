@@ -11,6 +11,7 @@
 
 #include "pan_bo.h"
 #include "pan_device.h"
+#include "pan_trace.h"
 #include "pan_util.h"
 #include "wrap.h"
 
@@ -18,7 +19,6 @@
 
 #include "util/u_inlines.h"
 #include "util/u_math.h"
-#include "util/perf/cpu_trace.h"
 
 /* This file implements a userspace BO cache. Allocating and freeing
  * GPU-visible buffers is very expensive, and even the extra kernel roundtrips
@@ -50,6 +50,24 @@ to_kmod_bo_flags(uint32_t flags)
    return kmod_bo_flags;
 }
 
+static void
+reset_bo_slot(struct panfrost_bo *bo)
+{
+   *bo = (struct panfrost_bo){
+      .seqno = bo->seqno,
+   };
+}
+
+UNUSED static bool
+bo_slot_is_free(struct panfrost_bo *bo)
+{
+   struct panfrost_bo expected = {
+      .seqno = bo->seqno,
+   };
+
+   return !memcmp(bo, &expected, sizeof(*bo));
+}
+
 static struct panfrost_bo *
 panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
                   const char *label)
@@ -66,7 +84,7 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
       goto err_alloc;
 
    bo = pan_lookup_bo(dev, kmod_bo->handle);
-   assert(!memcmp(bo, &((struct panfrost_bo){0}), sizeof(*bo)));
+   assert(bo_slot_is_free(bo));
    bo->kmod_bo = kmod_bo;
 
    struct pan_kmod_vm_op vm_op = {
@@ -92,12 +110,12 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
    bo->ptr.gpu = vm_op.va.start;
    bo->flags = flags;
    bo->dev = dev;
+   simple_mtx_init(&bo->lock, mtx_plain);
    return bo;
 
 err_bind:
    pan_kmod_bo_put(kmod_bo);
-   /* BO will be freed with the sparse array, but zero to indicate free */
-   memset(bo, 0, sizeof(*bo));
+   reset_bo_slot(bo);
 err_alloc:
    return NULL;
 }
@@ -105,14 +123,19 @@ err_alloc:
 static void
 panfrost_bo_free(struct panfrost_bo *bo)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
 
    struct pan_kmod_bo *kmod_bo = bo->kmod_bo;
    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
    uint64_t gpu_va = bo->ptr.gpu;
 
+   /* reset_bo_slot() will undo the poisoning done in simple_mtx_destroy(), but
+    * we need it for the valgrind annotation.
+    */
+   simple_mtx_destroy(&bo->lock);
+
    /* BO will be freed with the sparse array, but zero to indicate free */
-   memset(bo, 0, sizeof(*bo));
+   reset_bo_slot(bo);
 
    struct pan_kmod_vm_op vm_op = {
       .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
@@ -128,42 +151,6 @@ panfrost_bo_free(struct panfrost_bo *bo)
    assert(!ret);
 
    pan_kmod_bo_put(kmod_bo);
-}
-
-/* Returns true if the BO is ready, false otherwise.
- * access_type is encoding the type of access one wants to ensure is done.
- * Waiting is always done for writers, but if wait_readers is set then readers
- * are also waited for.
- */
-bool
-panfrost_bo_wait(struct panfrost_bo *bo, int64_t timeout_ns, bool wait_readers)
-{
-   MESA_TRACE_FUNC();
-
-   /* If the BO has been exported or imported we can't rely on the cached
-    * state, we need to call the WAIT_BO ioctl.
-    */
-   if (!(bo->flags & PAN_BO_SHARED)) {
-      /* If ->gpu_access is 0, the BO is idle, no need to wait. */
-      if (!bo->gpu_access)
-         return true;
-
-      /* If the caller only wants to wait for writers and no
-       * writes are pending, we don't have to wait.
-       */
-      if (!wait_readers && !(bo->gpu_access & PAN_BO_ACCESS_WRITE))
-         return true;
-   }
-
-   if (pan_kmod_bo_wait(bo->kmod_bo, timeout_ns, !wait_readers)) {
-      /* Set gpu_access to 0 so that the next call to bo_wait()
-       * doesn't have to call the WAIT_BO ioctl.
-       */
-      bo->gpu_access = 0;
-      return true;
-   }
-
-   return false;
 }
 
 /* Helper to calculate the bucket index of a BO */
@@ -320,13 +307,13 @@ panfrost_bo_cache_evict_all(struct panfrost_device *dev)
 int
 panfrost_bo_mmap(struct panfrost_bo *bo)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
 
    if (bo->ptr.cpu)
       return 0;
 
-   bo->ptr.cpu = pan_kmod_bo_mmap(bo->kmod_bo, 0, panfrost_bo_size(bo),
-                                  PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+   bo->ptr.cpu =
+      pan_kmod_bo_mmap(bo->kmod_bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
    if (bo->ptr.cpu == MAP_FAILED) {
       bo->ptr.cpu = NULL;
       return -1;
@@ -338,7 +325,7 @@ panfrost_bo_mmap(struct panfrost_bo *bo)
 static void
 panfrost_bo_munmap(struct panfrost_bo *bo)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
 
    if (!bo->ptr.cpu)
       return;
@@ -356,7 +343,8 @@ panfrost_bo_create(struct panfrost_device *dev, size_t size, uint32_t flags,
                    const char *label)
 {
    assert(label);
-   MESA_TRACE_SCOPE("%s size=%zu label=\"%s\"", __func__, size, label);
+   PAN_TRACE_SCOPE(PAN_TRACE_GL_BO, "%s size=%zu label=\"%s\"", __func__,
+                   size, label);
 
    struct panfrost_bo *bo;
 
@@ -419,6 +407,7 @@ panfrost_bo_create(struct panfrost_device *dev, size_t size, uint32_t flags,
    }
 
    panfrost_bo_set_label(bo, label);
+   bo->seqno++;
 
    return bo;
 }
@@ -438,19 +427,23 @@ panfrost_bo_unreference(struct panfrost_bo *bo)
    if (!bo)
       return;
 
+   struct panfrost_device *dev = bo->dev;
+
    /* Don't return to cache if there are still references */
    assert(p_atomic_read(&bo->refcnt) > 0);
    if (p_atomic_dec_return(&bo->refcnt))
       return;
 
-   struct panfrost_device *dev = bo->dev;
-
    pthread_mutex_lock(&dev->bo_map_lock);
 
    /* Someone might have imported this BO while we were waiting for the
     * lock, let's make sure it's still not referenced before freeing it.
+    * We also need to check bo->dev again, because it might be that the
+    * counter got briefly increased and decreased by the other thread
+    * which also managed to acquire the lock before us. In that case,
+    * the slot has been returned already.
     */
-   if (p_atomic_read(&bo->refcnt) == 0) {
+   if (bo->dev && p_atomic_read(&bo->refcnt) == 0) {
       /* When the reference count goes to zero, we need to cleanup */
       panfrost_bo_munmap(bo);
 
@@ -470,19 +463,27 @@ panfrost_bo_unreference(struct panfrost_bo *bo)
 struct panfrost_bo *
 panfrost_bo_import(struct panfrost_device *dev, int fd)
 {
+   PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
+
    struct panfrost_bo *bo;
-   ASSERTED int ret;
+   struct pan_kmod_bo *kmod_bo;
    unsigned gem_handle;
 
    pthread_mutex_lock(&dev->bo_map_lock);
-   ret = drmPrimeFDToHandle(dev->kmod.dev->fd, fd, &gem_handle);
-   assert(!ret);
+   /* Import via pan_kmod_bo_import - it handles drmPrimeFDToHandle internally */
+   kmod_bo = pan_kmod_bo_import(dev->kmod.dev, fd);
+   if (!kmod_bo) {
+      pthread_mutex_unlock(&dev->bo_map_lock);
+      return NULL;
+   }
 
+   /* Look up panfrost_bo by the GEM handle from kmod_bo */
+   gem_handle = pan_kmod_bo_handle(kmod_bo);
    bo = pan_lookup_bo(dev, gem_handle);
 
    if (!bo->dev) {
       bo->dev = dev;
-      bo->kmod_bo = pan_kmod_bo_import(dev->kmod.dev, fd, 0);
+      bo->kmod_bo = kmod_bo; /* Take ownership of kmod_bo reference */
 
       struct pan_kmod_vm_op vm_op = {
          .type = PAN_KMOD_VM_OP_TYPE_MAP,
@@ -510,20 +511,22 @@ panfrost_bo_import(struct panfrost_device *dev, int fd)
       if ((dev->debug & PAN_DBG_DUMP) && panfrost_bo_mmap(bo))
          mesa_loge("failed to mmap");
    } else {
-      /* bo->refcnt == 0 can happen if the BO
-       * was being released but panfrost_bo_import() acquired the
-       * lock before panfrost_bo_unreference(). In that case, refcnt
-       * is 0 and we can't use panfrost_bo_reference() directly, we
-       * have to re-initialize the refcnt().
-       * Note that panfrost_bo_unreference() checks
-       * refcnt value just after acquiring the lock to
-       * make sure the object is not freed if panfrost_bo_import()
-       * acquired it in the meantime.
+      /* pan_kmod_bo_import already incremented kmod_bo->refcnt,
+       * but we already have a reference in bo->kmod_bo,
+       * so release this extra kmod_bo reference.
        */
-      if (p_atomic_read(&bo->refcnt) == 0)
-         p_atomic_set(&bo->refcnt, 1);
-      else
-         panfrost_bo_reference(bo);
+      pan_kmod_bo_put(kmod_bo);
+
+      /* We can't use panfrost_bo_reference() here because we might
+       * be racing with panfrost_bo_unreference() which released
+       * the ref it had but didn't acquire the lock to release the
+       * slot yet. It's safe to unconditionally increment the counter
+       * without checking if it's > 0 in that case, because we have
+       * the lock held, and we know panfrost_bo_unreference() will
+       * back off after acquiring the lock if it sees a refcnt > 0.
+       */
+      assert(p_atomic_read(&bo->refcnt) >= 0);
+      p_atomic_inc(&bo->refcnt);
    }
    pthread_mutex_unlock(&dev->bo_map_lock);
 
@@ -533,9 +536,14 @@ panfrost_bo_import(struct panfrost_device *dev, int fd)
 int
 panfrost_bo_export(struct panfrost_bo *bo)
 {
+   PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
+
    int ret = pan_kmod_bo_export(bo->kmod_bo);
-   if (ret >= 0)
+   if (ret >= 0) {
+      simple_mtx_lock(&bo->lock);
       bo->flags |= PAN_BO_SHARED;
+      simple_mtx_unlock(&bo->lock);
+   }
 
    return ret;
 }
@@ -557,12 +565,15 @@ const char *
 panfrost_bo_replace_label(struct panfrost_bo *bo, const char *label,
                           bool set_kernel_label)
 {
+   simple_mtx_lock(&bo->lock);
    const char *old_label = bo->label;
 
    bo->label = label;
 
    if (set_kernel_label)
       pan_kmod_set_bo_label(bo->dev->kmod.dev, bo->kmod_bo, label);
+
+   simple_mtx_unlock(&bo->lock);
 
    return old_label;
 }

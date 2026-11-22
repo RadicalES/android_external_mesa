@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2019 Alyssa Rosenzweig <alyssa@rosenzweig.io>
+ * Copyright (C) 2018-2019 Alyssa Rosenzweig
  * Copyright (C) 2019-2020 Collabora, Ltd.
  * SPDX-License-Identifier: MIT
  */
@@ -994,7 +994,7 @@ emit_binary_bundle(compiler_context *ctx, midgard_block *block,
 
       mir_pack_swizzle_tex(ins);
 
-      if (!(ctx->quirks & MIDGARD_NO_OOO))
+      if (ctx->inputs->arch >= 5)
          mir_pack_tex_ooo(block, bundle, ins);
 
       unsigned osz = nir_alu_type_get_type_size(ins->dest_type);

@@ -3,10 +3,10 @@
 
 #![allow(unused_macros)]
 
-extern crate bitview;
+extern crate mesa_util;
 extern crate nvidia_headers;
 
-use bitview::*;
+use mesa_util::bitview::*;
 use nil_rs_bindings::*;
 use nvidia_headers::classes::cl9097::tex as cl9097;
 use nvidia_headers::classes::cl9097::FERMI_A;
@@ -521,7 +521,7 @@ fn nvb097_fill_image_view_desc(
 
     th.set_field(clb097::TEXHEAD_BL_S_R_G_B_CONVERSION, view.format.is_srgb());
 
-    set_enum!(th, clb097, TEXHEAD_BL_SECTOR_PROMOTION, PROMOTE_TO_2_V);
+    set_enum!(th, clb097, TEXHEAD_BL_SECTOR_PROMOTION, NO_PROMOTION);
     set_enum!(th, clb097, TEXHEAD_BL_BORDER_SIZE, BORDER_SAMPLER_COLOR);
 
     // In the sampler, the two options for FLOAT_COORD_NORMALIZATION are:
@@ -703,7 +703,7 @@ fn nvcb97_fill_image_view_desc(
         view.format.is_srgb(),
     );
 
-    set_enum!(th, clcb97, TEXHEAD_V2_BL_SECTOR_PROMOTION, PROMOTE_TO_2_V);
+    set_enum!(th, clcb97, TEXHEAD_V2_BL_SECTOR_PROMOTION, NO_PROMOTION);
     set_enum!(th, clcb97, TEXHEAD_V2_BL_BORDER_SOURCE, BORDER_COLOR);
 
     // In the sampler, the two options for FLOAT_COORD_NORMALIZATION are:
@@ -802,7 +802,7 @@ fn nvb097_nil_fill_buffer_desc(
     set_enum!(th, clb097, TEXHEAD_1D_TEXTURE_TYPE, ONE_D_BUFFER);
 
     // TODO: Do we need this?
-    set_enum!(th, clb097, TEXHEAD_1D_SECTOR_PROMOTION, PROMOTE_TO_2_V);
+    set_enum!(th, clb097, TEXHEAD_1D_SECTOR_PROMOTION, NO_PROMOTION);
 }
 
 fn nvcb97_nil_fill_buffer_desc(
@@ -833,7 +833,7 @@ fn nvcb97_nil_fill_buffer_desc(
     th.set_field(clcb97::TEXHEAD_V2_1DRT_WIDTH_MINUS_ONE, num_elements - 1);
 
     // TODO: Do we need this?
-    set_enum!(th, clcb97, TEXHEAD_1D_SECTOR_PROMOTION, PROMOTE_TO_2_V);
+    set_enum!(th, clcb97, TEXHEAD_1D_SECTOR_PROMOTION, NO_PROMOTION);
 }
 
 pub const ZERO_SWIZZLE: [nil_rs_bindings::pipe_swizzle; 4] = [
@@ -1003,7 +1003,7 @@ impl Descriptor {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nil_image_view_descriptor(
     dev: &nil_rs_bindings::nv_device_info,
     image: &Image,
@@ -1013,7 +1013,7 @@ pub extern "C" fn nil_image_view_descriptor(
     Descriptor::image_view(dev, image, view, base_address)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nil_buffer_descriptor(
     dev: &nil_rs_bindings::nv_device_info,
     base_address: u64,
@@ -1023,7 +1023,7 @@ pub extern "C" fn nil_buffer_descriptor(
     Descriptor::buffer(dev, base_address, format, num_elements)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn nil_null_descriptor(
     dev: &nil_rs_bindings::nv_device_info,
     zero_page_address: u64,

@@ -302,6 +302,11 @@ export_fs_mrtz(isel_context* ctx, const struct aco_ps_epilog_info* info, Temp de
    const unsigned format =
       ac_get_spi_shader_z_format(depth.id(), stencil.id(), samplemask.id(), alpha.id());
    assert(format != V_028710_SPI_SHADER_ZERO);
+   /* The chosen format must be the same as the caller's format if the caller knows it.
+    * (radeonsi doesn't)
+    */
+   assert(info->spi_shader_z_format == ACO_SPI_SHADER_Z_FORMAT_UNKNOWN ||
+          info->spi_shader_z_format == format);
 
    /* Both stencil and sample mask only need 16-bits. */
    if (format == V_028710_SPI_SHADER_UINT16_ABGR) {
@@ -405,9 +410,26 @@ select_ps_epilog(Program* program, void* pinfo, ac_shader_config* config,
       emit_clamp_alpha_test(&ctx, einfo, colors[i], i);
    }
 
+   assert(einfo->samplemask.used ||
+          (!einfo->kill_samplemask && !einfo->lower_1bit_sample_mask_to_discard));
+   assert(einfo->kill_samplemask + einfo->lower_1bit_sample_mask_to_discard <= 1);
+
+   if (einfo->samplemask.used && einfo->lower_1bit_sample_mask_to_discard) {
+      Temp samplemask = get_arg(&ctx, einfo->samplemask);
+
+      /* Discard if (samplemask & 0x1) == 0. */
+      samplemask = bld.vop2(aco_opcode::v_and_b32, bld.def(v1), Operand::c32(1), samplemask);
+      Temp cond = bld.vopc(aco_opcode::v_cmp_eq_u32, bld.def(bld.lm), Operand::c32(0), samplemask);
+
+      bld.pseudo(aco_opcode::p_discard_if, cond);
+      ctx.block->kind |= block_kind_uses_discard;
+      ctx.program->needs_exact = true;
+   }
+
    bool has_mrtz_depth = einfo->depth.used && !einfo->kill_depth;
    bool has_mrtz_stencil = einfo->stencil.used && !einfo->kill_stencil;
-   bool has_mrtz_samplemask = einfo->samplemask.used && !einfo->kill_samplemask;
+   bool has_mrtz_samplemask = einfo->samplemask.used && !einfo->kill_samplemask &&
+                              !einfo->lower_1bit_sample_mask_to_discard;
    bool has_mrtz_export =
       has_mrtz_depth || has_mrtz_stencil || has_mrtz_samplemask || has_mrtz_alpha;
    if (has_mrtz_export) {
@@ -449,8 +471,17 @@ select_ps_epilog(Program* program, void* pinfo, ac_shader_config* config,
    }
 
    if (mrt_num) {
+      if (einfo->mrt0_is_dual_src && mrt_num == 1) {
+         mrts[mrt_num++] = mrts[0];
+         std::fill(mrts[1].out, mrts[1].out + 3, Operand(v1));
+         u_foreach_bit (i, mrts[1].enabled_channels)
+            mrts[1].out[i] = bld.copy(bld.def(v1), Operand::c32(0));
+         if (einfo->colors[1].used)
+            std::swap(mrts[0], mrts[1]);
+         mrts[1].target++;
+      }
+
       if (ctx.options->gfx_level >= GFX11 && einfo->mrt0_is_dual_src) {
-         assert(mrt_num == 2);
          create_fs_dual_src_export_gfx11(&ctx, &mrts[0], &mrts[1]);
       } else {
          for (unsigned i = 0; i < mrt_num; i++)

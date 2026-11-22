@@ -33,6 +33,7 @@
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 #include "util/u_math.h"
+#include "util/u_memset.h"
 #include "util/u_thread.h"
 #include "util/xmlconfig.h"
 #include "vk_alloc.h"
@@ -127,6 +128,8 @@ enum vn_debug {
    VN_DEBUG_NO_SECOND_QUEUE = 1ull << 9,
    VN_DEBUG_NO_RAY_TRACING = 1ull << 10,
    VN_DEBUG_MEM_BUDGET = 1ull << 11,
+   VN_DEBUG_NO_DESC_HEAP = 1ull << 12,
+   VN_DEBUG_NO_DRM_SYNCOBJ = 1ull << 13,
 };
 
 enum vn_perf {
@@ -134,7 +137,6 @@ enum vn_perf {
    VN_PERF_NO_ASYNC_BUFFER_CREATE = 1ull << 1,
    VN_PERF_NO_ASYNC_QUEUE_SUBMIT = 1ull << 2,
    VN_PERF_NO_EVENT_FEEDBACK = 1ull << 3,
-   VN_PERF_NO_FENCE_FEEDBACK = 1ull << 4,
    VN_PERF_NO_CMD_BATCHING = 1ull << 6,
    VN_PERF_NO_SEMAPHORE_FEEDBACK = 1ull << 7,
    VN_PERF_NO_QUERY_FEEDBACK = 1ull << 8,
@@ -144,6 +146,7 @@ enum vn_perf {
    VN_PERF_NO_ASYNC_IMAGE_CREATE = 1ull << 12,
    VN_PERF_NO_ASYNC_IMAGE_FORMAT = 1ull << 13,
    VN_PERF_NO_ASYNC_PRESENT = 1ull << 14,
+   VN_PERF_NO_TIMELINE_SYNC = 1ull << 15,
 };
 
 typedef uint64_t vn_object_id;
@@ -235,7 +238,6 @@ enum vn_relax_reason {
    VN_RELAX_REASON_RING_SEQNO,
    VN_RELAX_REASON_TLS_RING_SEQNO,
    VN_RELAX_REASON_RING_SPACE,
-   VN_RELAX_REASON_FENCE,
    VN_RELAX_REASON_SEMAPHORE,
    VN_RELAX_REASON_QUERY,
 };
@@ -272,6 +274,7 @@ struct vn_relax_state {
    uint32_t iter;
    const struct vn_relax_profile profile;
    const char *reason_str;
+   bool warn;
 };
 
 /* TLS ring
@@ -390,6 +393,16 @@ vn_get_next_obj_id(void)
 uint32_t
 vn_extension_get_spec_version(const char *name);
 
+static inline int
+vn_timeout_to_poll_timeout(uint64_t timeout)
+{
+   const uint64_t ns_per_ms = 1000000;
+   const uint64_t ms = (timeout + ns_per_ms - 1) / ns_per_ms;
+   if (!ms && timeout)
+      return -1;
+   return ms <= INT_MAX ? ms : -1;
+}
+
 static inline void
 vn_watchdog_init(struct vn_watchdog *watchdog)
 {
@@ -428,6 +441,12 @@ vn_relax(struct vn_relax_state *state);
 
 void
 vn_relax_fini(struct vn_relax_state *state);
+
+static inline bool
+vn_relax_warn(struct vn_relax_state *state)
+{
+   return state->warn;
+}
 
 static_assert(sizeof(vn_object_id) >= sizeof(uintptr_t), "");
 
@@ -663,13 +682,13 @@ vn_tls_destroy_ring(struct vn_tls_ring *tls_ring);
 static inline uint32_t
 vn_cache_key_hash_function(const void *key)
 {
-   return _mesa_hash_data(key, SHA1_DIGEST_LENGTH);
+   return _mesa_hash_data(key, BLAKE3_KEY_LEN);
 }
 
 static inline bool
 vn_cache_key_equal_function(const void *key1, const void *key2)
 {
-   return memcmp(key1, key2, SHA1_DIGEST_LENGTH) == 0;
+   return memcmp(key1, key2, BLAKE3_KEY_LEN) == 0;
 }
 
 static inline void

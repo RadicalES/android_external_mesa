@@ -250,6 +250,8 @@ va_pack_widen(const bi_instr *I, enum bi_swizzle swz, enum va_size size)
       switch (swz) {
       case BI_SWIZZLE_B0123:
          return VA_SWIZZLES_8_BIT_B0123;
+      case BI_SWIZZLE_B3210:
+         return VA_SWIZZLES_8_BIT_B3210;
       case BI_SWIZZLE_B0101:
          return VA_SWIZZLES_8_BIT_B0101;
       case BI_SWIZZLE_B2323:
@@ -324,6 +326,25 @@ va_pack_widen(const bi_instr *I, enum bi_swizzle swz, enum va_size size)
          return VA_SWIZZLES_32_BIT_B3;
       default:
          invalid_instruction(I, "32-bit widen");
+      }
+   } else if (size == VA_SIZE_64) {
+      switch (swz) {
+      case BI_SWIZZLE_H01:
+         return VA_SWIZZLES_64_BIT_NONE;
+      case BI_SWIZZLE_H0:
+         return VA_SWIZZLES_64_BIT_H0;
+      case BI_SWIZZLE_H1:
+         return VA_SWIZZLES_64_BIT_H1;
+      case BI_SWIZZLE_B0:
+         return VA_SWIZZLES_64_BIT_B0;
+      case BI_SWIZZLE_B1:
+         return VA_SWIZZLES_64_BIT_B1;
+      case BI_SWIZZLE_B2:
+         return VA_SWIZZLES_64_BIT_B2;
+      case BI_SWIZZLE_B3:
+         return VA_SWIZZLES_64_BIT_B3;
+      default:
+         invalid_instruction(I, "64-bit widen");
       }
    } else {
       invalid_instruction(I, "type size for widen");
@@ -547,6 +568,10 @@ va_pack_alu(const bi_instr *I, unsigned arch)
       hex |= ((uint64_t)I->sample) << 38;
       break;
 
+   case BI_OPCODE_LD_VAR_BUF_FLAT_IMM:
+      hex |= ((uint64_t)I->index) << 8;
+      break;
+
    case BI_OPCODE_LD_ATTR_IMM:
       hex |= ((uint64_t)I->table) << 16;
       hex |= ((uint64_t)I->attribute_index) << 20;
@@ -737,35 +762,21 @@ va_pack_load(const bi_instr *I, bool buffer_descriptor)
       hex |= va_pack_byte_offset(I);
 
    hex |= (uint64_t)va_pack_src(I, 0) << 0;
+   hex |= (uint64_t)I->mem_access << 24;
 
    if (buffer_descriptor)
       hex |= (uint64_t)va_pack_src(I, 1) << 8;
 
    return hex;
 }
-
-static uint64_t
-va_pack_memory_access(const bi_instr *I)
-{
-   switch (I->seg) {
-   case BI_SEG_TL:
-      return VA_MEMORY_ACCESS_FORCE;
-   case BI_SEG_POS:
-      return VA_MEMORY_ACCESS_ISTREAM;
-   case BI_SEG_VARY:
-      return VA_MEMORY_ACCESS_ESTREAM;
-   default:
-      return VA_MEMORY_ACCESS_NONE;
-   }
-}
-
 static uint64_t
 va_pack_store(const bi_instr *I)
 {
-   uint64_t hex = va_pack_memory_access(I) << 24;
+   uint64_t hex = 0;
 
    va_validate_register_pair(I, 1);
    hex |= (uint64_t)va_pack_src(I, 1) << 0;
+   hex |= I->mem_access << 24;
 
    hex |= va_pack_byte_offset(I);
 
@@ -971,15 +982,18 @@ va_pack_instr(const bi_instr *I, unsigned arch)
 
       /* Conversion descriptor */
       hex |= (uint64_t)va_pack_src(I, 2) << 16;
-      hex |= va_pack_memory_access(I) << 37;
+      hex |= (uint64_t)I->mem_access << 37;
       break;
 
    case BI_OPCODE_ST_CVT:
       /* Staging read */
-      hex |= va_pack_store(I);
+      va_validate_register_pair(I, 1);
+      hex |= (uint64_t)va_pack_src(I, 1) << 0;
+      hex |= va_pack_byte_offset(I);
 
       /* Conversion descriptor */
       hex |= (uint64_t)va_pack_src(I, 3) << 16;
+      hex |= (uint64_t)I->mem_access << 37;
       break;
 
    case BI_OPCODE_BLEND: {
@@ -1033,8 +1047,11 @@ va_pack_instr(const bi_instr *I, unsigned arch)
          hex |= (1ull << 46);
 
       if (I->op == BI_OPCODE_TEX_GRADIENT) {
-         if (I->force_delta_enable)
+         if (I->force_delta_enable) {
+            if (arch < 10)
+               invalid_instruction(I, "gradient instruction does not support .force_delta_enable");
             hex |= (1ull << 12);
+         }
          if (I->lod_bias_disable)
             hex |= (1ull << 13);
          if (I->lod_clamp_disable)
@@ -1166,15 +1183,20 @@ va_lower_blend(bi_context *ctx)
 
       unsigned prolog_length = 2 * 8;
 
-      /* By ABI, r48 is the link register shared with blend shaders */
-      assert(bi_is_equiv(I->dest[0], bi_register(48)));
+      /* By ABI, the preload blend link register is shared with blend
+       * shaders */
+      assert(bi_is_equiv(I->dest[0], bi_register(bi_preload_reg(
+                                        BI_PRELOAD_BLEND_LINK, ctx->arch))));
 
-      if (I->flow == VA_FLOW_END)
-         bi_iadd_imm_i32_to(&b, I->dest[0], va_zero_lut(), 0);
-      else
-         bi_iadd_imm_i32_to(&b, I->dest[0], pc, prolog_length - 8);
+      bi_instr *link =
+         (I->flow == VA_FLOW_END)
+            ? bi_iadd_imm_i32_to(&b, I->dest[0], va_zero_lut(), 0)
+            : bi_iadd_imm_i32_to(&b, I->dest[0], pc, prolog_length - 8);
 
-      bi_branchzi(&b, va_zero_lut(), I->src[3], BI_CMPF_EQ);
+      bi_instr *call = bi_branchzi(&b, va_zero_lut(), I->src[3], BI_CMPF_EQ);
+
+      link->is_blend_prologue = true;
+      call->is_blend_prologue = true;
 
       /* For fixed function: skip the prologue, or return */
       if (I->flow != VA_FLOW_END)
@@ -1193,6 +1215,31 @@ bi_pack_valhall(bi_context *ctx, struct util_dynarray *emission)
    if (ctx->stage == MESA_SHADER_FRAGMENT && !ctx->inputs->is_blend)
       va_lower_blend(ctx);
 
+   bool has_pool = false;
+   unsigned num_instrs = 0;
+
+   bi_foreach_block(ctx, block) {
+      bi_foreach_instr_in_block(block, I) {
+         has_pool |= I->patch_imm_const_offset;
+         num_instrs++;
+      }
+   }
+
+   unsigned pool_offset = ALIGN_POT(num_instrs * 8 + 8, 128);
+
+   if (has_pool) {
+      assert(ctx->nir->constant_data_size);
+
+      unsigned idx = 0;
+      bi_foreach_block(ctx, block) {
+         bi_foreach_instr_in_block(block, I) {
+            if (I->patch_imm_const_offset)
+               I->index += pool_offset - (idx + 1) * 8;
+            idx++;
+         }
+      }
+   }
+
    bi_foreach_block(ctx, block) {
       bi_foreach_instr_in_block(block, I) {
          if (I->op == BI_OPCODE_BRANCHZ_I16)
@@ -1201,6 +1248,16 @@ bi_pack_valhall(bi_context *ctx, struct util_dynarray *emission)
          uint64_t hex = va_pack_instr(I, ctx->arch);
          util_dynarray_append(emission, hex);
       }
+   }
+
+   if (has_pool) {
+      unsigned pad = (orig_size + pool_offset) - emission->size;
+      memset(util_dynarray_grow(emission, uint8_t, pad), 0, pad);
+      memcpy(
+         util_dynarray_grow(emission, uint8_t, ctx->nir->constant_data_size),
+         ctx->nir->constant_data, ctx->nir->constant_data_size);
+      ctx->constant_pool_size_B = ctx->nir->constant_data_size;
+      ctx->constant_pool_offset_B = pool_offset;
    }
 
    /* Pad with zeroes, but keep empty programs empty so they may be omitted

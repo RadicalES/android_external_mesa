@@ -26,6 +26,8 @@
 #include "sfn_shader_gs.h"
 #include "sfn_shader_tess.h"
 #include "sfn_shader_vs.h"
+
+#include "pipe/p_shader_tokens.h"
 #include "util/u_math.h"
 
 #include <numeric>
@@ -117,8 +119,8 @@ ShaderInput::do_print(std::ostream& os) const
 }
 
 void
-ShaderInput::set_interpolator(int interp,
-                              int interp_loc,
+ShaderInput::set_interpolator(glsl_interp_mode interp,
+                              r600_interp_location interp_loc,
                               bool uses_interpolate_at_centroid)
 {
    m_interpolator = interp;
@@ -134,13 +136,13 @@ ShaderInput::set_uses_interpolate_at_centroid()
 
 int64_t Shader::s_next_shader_id = 1;
 
-Shader::Shader(const char *type_id, unsigned atomic_base):
+Shader::Shader(const char *type_id, struct dynamic_offset dynamic_offset):
     m_current_block(nullptr),
     m_type_id(type_id),
     m_chip_class(ISA_CC_R600),
     m_next_block(0),
-    m_atomic_base(atomic_base),
-    m_shader_id(s_next_shader_id++)
+    m_shader_id(s_next_shader_id++),
+    m_dynamic_offset(dynamic_offset)
 {
    m_instr_factory = new InstrFactory();
    m_chain_instr.this_shader = this;
@@ -259,8 +261,8 @@ Shader::read_input(std::istream& is)
 {
    ShaderInput input;
 
-   int interp = 0;
-   int interp_loc = 0;
+   glsl_interp_mode interp = INTERP_MODE_NONE;
+   r600_interp_location interp_loc = R600_INTERP_LOC_SAMPLE;
    bool use_centroid = false;
 
    std::string token;
@@ -274,10 +276,10 @@ Shader::read_input(std::istream& is)
          input.set_no_varying(true);
       else if (int_from_string_with_prefix_optional(token, "SYSVALUE:", value))
          input.set_system_value(static_cast<gl_system_value>(value));
-      else if (int_from_string_with_prefix_optional(token, "INTERP:", interp))
-         ;
-      else if (int_from_string_with_prefix_optional(token, "ILOC:", interp_loc))
-         ;
+      else if (token.compare(0, 7, "INTERP:") == 0)
+         interp = static_cast<glsl_interp_mode>(atoi(token.c_str() + 7));
+      else if (token.compare(0, 5, "ILOC:") == 0)
+         interp_loc = static_cast<r600_interp_location>(atoi(token.c_str() + 5));
       else if (token == "USE_CENTROID")
          use_centroid = true;
       else {
@@ -506,7 +508,8 @@ Shader::value_factory()
 bool
 Shader::process(nir_shader *nir)
 {
-   m_ssbo_image_offset = nir->info.num_images;
+   clamp_dynamic_offset(nir->info.num_images);
+   m_shader_stage = nir->info.stage;
 
    if (nir->info.use_legacy_math_rules)
       set_flag(sh_legacy_math_rules);
@@ -579,15 +582,12 @@ Shader::scan_uniforms(nir_variable *uniform)
       int natomics = glsl_atomic_size(uniform->type) / 4; /* ATOMIC_COUNTER_SIZE */
       m_nhwatomic += natomics;
 
-      if (glsl_type_is_array(uniform->type))
-         m_indirect_files |= 1 << TGSI_FILE_HW_ATOMIC;
-
       m_flags.set(sh_uses_atomics);
 
       r600_shader_atomic atom = {0};
 
       atom.resource_id = uniform->data.binding;
-      atom.hw_idx = m_atomic_base + m_next_hwatomic_loc;
+      atom.hw_idx = m_next_hwatomic_loc;
 
       atom.start = uniform->data.offset >> 2;
       atom.count = natomics;
@@ -606,9 +606,7 @@ Shader::scan_uniforms(nir_variable *uniform)
 
    auto type = glsl_without_array(uniform->type);
    if (glsl_type_is_image(type) || uniform->data.mode == nir_var_mem_ssbo) {
-      m_flags.set(sh_uses_images);
-      if (glsl_type_is_array(uniform->type) && !(uniform->data.mode == nir_var_mem_ssbo))
-         m_indirect_files |= 1 << TGSI_FILE_IMAGE;
+      m_flags.set(sh_uses_images);      
    }
 
    return true;
@@ -931,6 +929,10 @@ Shader::process_intrinsic(nir_intrinsic_instr *intr)
    case nir_intrinsic_load_draw_id:
       return emit_get_lds_info_uint(intr,
                                     offsetof(struct r600_lds_constant_buffer, draw_id));
+   case nir_intrinsic_load_primitive_id_modulo_r600:
+      return emit_get_lds_info_uint2(intr,
+                                     offsetof(struct r600_lds_constant_buffer,
+                                              primitiveid_modulo));
    case nir_intrinsic_barrier:
       return emit_barrier(intr);
    case nir_intrinsic_shared_atomic:
@@ -1546,6 +1548,25 @@ Shader::emit_get_lds_info_uint(nir_intrinsic_instr *instr, int offset)
 }
 
 bool
+Shader::emit_get_lds_info_uint2(nir_intrinsic_instr *instr, int offset)
+{
+   auto src = value_factory().temp_register();
+   emit_instruction(new AluInstr(op1_mov, src, value_factory().zero(), AluInstr::write));
+
+   auto dest = value_factory().dest_vec4(instr->def, pin_group);
+   auto fetch = new LoadFromBuffer(dest,
+                                   {0, 1, 7, 7},
+                                   src,
+                                   offset,
+                                   R600_LDS_INFO_CONST_BUFFER,
+                                   nullptr,
+                                   fmt_32_32);
+   emit_instruction(fetch);
+
+   return true;
+}
+
+bool
 Shader::emit_shader_clock(nir_intrinsic_instr *instr)
 {
    auto& vf = value_factory();
@@ -1665,7 +1686,6 @@ Shader::load_ubo(nir_intrinsic_instr *instr)
          ir = new AluInstr(op1_mov, dest, u, AluInstr::write);
          emit_instruction(ir);
       }
-      m_indirect_files |= 1 << TGSI_FILE_CONSTANT;
       return true;
    }
 }
@@ -1803,16 +1823,9 @@ Shader::get_shader_info(r600_shader *sh_info)
    }
 
    sh_info->nhwatomic = m_nhwatomic;
-   sh_info->atomic_base = m_atomic_base;
    sh_info->nhwatomic_ranges = m_atomics.size();
    for (unsigned i = 0; i < m_atomics.size(); ++i)
       sh_info->atomics[i] = m_atomics[i];
-
-   if (m_flags.test(sh_indirect_const_file))
-      sh_info->indirect_files |= 1 << TGSI_FILE_CONSTANT;
-
-   if (m_flags.test(sh_indirect_atomic))
-      sh_info->indirect_files |= 1 << TGSI_FILE_HW_ATOMIC;
 
    sh_info->uses_tex_buffers = m_flags.test(sh_uses_tex_buffer);
 
@@ -1822,8 +1835,7 @@ Shader::get_shader_info(r600_shader *sh_info)
    sh_info->uses_images = m_flags.test(sh_uses_images);
    sh_info->uses_atomics = m_flags.test(sh_uses_atomics);
    sh_info->disable_sb = m_flags.test(sh_disble_sb);
-   sh_info->has_txq_cube_array_z_comp = m_flags.test(sh_txs_cube_array_comp);
-   sh_info->indirect_files = m_indirect_files;
+   sh_info->has_resinfo_via_uniform = m_flags.test(sh_resinfo_via_uniform);
    do_get_shader_info(sh_info);
 }
 

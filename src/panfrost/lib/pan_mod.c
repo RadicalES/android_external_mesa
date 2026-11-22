@@ -16,14 +16,6 @@
 
 #include "util/format/u_format.h"
 
-#if PAN_ARCH <= 10
-#define MAX_SIZE_B         u_uintN_max(32)
-#define MAX_SLICE_STRIDE_B u_uintN_max(32)
-#else
-#define MAX_SIZE_B         u_uintN_max(48)
-#define MAX_SLICE_STRIDE_B u_uintN_max(37)
-#endif
-
 static bool
 pan_mod_afbc_match(uint64_t mod)
 {
@@ -179,11 +171,52 @@ pan_mod_afbc_init_slice_layout(
    slayout->afbc.surface_stride_B = surf_stride_B;
    slayout->size_B = surf_stride_B * mip_extent_px.depth;
 
-   if (hdr_surf_size_B > UINT32_MAX || surf_stride_B > UINT32_MAX ||
-       slayout->size_B > UINT32_MAX)
+   if (hdr_surf_size_B > UINT32_MAX)
       return false;
 
    return true;
+}
+
+static uint32_t
+pan_mod_afbc_get_format_caps(const struct pan_kmod_dev_props *dprops,
+                             enum pipe_format format, uint64_t modifier)
+{
+   /* AFBC not supported. */
+   if (!pan_query_afbc(dprops))
+      return 0;
+
+   /* Not all architectures support tiled mode */
+   if ((modifier & AFBC_FORMAT_MOD_TILED) && !pan_afbc_can_tile(PAN_ARCH))
+      return 0;
+
+   /* ... or split mode */
+   if ((modifier & AFBC_FORMAT_MOD_SPLIT) && !pan_afbc_can_split(PAN_ARCH))
+      return 0;
+
+   /* Check compatibility between formats and parameters */
+   unsigned plane_count = util_format_get_num_planes(format);
+   for (unsigned p = 0; p < plane_count; p++) {
+      enum pan_afbc_mode mode = pan_afbc_format(PAN_ARCH, format, p);
+      if (mode == PAN_AFBC_MODE_INVALID)
+         return 0;
+      if (!pan_afbc_check_params(mode, modifier))
+         return 0;
+   }
+
+   unsigned sw = pan_afbc_superblock_width(modifier);
+   bool is_split = modifier & AFBC_FORMAT_MOD_SPLIT;
+   bool is_ytr = modifier & AFBC_FORMAT_MOD_YTR;
+
+   uint32_t caps = PAN_MOD_FORMAT_CAP_DIM_2D |
+                   PAN_MOD_FORMAT_CAP_WSI;
+
+   if (sw == 16 && !(is_split || is_ytr)) {
+      caps |= PAN_MOD_FORMAT_CAP_DEPTH_STENCIL;
+      if (PAN_ARCH >= 9)
+         caps |= PAN_MOD_FORMAT_CAP_DEPTH_STENCIL_INTERLEAVED;
+   }
+
+   return caps;
 }
 
 static enum pan_mod_support
@@ -191,64 +224,27 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
                         const struct pan_image_props *iprops,
                         const struct pan_image_usage *iusage)
 {
-   /* No image store. */
-   if (iusage && iusage->bind & PAN_BIND_STORAGE_IMAGE)
-      return PAN_MOD_NOT_SUPPORTED;
+   struct pan_image_block_size superblock_extent_px = pan_afbc_superblock_size(iprops->modifier);
 
-   /* AFBC not supported. */
-   if (!pan_query_afbc(dprops))
-      return PAN_MOD_NOT_SUPPORTED;
+   if (iprops->modifier & AFBC_FORMAT_MOD_TILED) {
+      struct pan_image_block_size tile_extent_px = {
+         superblock_extent_px.width * pan_afbc_tile_size(iprops->format, iprops->modifier),
+         superblock_extent_px.height * pan_afbc_tile_size(iprops->format, iprops->modifier),
+      };
 
-   unsigned plane_count = util_format_get_num_planes(iprops->format);
-   const struct util_format_description *fdesc =
-      util_format_description(iprops->format);
-
-   /* Check if the format is supported first. */
-   enum pan_afbc_mode plane_modes[3];
-   for (unsigned p = 0; p < plane_count; p++) {
-      plane_modes[p] = pan_afbc_format(PAN_ARCH, iprops->format, p);
-      if (plane_modes[p] == PAN_AFBC_MODE_INVALID)
-         return PAN_MOD_NOT_SUPPORTED;
+      /* Tiled mode has some overhead we don't want to pay if the image size is
+       * too thin. */
+      if (iprops->extent_px.width < tile_extent_px.width / 2 ||
+          iprops->extent_px.height < tile_extent_px.height / 2)
+         return PAN_MOD_NOT_OPTIMAL;
+   } else {
+      /* For images thinner than a superblock, fall through to U-interleaved. */
+      if (iprops->extent_px.width < superblock_extent_px.width ||
+          iprops->extent_px.height < superblock_extent_px.height)
+         return PAN_MOD_NOT_OPTIMAL;
    }
 
-   /* AFBC can't do multisampling. */
-   if (iprops->nr_samples > 1)
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* AFBC(2D) or AFBC(3D) on v7+ only. */
-   if ((iprops->dim == MALI_TEXTURE_DIMENSION_3D && PAN_ARCH < 7) ||
-       iprops->dim != MALI_TEXTURE_DIMENSION_2D)
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* ZS buffer descriptors can't pass split/wide/YTR modifiers. */
-   if (iusage && (iusage->bind & PAN_BIND_DEPTH_STENCIL) &&
-       (pan_afbc_superblock_width(iprops->modifier) != 16 ||
-        (iprops->modifier & (AFBC_FORMAT_MOD_SPLIT | AFBC_FORMAT_MOD_YTR))))
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* YTR is only useful on RGB formats. */
-   if ((iprops->modifier & AFBC_FORMAT_MOD_YTR) &&
-       (pan_format_is_yuv(iprops->format) || fdesc->nr_channels < 3))
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* Make sure all planes support split mode. */
-   if ((iprops->modifier & AFBC_FORMAT_MOD_SPLIT)) {
-      for (unsigned p = 0; p < plane_count; p++) {
-         if (!pan_afbc_can_split(PAN_ARCH, plane_modes[p], iprops->modifier))
-            return PAN_MOD_NOT_SUPPORTED;
-      }
-   }
-
-   /* Make sure tiled mode is supported. */
-   if ((iprops->modifier & AFBC_FORMAT_MOD_TILED) &&
-       !pan_afbc_can_tile(PAN_ARCH))
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* For one tile, AFBC is a loss compared to u-interleaved */
-   if (iprops->extent_px.width <= 16 && iprops->extent_px.height <= 16)
-      return PAN_MOD_NOT_OPTIMAL;
-
-   /* Reserve 32x8 tiles for WSI images. */
+   /* Only use 32x8 superblock for WSI images. */
    if (iusage && !iusage->wsi &&
        pan_afbc_superblock_width(iprops->modifier) != 16)
       return PAN_MOD_NOT_OPTIMAL;
@@ -257,15 +253,6 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
    if (pan_afbc_can_ytr(iprops->format) &&
        !(iprops->modifier & AFBC_FORMAT_MOD_YTR))
       return PAN_MOD_NOT_OPTIMAL;
-
-   if (iprops->modifier & (AFBC_FORMAT_MOD_TILED | AFBC_FORMAT_MOD_SC))
-      return PAN_MOD_NOT_SUPPORTED;
-
-   bool is_tiled = iprops->modifier & AFBC_FORMAT_MOD_TILED;
-   bool can_tile = pan_afbc_can_tile(PAN_ARCH);
-
-   if (is_tiled && !can_tile)
-      return PAN_MOD_NOT_SUPPORTED;
 
    /* Packing/unpacking AFBC payload requires a COMPUTE job which we'd rather
     * avoid.
@@ -276,6 +263,51 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
       return PAN_MOD_NOT_OPTIMAL;
 
    return PAN_MOD_OPTIMAL;
+}
+
+static bool
+pan_mod_afbc_supports_msaa_average(enum pipe_format format)
+{
+#if PAN_ARCH >= 9
+   const struct pan_blendable_format *blend_format =
+      GENX(pan_blendable_format_from_pipe_format)(format);
+
+   if (blend_format->internal == MALI_COLOR_BUFFER_INTERNAL_FORMAT_RAW_VALUE)
+      return false;
+
+   if (!util_format_is_float(format)) {
+      switch (blend_format->writeback) {
+      case MALI_COLOR_FORMAT_R8:
+      case MALI_COLOR_FORMAT_R8G8:
+      case MALI_COLOR_FORMAT_R8G8B8:
+      case MALI_COLOR_FORMAT_R8G8B8A8:
+      case MALI_COLOR_FORMAT_R10G10B10A2:
+      case MALI_COLOR_FORMAT_R4G4B4A4:
+      case MALI_COLOR_FORMAT_R5G6B5:
+      case MALI_COLOR_FORMAT_R5G5B5A1:
+         return true;
+      default:
+         return false;
+      }
+   } else {
+#if PAN_ARCH >= 11
+      switch (blend_format->writeback) {
+      case MALI_FLOAT_COLOR_FORMAT_R16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG16F:
+      case MALI_FLOAT_COLOR_FORMAT_RGB16F:
+      case MALI_FLOAT_COLOR_FORMAT_RGBA16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG11F_B10F:
+         return true;
+      default:
+         return false;
+      }
+#endif
+   }
+#else
+   UNREACHABLE("Not implemented");
+#endif
+
+   return false;
 }
 
 #define pan_mod_afbc_emit_tex_payload_entry                                    \
@@ -291,31 +323,27 @@ pan_mod_afrc_match(uint64_t mod)
    return drm_is_afrc(mod);
 }
 
+static uint32_t
+pan_mod_afrc_get_format_caps(const struct pan_kmod_dev_props *dprops,
+                             enum pipe_format format, uint64_t modifier)
+{
+   /* AFRC not supported. */
+   if (!pan_query_afrc(dprops))
+      return 0;
+
+   /* Format not AFRC-able. */
+   if (!pan_afrc_supports_format(format))
+      return 0;
+
+   return PAN_MOD_FORMAT_CAP_DIM_2D |
+          PAN_MOD_FORMAT_CAP_DIM_3D;
+}
+
 static enum pan_mod_support
 pan_mod_afrc_test_props(const struct pan_kmod_dev_props *dprops,
                         const struct pan_image_props *iprops,
                         const struct pan_image_usage *iusage)
 {
-   /* AFRC not supported. */
-   if (!pan_query_afrc(dprops))
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* Format not AFRC-able. */
-   if (!pan_afrc_supports_format(iprops->format))
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* AFRC does not support layered multisampling. */
-   if (iprops->nr_samples > 1)
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* No image store. */
-   if (iusage && iusage->bind & PAN_BIND_STORAGE_IMAGE)
-      return PAN_MOD_NOT_SUPPORTED;
-
-   /* We can't write to an AFRC resource directly. */
-   if (iusage && iusage->host_copy)
-      return PAN_MOD_NOT_SUPPORTED;
-
    /* Host updates require an extra blit which we would rather avoid. */
    if (iusage && iusage->frequent_host_updates)
       return PAN_MOD_NOT_OPTIMAL;
@@ -325,6 +353,27 @@ pan_mod_afrc_test_props(const struct pan_kmod_dev_props *dprops,
       return PAN_MOD_NOT_OPTIMAL;
 
    return PAN_MOD_OPTIMAL;
+}
+
+static bool
+pan_mod_afrc_supports_msaa_average(enum pipe_format format)
+{
+   const struct pan_blendable_format *blend_format =
+      GENX(pan_blendable_format_from_pipe_format)(format);
+
+   if (blend_format->internal == MALI_COLOR_BUFFER_INTERNAL_FORMAT_RAW_VALUE ||
+       util_format_is_float(format))
+      return false;
+
+   switch (blend_format->writeback) {
+   case MALI_COLOR_FORMAT_R8:
+   case MALI_COLOR_FORMAT_R8G8:
+   case MALI_COLOR_FORMAT_R8G8B8:
+   case MALI_COLOR_FORMAT_R8G8B8A8:
+      return true;
+   default:
+      return false;
+   }
 }
 
 static uint32_t
@@ -407,16 +456,11 @@ pan_mod_afrc_init_slice_layout(
 
    uint64_t surf_stride_B =
       (uint64_t)slayout->tiled_or_linear.row_stride_B *
-      DIV_ROUND_UP(aligned_extent_px.height, aligned_extent_px.height);
+      (aligned_extent_px.height / tile_extent_px.height);
 
    slayout->tiled_or_linear.surface_stride_B = surf_stride_B;
    slayout->size_B =
       surf_stride_B * aligned_extent_px.depth * props->nr_samples;
-
-   /* Make sure the stride/size fits in the descriptor fields. */
-   if (slayout->size_B > MAX_SIZE_B ||
-       slayout->tiled_or_linear.surface_stride_B > MAX_SLICE_STRIDE_B)
-      return false;
 
    return true;
 }
@@ -434,17 +478,31 @@ pan_mod_u_tiled_match(uint64_t mod)
    return mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED;
 }
 
+static uint32_t
+pan_mod_u_tiled_get_format_caps(const struct pan_kmod_dev_props *dprops,
+                                enum pipe_format format, uint64_t modifier)
+{
+   assert(GENX(pan_format_from_pipe_format)(format)->hw);
+
+   /* YUV not supported. */
+   if (pan_format_is_yuv(format))
+      return 0;
+
+   return PAN_MOD_FORMAT_CAP_DIM_1D |
+          PAN_MOD_FORMAT_CAP_DIM_2D |
+          PAN_MOD_FORMAT_CAP_DIM_3D |
+          PAN_MOD_FORMAT_CAP_MSAA |
+          PAN_MOD_FORMAT_CAP_STORAGE_IMAGE |
+          PAN_MOD_FORMAT_CAP_DEPTH_STENCIL |
+          PAN_MOD_FORMAT_CAP_DEPTH_STENCIL_INTERLEAVED |
+          PAN_MOD_FORMAT_CAP_HOST_COPY;
+}
+
 static enum pan_mod_support
 pan_mod_u_tiled_test_props(const struct pan_kmod_dev_props *dprops,
                            const struct pan_image_props *iprops,
                            const struct pan_image_usage *iusage)
 {
-   assert(GENX(pan_format_from_pipe_format)(iprops->format)->hw);
-
-   /* YUV not supported. */
-   if (pan_format_is_yuv(iprops->format))
-      return PAN_MOD_NOT_SUPPORTED;
-
    /* The purpose of tiling is improving locality in both X- and
     * Y-directions. If there is only a single pixel in either direction,
     * tiling does not make sense; using a linear layout instead is optimal
@@ -454,6 +512,52 @@ pan_mod_u_tiled_test_props(const struct pan_kmod_dev_props *dprops,
       return PAN_MOD_NOT_OPTIMAL;
 
    return PAN_MOD_OPTIMAL;
+}
+
+static bool
+pan_mod_u_tiled_supports_msaa_average(enum pipe_format format)
+{
+#if PAN_ARCH >= 9
+   const struct pan_blendable_format *blend_format =
+      GENX(pan_blendable_format_from_pipe_format)(format);
+
+   if (blend_format->internal == MALI_COLOR_BUFFER_INTERNAL_FORMAT_RAW_VALUE)
+      return false;
+
+   if (!util_format_is_float(format)) {
+      switch (blend_format->writeback) {
+      case MALI_COLOR_FORMAT_R8:
+      case MALI_COLOR_FORMAT_R8G8:
+      case MALI_COLOR_FORMAT_R8G8B8:
+      case MALI_COLOR_FORMAT_R8G8B8A8:
+      case MALI_COLOR_FORMAT_R10G10B10A2:
+      case MALI_COLOR_FORMAT_R8G8B8_FROM_R8G8B8A2:
+      case MALI_COLOR_FORMAT_R4G4B4A4:
+      case MALI_COLOR_FORMAT_R5G6B5:
+      case MALI_COLOR_FORMAT_R5G5B5A1:
+         return true;
+      default:
+         return false;
+      }
+   } else {
+#if PAN_ARCH >= 11
+      switch (blend_format->writeback) {
+      case MALI_FLOAT_COLOR_FORMAT_R16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG16F:
+      case MALI_FLOAT_COLOR_FORMAT_RGB16F:
+      case MALI_FLOAT_COLOR_FORMAT_RGBA16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG11F_B10F:
+         return true;
+      default:
+         return false;
+      }
+#endif
+   }
+#else
+   UNREACHABLE("Not implemented");
+#endif
+
+   return false;
 }
 
 static uint32_t
@@ -545,12 +649,6 @@ pan_mod_u_tiled_init_slice_layout(
          align_mask + 1);
    }
 
-   if (layout_constraints && layout_constraints->u_tiled.row_align_B) {
-      slayout->tiled_or_linear.row_stride_B =
-         ALIGN_POT(slayout->tiled_or_linear.row_stride_B,
-                   layout_constraints->u_tiled.row_align_B);
-   }
-
    uint64_t surf_stride_B =
       (uint64_t)slayout->tiled_or_linear.row_stride_B *
       DIV_ROUND_UP(mip_extent_el.height, tile_extent_el.height);
@@ -558,11 +656,6 @@ pan_mod_u_tiled_init_slice_layout(
 
    slayout->tiled_or_linear.surface_stride_B = surf_stride_B;
    slayout->size_B = surf_stride_B * mip_extent_el.depth * props->nr_samples;
-
-   /* Make sure the stride/size fits in the descriptor fields. */
-   if (slayout->size_B > MAX_SIZE_B ||
-       slayout->tiled_or_linear.surface_stride_B > MAX_SLICE_STRIDE_B)
-      return false;
 
    return true;
 }
@@ -574,10 +667,191 @@ pan_mod_u_tiled_init_slice_layout(
 #define pan_mod_u_tiled_emit_zs_attachment GENX(pan_emit_u_tiled_zs_attachment)
 #define pan_mod_u_tiled_emit_s_attachment  GENX(pan_emit_u_tiled_s_attachment)
 
+#if PAN_ARCH >= 10
+#define pan_mod_interleaved_64k_init_plane_layout NULL
+
+static bool
+pan_mod_interleaved_64k_init_slice_layout(
+   const struct pan_image_props *props, unsigned plane_idx,
+   struct pan_image_extent mip_extent_px,
+   const struct pan_image_layout_constraints *layout_constraints,
+   struct pan_image_slice_layout *slayout)
+{
+   const bool use_explicit_layout =
+      layout_constraints && layout_constraints->wsi_row_pitch_B;
+
+   struct pan_image_block_size tile_extent_el =
+      pan_interleaved_64k_tile_size_el(props->format);
+   struct pan_image_block_size tile_extent_px = {
+      tile_extent_el.width * util_format_get_blockwidth(props->format),
+      tile_extent_el.height * util_format_get_blockheight(props->format),
+   };
+   uint64_t tile_size_B = 65536;
+
+   struct pan_image_extent mip_extent_tiles = {
+      DIV_ROUND_UP(mip_extent_px.width, tile_extent_px.width),
+      DIV_ROUND_UP(mip_extent_px.height, tile_extent_px.height),
+      mip_extent_px.depth,
+   };
+
+   uint64_t min_row_stride_B = mip_extent_tiles.width * tile_size_B;
+   uint64_t row_stride_B = min_row_stride_B;
+
+   if (use_explicit_layout) {
+      row_stride_B = layout_constraints->wsi_row_pitch_B;
+      if (row_stride_B < min_row_stride_B || (row_stride_B % tile_size_B) != 0) {
+         mesa_loge("Interleaved 64k pitch invalid or too small");
+         return false;
+      }
+   }
+
+   uint64_t surf_stride_B = mip_extent_tiles.height * row_stride_B;
+
+   slayout->offset_B = layout_constraints ? layout_constraints->offset_B : 0;
+   slayout->size_B = mip_extent_tiles.depth * surf_stride_B;
+   slayout->tiled_or_linear.row_stride_B = row_stride_B;
+   slayout->tiled_or_linear.surface_stride_B = surf_stride_B;
+
+   return true;
+}
+
+static uint32_t
+pan_mod_interleaved_64k_get_wsi_row_pitch(const struct pan_image *image,
+                                          unsigned plane_idx, unsigned mip_level)
+{
+   const struct pan_image_layout *layout = &image->planes[plane_idx]->layout;
+
+   return layout->slices[mip_level].tiled_or_linear.row_stride_B;
+}
+
+static bool
+pan_mod_interleaved_64k_match(uint64_t mod)
+{
+   return mod == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K;
+}
+
+static uint32_t
+pan_mod_interleaved_64k_get_format_caps(const struct pan_kmod_dev_props *dprops,
+                                        enum pipe_format format, uint64_t modifier)
+{
+   assert(GENX(pan_format_from_pipe_format)(format)->hw);
+
+   /* YUV not supported. */
+   if (pan_format_is_yuv(format))
+      return 0;
+
+   /* Non-po2 byte texel blocks not supported. */
+   if (!util_is_power_of_two_nonzero(util_format_get_blocksize(format)))
+      return 0;
+
+   return PAN_MOD_FORMAT_CAP_DIM_1D |
+          PAN_MOD_FORMAT_CAP_DIM_2D |
+          PAN_MOD_FORMAT_CAP_DIM_3D |
+          PAN_MOD_FORMAT_CAP_STORAGE_IMAGE |
+          PAN_MOD_FORMAT_CAP_DEPTH_STENCIL |
+          PAN_MOD_FORMAT_CAP_DEPTH_STENCIL_INTERLEAVED |
+          PAN_MOD_FORMAT_CAP_SPARSE_MAP;
+}
+
+static enum pan_mod_support
+pan_mod_interleaved_64k_test_props(const struct pan_kmod_dev_props *dprops,
+                                   const struct pan_image_props *iprops,
+                                   const struct pan_image_usage *iusage)
+{
+   struct pan_image_block_size tile_extent_el =
+      pan_interleaved_64k_tile_size_el(iprops->format);
+   struct pan_image_block_size tile_extent_px = {
+      tile_extent_el.width * util_format_get_blockwidth(iprops->format),
+      tile_extent_el.height * util_format_get_blockheight(iprops->format),
+   };
+
+   /* If our image is too thin it might make more sense to use U-interleaved or
+    * even linear */
+   if (iprops->extent_px.width < tile_extent_px.width / 2 ||
+       iprops->extent_px.height < tile_extent_px.height / 2)
+      return PAN_MOD_NOT_OPTIMAL;
+
+   return PAN_MOD_OPTIMAL;
+}
+
+static bool
+pan_mod_interleaved_64k_supports_msaa_average(enum pipe_format format)
+{
+   const struct pan_blendable_format *blend_format =
+      GENX(pan_blendable_format_from_pipe_format)(format);
+
+   if (blend_format->internal == MALI_COLOR_BUFFER_INTERNAL_FORMAT_RAW_VALUE)
+      return false;
+
+   if (!util_format_is_float(format)) {
+      switch (blend_format->writeback) {
+      case MALI_COLOR_FORMAT_R8:
+      case MALI_COLOR_FORMAT_R8G8:
+      case MALI_COLOR_FORMAT_R8G8B8A8:
+      case MALI_COLOR_FORMAT_R10G10B10A2:
+      case MALI_COLOR_FORMAT_R4G4B4A4:
+      case MALI_COLOR_FORMAT_R5G6B5:
+      case MALI_COLOR_FORMAT_R5G5B5A1:
+         return true;
+      default:
+         return false;
+      }
+   } else {
+#if PAN_ARCH >= 11
+      switch (blend_format->writeback) {
+      case MALI_FLOAT_COLOR_FORMAT_R16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG16F:
+      case MALI_FLOAT_COLOR_FORMAT_RGBA16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG11F_B10F:
+         return true;
+      default:
+         return false;
+      }
+#endif
+   }
+
+   return false;
+}
+
+#define pan_mod_interleaved_64k_emit_tex_payload_entry                                 \
+   GENX(pan_tex_emit_interleaved_64k_payload_entry)
+#define pan_mod_interleaved_64k_emit_color_attachment                                  \
+   GENX(pan_emit_interleaved_64k_color_attachment)
+#define pan_mod_interleaved_64k_emit_zs_attachment GENX(pan_emit_interleaved_64k_zs_attachment)
+#define pan_mod_interleaved_64k_emit_s_attachment  GENX(pan_emit_interleaved_64k_s_attachment)
+#endif
+
 static bool
 pan_mod_linear_match(uint64_t mod)
 {
    return mod == DRM_FORMAT_MOD_LINEAR;
+}
+
+static uint32_t
+pan_mod_linear_get_format_caps(const struct pan_kmod_dev_props *dprops,
+                               enum pipe_format format, uint64_t modifier)
+{
+   assert(GENX(pan_format_from_pipe_format)(format)->hw);
+
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8_420_UNORM_PACKED:
+   case PIPE_FORMAT_R10G10B10_420_UNORM_PACKED:
+   case PIPE_FORMAT_X6R10X6G10_X6R10X6B10_422_UNORM:
+      /* These formats have no linear representation. */
+      return 0;
+   default:
+      break;
+   }
+
+   return PAN_MOD_FORMAT_CAP_DIM_1D |
+          PAN_MOD_FORMAT_CAP_DIM_2D |
+          PAN_MOD_FORMAT_CAP_DIM_3D |
+          PAN_MOD_FORMAT_CAP_MSAA |
+          PAN_MOD_FORMAT_CAP_STORAGE_IMAGE |
+          PAN_MOD_FORMAT_CAP_DEPTH_STENCIL |
+          PAN_MOD_FORMAT_CAP_DEPTH_STENCIL_INTERLEAVED |
+          PAN_MOD_FORMAT_CAP_HOST_COPY |
+          PAN_MOD_FORMAT_CAP_WSI;
 }
 
 static enum pan_mod_support
@@ -585,21 +859,57 @@ pan_mod_linear_test_props(const struct pan_kmod_dev_props *dprops,
                           const struct pan_image_props *iprops,
                           const struct pan_image_usage *iusage)
 {
-   assert(GENX(pan_format_from_pipe_format)(iprops->format)->hw);
+   /* We assume that all "better" mods have been tested before linear, and
+    * declare it as optimal so it's always picked when tested, unless it's
+    * not supported.
+    */
+   return PAN_MOD_OPTIMAL;
+}
 
-   switch (iprops->format) {
-   /* AFBC-only formats. */
-   case PIPE_FORMAT_R8G8B8_420_UNORM_PACKED:
-   case PIPE_FORMAT_R10G10B10_420_UNORM_PACKED:
-   case PIPE_FORMAT_X6R10X6G10_X6R10X6B10_422_UNORM:
-      return PAN_MOD_NOT_SUPPORTED;
-   default:
-      /* We assume that all "better" mods have been tested before linear, and
-       * declare it as optimal so it's always picked when tested, unless it's
-       * not supported.
-       */
-      return PAN_MOD_OPTIMAL;
+static bool
+pan_mod_linear_supports_msaa_average(enum pipe_format format)
+{
+#if PAN_ARCH >= 9
+   const struct pan_blendable_format *blend_format =
+      GENX(pan_blendable_format_from_pipe_format)(format);
+
+   if (blend_format->internal == MALI_COLOR_BUFFER_INTERNAL_FORMAT_RAW_VALUE)
+      return false;
+
+   if (!util_format_is_float(format)) {
+      switch (blend_format->writeback) {
+      case MALI_COLOR_FORMAT_R8:
+      case MALI_COLOR_FORMAT_R8G8:
+      case MALI_COLOR_FORMAT_R8G8B8:
+      case MALI_COLOR_FORMAT_R8G8B8A8:
+      case MALI_COLOR_FORMAT_R10G10B10A2:
+      case MALI_COLOR_FORMAT_R8G8B8_FROM_R8G8B8A2:
+      case MALI_COLOR_FORMAT_R4G4B4A4:
+      case MALI_COLOR_FORMAT_R5G6B5:
+      case MALI_COLOR_FORMAT_R5G5B5A1:
+         return true;
+      default:
+         return false;
+      }
+   } else {
+#if PAN_ARCH >= 11
+      switch (blend_format->writeback) {
+      case MALI_FLOAT_COLOR_FORMAT_R16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG16F:
+      case MALI_FLOAT_COLOR_FORMAT_RGB16F:
+      case MALI_FLOAT_COLOR_FORMAT_RGBA16F:
+      case MALI_FLOAT_COLOR_FORMAT_RG11F_B10F:
+         return true;
+      default:
+         return false;
+      }
+#endif
    }
+#else
+   UNREACHABLE("Not implemented");
+#endif
+
+   return false;
 }
 
 static uint32_t
@@ -680,11 +990,6 @@ pan_mod_linear_init_slice_layout(
       (uint64_t)slayout->tiled_or_linear.row_stride_B * mip_extent_el.height;
    surf_stride_B = ALIGN_POT(surf_stride_B, (uint64_t)align_mask + 1);
 
-   /* Surface stride is passed as a 32-bit unsigned integer to RT/ZS and texture
-    * descriptors, make sure it fits. */
-   if (surf_stride_B > UINT32_MAX)
-      return false;
-
    slayout->tiled_or_linear.surface_stride_B = surf_stride_B;
    slayout->size_B = surf_stride_B * mip_extent_el.depth * props->nr_samples;
    return true;
@@ -711,7 +1016,9 @@ pan_mod_linear_init_slice_layout(
 #define PAN_MOD_DEF(__name)                                                    \
    {                                                                           \
       .match = pan_mod_##__name##_match,                                       \
+      .get_format_caps = pan_mod_##__name##_get_format_caps,                   \
       .test_props = pan_mod_##__name##_test_props,                             \
+      .supports_msaa_average = pan_mod_##__name##_supports_msaa_average,       \
       .get_wsi_row_pitch = pan_mod_##__name##_get_wsi_row_pitch,               \
       .init_plane_layout = pan_mod_##__name##_init_plane_layout,               \
       .init_slice_layout = pan_mod_##__name##_init_slice_layout,               \
@@ -724,6 +1031,7 @@ static const struct pan_mod_handler pan_mod_handlers[] = {
    PAN_MOD_DEF(u_tiled),
    PAN_MOD_DEF(linear),
 #if PAN_ARCH >= 10
+   PAN_MOD_DEF(interleaved_64k),
    PAN_MOD_DEF(afrc),
 #endif
 };

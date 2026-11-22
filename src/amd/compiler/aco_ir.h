@@ -7,6 +7,7 @@
 #ifndef ACO_IR_H
 #define ACO_IR_H
 
+#include "aco_interface.h"
 #include "aco_opcodes.h"
 #include "aco_shader_info.h"
 #include "aco_util.h"
@@ -66,12 +67,12 @@ enum memory_semantics : uint8_t {
    semantic_none = 0x0,
    /* for loads: don't move any access after this load to before this load (even other loads)
     * for barriers: don't move any access after the barrier to before any
-    * atomic_loads/control_barriers/p_pops_gfx9_add_exiting_wave_id or
+    * atomic_loads/barrier_wait/p_pops_gfx9_add_exiting_wave_id or
     * certain s_wait_event before the barrier */
    semantic_acquire = 0x1,
    /* for stores: don't move any access before this store to after this store
     * for barriers: don't move any access before the barrier to after any
-    * atomic_stores/control_barriers/p_pops_gfx9_ordered_section_done or
+    * atomic_stores/barrier_signal/p_pops_gfx9_ordered_section_done or
     * certain sendmsg/exports after the barrier */
    semantic_release = 0x2,
 
@@ -379,6 +380,8 @@ static constexpr RegClass v3b{RegClass::v3b};
 static constexpr RegClass v4b{RegClass::v4b};
 static constexpr RegClass v6b{RegClass::v6b};
 static constexpr RegClass v8b{RegClass::v8b};
+static constexpr RegClass lv1{RegClass::v1_linear};
+static constexpr RegClass lv2{RegClass::v2_linear};
 
 /**
  * Temp Class
@@ -942,8 +945,9 @@ private:
 class Definition final {
 public:
    constexpr Definition()
-       : temp(Temp(0, s1)), reg_(0), isFixed_(0), isPrecolored_(0), isKill_(0), isPrecise_(0),
-         isInfPreserve_(0), isNaNPreserve_(0), isSZPreserve_(0), isNUW_(0), isNoCSE_(0)
+       : temp(Temp(0, s1)), reg_(0), isFixed_(0), isPrecolored_(0), isKill_(0), isNoContract_(0),
+         isNoReassoc_(0), isInfPreserve_(0), isNaNPreserve_(0), isSZPreserve_(0), isNUW_(0),
+         isNoCSE_(0)
    {}
    explicit Definition(Temp tmp) noexcept : temp(tmp) {}
    explicit Definition(PhysReg reg, RegClass type) noexcept : temp(Temp(0, type)) { setFixed(reg); }
@@ -986,9 +990,13 @@ public:
 
    constexpr bool isKill() const noexcept { return isKill_; }
 
-   constexpr void setPrecise(bool precise) noexcept { isPrecise_ = precise; }
+   constexpr void setNoContract(bool no_contract) noexcept { isNoContract_ = no_contract; }
 
-   constexpr bool isPrecise() const noexcept { return isPrecise_; }
+   constexpr bool isNoContract() const noexcept { return isNoContract_; }
+
+   constexpr void setNoReassoc(bool no_reassoc) noexcept { isNoReassoc_ = no_reassoc; }
+
+   constexpr bool isNoReassoc() const noexcept { return isNoReassoc_; }
 
    constexpr void setInfPreserve(bool inf_preserve) noexcept { isInfPreserve_ = inf_preserve; }
 
@@ -1019,7 +1027,8 @@ private:
          uint8_t isFixed_ : 1;
          uint8_t isPrecolored_ : 1;
          uint8_t isKill_ : 1;
-         uint8_t isPrecise_ : 1;
+         uint8_t isNoContract_ : 1;
+         uint8_t isNoReassoc_ : 1;
          uint8_t isInfPreserve_ : 1;
          uint8_t isNaNPreserve_ : 1;
          uint8_t isSZPreserve_ : 1;
@@ -1034,13 +1043,7 @@ private:
 struct RegisterDemand {
    constexpr RegisterDemand() = default;
    constexpr RegisterDemand(const int16_t v, const int16_t s) noexcept : vgpr{v}, sgpr{s} {}
-   constexpr RegisterDemand(Temp t) noexcept
-   {
-      if (t.regClass().type() == RegType::sgpr)
-         sgpr = t.size();
-      else
-         vgpr = t.size();
-   }
+   constexpr RegisterDemand(Temp t) noexcept { (*this)[t.type()] = t.size(); }
    int16_t vgpr = 0;
    int16_t sgpr = 0;
 
@@ -1057,6 +1060,18 @@ struct RegisterDemand {
    constexpr bool exceeds(const RegisterDemand other) const noexcept
    {
       return vgpr > other.vgpr || sgpr > other.sgpr;
+   }
+
+   constexpr bool empty() const noexcept { return !exceeds(RegisterDemand()); }
+
+   constexpr const int16_t& operator[](RegType type) const noexcept
+   {
+      return type == RegType::vgpr ? vgpr : sgpr;
+   }
+
+   constexpr int16_t& operator[](RegType type) noexcept
+   {
+      return type == RegType::vgpr ? vgpr : sgpr;
    }
 
    constexpr RegisterDemand operator+(const Temp t) const noexcept
@@ -1093,19 +1108,13 @@ struct RegisterDemand {
 
    constexpr RegisterDemand& operator+=(const Temp t) noexcept
    {
-      if (t.type() == RegType::sgpr)
-         sgpr += t.size();
-      else
-         vgpr += t.size();
+      (*this)[t.type()] += t.size();
       return *this;
    }
 
    constexpr RegisterDemand& operator-=(const Temp t) noexcept
    {
-      if (t.type() == RegType::sgpr)
-         sgpr -= t.size();
-      else
-         vgpr -= t.size();
+      (*this)[t.type()] -= t.size();
       return *this;
    }
 
@@ -1171,6 +1180,11 @@ struct ABI {
       clobbered_regs.sgpr += std::max((int)(reg_limit.sgpr % stride) - clobbered_start, 0);
 
       return clobbered_regs;
+   }
+
+   RegisterDemand numPreserved(RegisterDemand reg_limit) const
+   {
+      return reg_limit - numClobbered(reg_limit);
    }
 };
 
@@ -1777,15 +1791,15 @@ static_assert(sizeof(MUBUF_instruction) == sizeof(Instruction) + 8, "Unexpected 
 struct MTBUF_instruction : public Instruction {
    memory_sync_info sync;
    ac_hw_cache_flags cache;
-   uint8_t dfmt : 4;         /* Data Format of data in memory buffer */
-   uint8_t nfmt : 3;         /* Numeric format of data in memory */
-   bool offen : 1;           /* Supply an offset from VGPR (VADDR) */
-   bool idxen : 1;           /* Supply an index from VGPR (VADDR) */
-   bool tfe : 1;             /* texture fail enable */
-   bool disable_wqm : 1;     /* Require an exec mask without helper invocations */
+   uint8_t dfmt : 4;     /* Data Format of data in memory buffer */
+   uint8_t nfmt : 3;     /* Numeric format of data in memory */
+   bool offen : 1;       /* Supply an offset from VGPR (VADDR) */
+   bool idxen : 1;       /* Supply an index from VGPR (VADDR) */
+   bool tfe : 1;         /* texture fail enable */
+   bool disable_wqm : 1; /* Require an exec mask without helper invocations */
    uint8_t padding0 : 5;
    uint16_t padding1;
-   uint32_t offset : 23;     /* Unsigned byte offset */
+   uint32_t offset : 23; /* Unsigned byte offset */
    uint32_t padding2 : 9;
 };
 static_assert(sizeof(MTBUF_instruction) == sizeof(Instruction) + 12, "Unexpected padding");
@@ -2015,7 +2029,8 @@ bool is_wait_export_ready(amd_gfx_level gfx_level, const Instruction* instr);
 class Program;
 
 uint16_t is_atomic_or_control_instr(Program* program, const Instruction* instr,
-                                    memory_sync_info sync, unsigned semantic);
+                                    memory_sync_info sync, unsigned semantic,
+                                    sync_scope ignore_scope = scope_invocation);
 
 memory_sync_info get_sync_info(const Instruction* instr);
 
@@ -2039,11 +2054,22 @@ bool can_use_input_modifiers(amd_gfx_level gfx_level, aco_opcode op, int idx);
 bool can_use_opsel(amd_gfx_level gfx_level, aco_opcode op, int idx);
 bool instr_is_16bit(amd_gfx_level gfx_level, aco_opcode op);
 uint8_t get_gfx11_true16_mask(aco_opcode op);
+bool can_use_SDWA(amd_gfx_level gfx_level, const Instruction* instr, bool pre_ra);
 bool can_use_SDWA(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool pre_ra);
+
+struct SubdwordCaps {
+   unsigned placement_stride;
+   unsigned overwrite_bytes;
+};
+
+unsigned get_subdword_operand_stride(Program* program, const Instruction* instr, unsigned idx,
+                                     RegClass rc);
+SubdwordCaps get_subdword_definition_caps(Program* program, const Instruction* instr, unsigned idx,
+                                          RegClass rc);
+
 bool opcode_supports_dpp(amd_gfx_level gfx_level, aco_opcode opcode, bool vop3p);
 bool can_use_DPP(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool dpp8);
-bool can_use_DPP(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr, bool dpp8);
-bool can_write_m0(const aco_ptr<Instruction>& instr);
+bool can_write_m0(const Instruction* instr);
 /* updates "instr" and returns the old instruction (or NULL if no update was needed) */
 aco_ptr<Instruction> convert_to_SDWA(amd_gfx_level gfx_level, aco_ptr<Instruction>& instr);
 aco_ptr<Instruction> convert_to_DPP(amd_gfx_level gfx_level, aco_ptr<Instruction>& instr,
@@ -2053,6 +2079,7 @@ bool needs_exec_mask(const Instruction* instr);
 aco_opcode get_vcmp_inverse(aco_opcode op);
 aco_opcode get_vcmp_swapped(aco_opcode op);
 aco_opcode get_vcmpx(aco_opcode op);
+/* Assumes that "op" is a VOPC opcode. */
 bool is_cmpx(aco_opcode op);
 
 aco_opcode get_swapped_opcode(aco_opcode opcode, unsigned idx0, unsigned idx1);
@@ -2128,7 +2155,7 @@ enum block_kind {
    block_kind_loop_preheader = 1 << 2,
    block_kind_loop_header = 1 << 3,
    block_kind_loop_exit = 1 << 4,
-   block_kind_continue = 1 << 5,
+   block_kind_loop_latch = 1 << 5,
    block_kind_break = 1 << 6,
    block_kind_branch = 1 << 7,
    block_kind_merge = 1 << 8,
@@ -2279,6 +2306,7 @@ struct DeviceInfo {
    bool sram_ecc_enabled = false;
    bool has_point_sample_accel = false;
    bool has_gfx6_mrt_export_bug = false;
+   bool has_desc_resource_level = false;
 
    int32_t scratch_global_offset_min;
    int32_t scratch_global_offset_max;
@@ -2311,8 +2339,8 @@ public:
    unsigned wave_size;
    RegClass lane_mask;
    Stage stage;
-   bool needs_exact = false; /* there exists an instruction with disable_wqm = true */
-   bool needs_wqm = false;   /* there exists a p_wqm instruction */
+   bool needs_exact = false;             /* there exists an instruction with disable_wqm = true */
+   bool needs_wqm = false;               /* there exists a p_wqm instruction */
    bool needs_fp_mode_insertion = false; /* insert_fp_mode should be run */
    bool has_smem_buffer_or_global_loads = false;
    bool has_pops_overlapped_waves_wait = false;
@@ -2326,7 +2354,6 @@ public:
    /* Private segment buffers and scratch offsets. One entry per start/resume block */
    aco::small_vec<Temp, 2> private_segment_buffers;
    aco::small_vec<Temp, 2> scratch_offsets;
-   Temp static_scratch_rsrc;
    Temp stack_ptr;
 
    uint16_t num_waves = 0;
@@ -2335,6 +2362,7 @@ public:
    bool wgp_mode;
 
    bool needs_vcc = false;
+   bool preserve_s2 = false;
 
    CompilationProgress progress;
 
@@ -2475,8 +2503,9 @@ void insert_delay_alu(Program* program);
 void combine_delay_alu(Program* program);
 void insert_NOPs(Program* program);
 void form_hard_clauses(Program* program);
-unsigned emit_program(Program* program, std::vector<uint32_t>& code,
-                      std::vector<struct aco_symbol>* symbols = NULL, bool append_endpgm = true);
+void emit_program(Program* program, std::vector<uint32_t>& code,
+                  std::vector<struct aco_symbol>& symbols, bool append_endpgm,
+                  aco_callback_params* params);
 /**
  * Returns true if print_asm can disassemble the given program for the current build/runtime
  * configuration
@@ -2518,7 +2547,7 @@ void aco_print_program(const Program* program, FILE* output, unsigned flags = 0)
 
 void _aco_err(Program* program, const char* file, unsigned line, const char* fmt, ...);
 
-#define aco_err(program, ...)      _aco_err(program, __FILE__, __LINE__, __VA_ARGS__)
+#define aco_err(program, ...) _aco_err(program, __FILE__, __LINE__, __VA_ARGS__)
 
 /* Returns the indices of operands to which definitions are tied to. */
 aco::small_vec<uint32_t, 2> get_tied_defs(Instruction* instr);
@@ -2607,6 +2636,20 @@ struct aco_alu_opcode_info {
    aco_type def_types[3];
    fixed_reg op_fixed_reg[4];
    fixed_reg def_fixed_reg[3];
+
+   aco_type get_def_type(unsigned idx) const
+   {
+      /* v_cmpx instructions before GFX10 have 2 definitions but only one def_type. */
+      return def_types[MIN2(idx, num_defs - 1u)];
+   }
+
+   fixed_reg get_def_fixed_reg(Instruction* instr, enum amd_gfx_level gfx_level, unsigned idx) const
+   {
+      if (gfx_level < GFX10 && def_fixed_reg[0] == fixed_exec && instr->isVOPC())
+         return idx == 0 ? not_fixed : fixed_exec;
+      else
+         return def_fixed_reg[idx];
+   }
 };
 
 typedef struct {
@@ -2614,6 +2657,7 @@ typedef struct {
    const int16_t opcode_gfx9[static_cast<int>(aco_opcode::num_opcodes)];
    const int16_t opcode_gfx10[static_cast<int>(aco_opcode::num_opcodes)];
    const int16_t opcode_gfx11[static_cast<int>(aco_opcode::num_opcodes)];
+   const int16_t opcode_gfx11_7[static_cast<int>(aco_opcode::num_opcodes)];
    const int16_t opcode_gfx12[static_cast<int>(aco_opcode::num_opcodes)];
    const std::bitset<static_cast<int>(aco_opcode::num_opcodes)> is_atomic;
    const char* name[static_cast<int>(aco_opcode::num_opcodes)];

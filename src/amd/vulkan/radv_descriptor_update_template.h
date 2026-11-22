@@ -27,8 +27,6 @@ struct radv_descriptor_update_template_entry {
    /* In dwords. Not valid/used for dynamic descriptors */
    uint32_t dst_stride;
 
-   uint32_t buffer_offset;
-
    /* Only valid for combined image samplers and samplers */
    uint8_t has_sampler;
    uint8_t has_ycbcr_sampler;
@@ -38,7 +36,7 @@ struct radv_descriptor_update_template_entry {
    size_t src_stride;
 
    /* For push descriptors */
-   const uint32_t *immutable_samplers;
+   const uint8_t *immutable_samplers;
 };
 
 struct radv_descriptor_update_template {

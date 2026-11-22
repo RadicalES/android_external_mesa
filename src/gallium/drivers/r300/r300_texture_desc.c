@@ -138,6 +138,14 @@ static unsigned r300_texture_get_stride(struct r300_screen *screen,
                                               tex->b.bind & PIPE_BIND_SCANOUT);
         width = align(width, tile_width);
 
+        /* NPOT textures use stride addressing (TX_PITCH_EN). Keep macro-tiled
+         * strides at an even number of macro tiles in X to prevent flakes. */
+        if (tex->b.target != PIPE_TEXTURE_3D &&
+            tex->tex.macrotile[level] &&
+            tex->tex.uses_stride_addressing) {
+            width = align(width, tile_width * 2);
+        }
+
         stride = util_format_get_stride(tex->b.format, width);
         /* The alignment to 32 bytes is sort of implied by the layout... */
         return stride;
@@ -358,11 +366,7 @@ static void r300_setup_hyperz_properties(struct r300_screen *screen,
         tex->tex.microtile) {
         unsigned i, pipes;
 
-        if (screen->caps.family == CHIP_RV530) {
-            pipes = screen->info.r300_num_z_pipes;
-        } else {
-            pipes = screen->info.r300_num_gb_pipes;
-        }
+        pipes = r300_hyperz_pipe_count(screen);
 
         for (i = 0; i <= tex->b.last_level; i++) {
             unsigned zcomp_numdw, zcompsize, hiz_numdw, stride, height;
@@ -595,11 +599,22 @@ void r300_texture_desc_init(struct r300_screen *rscreen,
 
     r300_setup_flags(tex);
 
-    /* Align a 3D NPOT texture to POT. */
+    /* Align NPOT texture targets which require a POT hardware layout. */
     if (base->target == PIPE_TEXTURE_3D && tex->tex.is_npot) {
         tex->tex.width0 = util_next_power_of_two(tex->tex.width0);
         tex->tex.height0 = util_next_power_of_two(tex->tex.height0);
         tex->tex.depth0 = util_next_power_of_two(tex->tex.depth0);
+    } else if (base->target == PIPE_TEXTURE_CUBE && tex->tex.is_npot) {
+        unsigned size = util_next_power_of_two(MAX2(tex->tex.width0,
+                                                    tex->tex.height0));
+        tex->tex.width0 = size;
+        tex->tex.height0 = size;
+
+        /* The padded POT layout doesn't need stride addressing, which would
+         * unnecessarily trigger the macro-tiled stride rounding workaround.
+         * Preserve it only for a resource with an explicit stride. */
+        if (!tex->tex.stride_in_bytes_override)
+            tex->tex.uses_stride_addressing = false;
     }
 
     /* Setup tiling. */

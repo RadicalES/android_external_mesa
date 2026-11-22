@@ -42,10 +42,6 @@ __calc_gmem_cache_offsets(const struct fd_dev_info *info, unsigned offset,
 {
    unsigned num_ccu = info->num_ccu;
 
-   /* This seems not to be load bearing, but keeping it for now to match blob: */
-   if (info->chip >= 8)
-      offset -= 0x78000;
-
    config->vpc_bv_pos_buf_offset = offset - (num_ccu * config->vpc_bv_pos_buf_size);
    offset = config->vpc_bv_pos_buf_offset;
 
@@ -75,9 +71,14 @@ fd6_calc_gmem_cache_offsets(const struct fd_dev_info *info, unsigned gmemsize_by
    uint32_t color_cache_size_gmem =
       color_cache_size /
       (1 << info->props.gmem_ccu_color_cache_fraction);
+   uint32_t depth_cache_size_gmem =
+      depth_cache_size /
+      (1 << info->props.gmem_ccu_depth_cache_fraction);
 
    sysmem->depth_ccu_offset = 0;
    sysmem->color_ccu_offset = sysmem->depth_ccu_offset + depth_cache_size;
+   sysmem->depth_cache_fraction =
+      info->props.sysmem_ccu_depth_cache_fraction;
 
    /* TODO we could unify gen7/gen8 setup.. gen7 is a subset.. */
    if (info->chip == 8) {
@@ -108,11 +109,16 @@ fd6_calc_gmem_cache_offsets(const struct fd_dev_info *info, unsigned gmemsize_by
          (gmem->vpc_attr_buf_size * info->num_ccu);
 
       gmem->color_ccu_offset = gmem->vpc_attr_buf_offset - color_cache_size_gmem;
+      /* Custom resolves can write depth through the CCU. */
+      gmem->depth_ccu_offset = gmem->color_ccu_offset - depth_cache_size_gmem;
+      gmem->depth_cache_fraction = info->props.gmem_ccu_depth_cache_fraction;
 
       return gmem->vpc_attr_buf_offset;
    } else {
-      gmem->depth_ccu_offset = 0;
       gmem->color_ccu_offset = gmemsize_bytes - color_cache_size_gmem;
+      /* Custom resolves can write depth through the CCU. */
+      gmem->depth_ccu_offset = gmem->color_ccu_offset - depth_cache_size_gmem;
+      gmem->depth_cache_fraction = info->props.gmem_ccu_depth_cache_fraction;
 
       return gmemsize_bytes;
    }

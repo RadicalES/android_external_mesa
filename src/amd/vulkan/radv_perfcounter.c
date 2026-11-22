@@ -6,12 +6,12 @@
 
 #include <inttypes.h>
 
+#include "tools/radv_sqtt.h"
 #include "ac_perfcounter.h"
 #include "amdgfxregs.h"
 #include "radv_cs.h"
 #include "radv_entrypoints.h"
 #include "radv_perfcounter.h"
-#include "radv_sqtt.h"
 #include "sid.h"
 
 void
@@ -99,7 +99,7 @@ enum radv_perfcounter_op {
 #define G_REG_OFFSET(x)    ((x) & 0xFFFF)
 #define S_REG_INSTANCES(x) ((x) << 16)
 #define G_REG_INSTANCES(x) (((x) >> 16) & 0x7FFF)
-#define S_REG_CONSTANT(x)  ((x) << 31)
+#define S_REG_CONSTANT(x)  ((unsigned)(x) << 31)
 #define G_REG_CONSTANT(x)  ((x) >> 31)
 
 struct radv_perfcounter_impl {
@@ -188,6 +188,14 @@ enum {
    GL2C_PERF_SEL_EA_RDREQ_64B_GFX103 = CTR(GL2C, 0x64),
    GL2C_PERF_SEL_EA_RDREQ_96B_GFX103 = CTR(GL2C, 0x65),
    GL2C_PERF_SEL_EA_RDREQ_128B_GFX103 = CTR(GL2C, 0x66),
+
+   GL2C_PERF_SEL_MISS_GFX12 = CTR(GL2C, 0x2a),
+   GL2C_PERF_SEL_MC_WRREQ_GFX12 = CTR(GL2C, 0x6c),
+   GL2C_PERF_SEL_EA_WRREQ_64B_GFX12 = CTR(GL2C, 0x72),
+   GL2C_PERF_SEL_EA_RDREQ_32B_GFX12 = CTR(GL2C, 0x92),
+   GL2C_PERF_SEL_EA_RDREQ_64B_GFX12 = CTR(GL2C, 0x93),
+   GL2C_PERF_SEL_EA_RDREQ_128B_GFX12 = CTR(GL2C, 0x94),
+   GL2C_PERF_SEL_EA_RDREQ_256B_GFX12 = CTR(GL2C, 0x95),
 };
 
 enum {
@@ -204,11 +212,35 @@ enum {
 };
 
 enum {
-   TCP_PERF_SEL_REQ_GFX10 = CTR(TCP, 0x9),
-   TCP_PERF_SEL_REQ_MISS_GFX10 = CTR(TCP, 0x12),
+   SQ_PERF_SEL_WAVES_GFX11 = CTR(SQ, 0x14),
+   SQ_PERF_SEL_INSTS_GDS_GFX11 = CTR(SQ_WGP, 0x36),
+   SQ_PERF_SEL_INSTS_LDS_GFX11 = CTR(SQ_WGP, 0x39),
+   SQ_PERF_SEL_INSTS_SALU_GFX11 = CTR(SQ_WGP, 0x3a),
+   SQ_PERF_SEL_INSTS_SMEM_GFX11 = CTR(SQ_WGP, 0x3b),
+   SQ_PERF_SEL_INSTS_VALU_GFX11 = CTR(SQ_WGP, 0x3e),
+   SQ_PERF_SEL_INSTS_TEX_LOAD_GFX11 = CTR(SQ_WGP, 0x42),
+   SQ_PERF_SEL_INSTS_TEX_STORE_GFX11 = CTR(SQ_WGP, 0x43),
+   SQ_PERF_SEL_INST_CYCLES_VALU_GFX11 = CTR(SQ_WGP, 0x67),
 };
 
-#define CTR_NUM_SIMD CONSTANT(pdev->info.cu_info.num_simd_per_compute_unit * pdev->info.num_cu)
+enum {
+   SQ_PERF_SEL_WAVES_GFX12 = CTR(SQ, 0x13),
+   SQ_PERF_SEL_INSTS_LDS_GFX12 = CTR(SQ_WGP, 0x2d),
+   SQ_PERF_SEL_INSTS_SALU_GFX12 = CTR(SQ_WGP, 0x2e),
+   SQ_PERF_SEL_INSTS_SMEM_GFX12 = CTR(SQ_WGP, 0x2f),
+   SQ_PERF_SEL_INSTS_VALU_GFX12 = CTR(SQ_WGP, 0x32),
+   SQ_PERF_SEL_INSTS_TEX_LOAD_GFX12 = CTR(SQ_WGP, 0x36),
+   SQ_PERF_SEL_INSTS_TEX_STORE_GFX12 = CTR(SQ_WGP, 0x37),
+   SQ_PERF_SEL_INST_CYCLES_VALU_GFX12 = CTR(SQ_WGP, 0x63),
+};
+
+enum {
+   TCP_PERF_SEL_REQ_GFX10 = CTR(TCP, 0x9),
+   TCP_PERF_SEL_REQ_MISS_GFX10 = CTR(TCP, 0x12),
+   TCP_PERF_SEL_REQ_MISS_GFX11 = CTR(TCP, 0x11),
+};
+
+#define CTR_NUM_SIMD CONSTANT(pdev->info.compiler_info.num_simd_per_compute_unit * pdev->info.num_cu)
 #define CTR_NUM_CUS  CONSTANT(pdev->info.num_cu)
 
 static void
@@ -219,32 +251,91 @@ radv_query_perfcounter_descs(struct radv_physical_device *pdev, uint32_t *count,
    ADD_PC(RADV_PC_OP_MAX, CYCLES, "GPU active cycles", "GRBM", "cycles the GPU is active processing a command buffer.",
           GPU_CYCLES, GRBM_PERF_SEL_GUI_ACTIVE);
 
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "Waves", "Shaders", "Number of waves executed", SHADER_WAVES, SQ_PERF_SEL_WAVES);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "Instructions", "Shaders", "Number of Instructions executed", SHADER_INSTRUCTIONS,
-          SQ_PERF_SEL_INSTS_ALL_GFX10);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "VALU Instructions", "Shaders", "Number of VALU Instructions executed",
-          SHADER_INSTRUCTIONS_VALU, SQ_PERF_SEL_INSTS_VALU_GFX10);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "SALU Instructions", "Shaders", "Number of SALU Instructions executed",
-          SHADER_INSTRUCTIONS_SALU, SQ_PERF_SEL_INSTS_SALU_GFX10);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Load Instructions", "Shaders", "Number of VMEM load instructions executed",
-          SHADER_INSTRUCTIONS_VMEM_LOAD, SQ_PERF_SEL_INSTS_TEX_LOAD_GFX10);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "SMEM Load Instructions", "Shaders", "Number of SMEM load instructions executed",
-          SHADER_INSTRUCTIONS_SMEM_LOAD, SQ_PERF_SEL_INSTS_SMEM_GFX10);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Store Instructions", "Shaders", "Number of VMEM store instructions executed",
-          SHADER_INSTRUCTIONS_VMEM_STORE, SQ_PERF_SEL_INSTS_TEX_STORE_GFX10);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "LDS Instructions", "Shaders", "Number of LDS Instructions executed",
-          SHADER_INSTRUCTIONS_LDS, SQ_PERF_SEL_INSTS_LDS_GFX10);
-   ADD_PC(RADV_PC_OP_SUM, GENERIC, "GDS Instructions", "Shaders", "Number of GDS Instructions executed",
-          SHADER_INSTRUCTIONS_GDS, SQ_PERF_SEL_INSTS_GDS_GFX10);
+   if (pdev->info.gfx_level >= GFX12) {
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "Waves", "Shaders", "Number of waves executed", SHADER_WAVES,
+             SQ_PERF_SEL_WAVES_GFX12);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VALU Instructions", "Shaders", "Number of VALU Instructions executed",
+             SHADER_INSTRUCTIONS_VALU, SQ_PERF_SEL_INSTS_VALU_GFX12);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "SALU Instructions", "Shaders", "Number of SALU Instructions executed",
+             SHADER_INSTRUCTIONS_SALU, SQ_PERF_SEL_INSTS_SALU_GFX12);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Load Instructions", "Shaders", "Number of VMEM load instructions executed",
+             SHADER_INSTRUCTIONS_VMEM_LOAD, SQ_PERF_SEL_INSTS_TEX_LOAD_GFX12);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "SMEM Load Instructions", "Shaders", "Number of SMEM load instructions executed",
+             SHADER_INSTRUCTIONS_SMEM_LOAD, SQ_PERF_SEL_INSTS_SMEM_GFX12);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Store Instructions", "Shaders",
+             "Number of VMEM store instructions executed", SHADER_INSTRUCTIONS_VMEM_STORE,
+             SQ_PERF_SEL_INSTS_TEX_STORE_GFX12);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "LDS Instructions", "Shaders", "Number of LDS Instructions executed",
+             SHADER_INSTRUCTIONS_LDS, SQ_PERF_SEL_INSTS_LDS_GFX12);
 
-   ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "VALU Busy", "Shader Utilization",
-          "Percentage of time the VALU units are busy", SHADER_VALU_BUSY, SQ_PERF_SEL_INST_CYCLES_VALU_GFX10,
-          CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_SIMD);
-   ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "SALU Busy", "Shader Utilization",
-          "Percentage of time the SALU units are busy", SHADER_SALU_BUSY, SQ_PERF_SEL_INSTS_SALU_GFX10,
-          CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_CUS);
+      ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "VALU Busy", "Shader Utilization",
+             "Percentage of time the VALU units are busy", SHADER_VALU_BUSY, SQ_PERF_SEL_INST_CYCLES_VALU_GFX12,
+             CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_SIMD);
+      ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "SALU Busy", "Shader Utilization",
+             "Percentage of time the SALU units are busy", SHADER_SALU_BUSY, SQ_PERF_SEL_INSTS_SALU_GFX12,
+             CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_CUS);
+   } else if (pdev->info.gfx_level >= GFX11) {
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "Waves", "Shaders", "Number of waves executed", SHADER_WAVES,
+             SQ_PERF_SEL_WAVES_GFX11);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VALU Instructions", "Shaders", "Number of VALU Instructions executed",
+             SHADER_INSTRUCTIONS_VALU, SQ_PERF_SEL_INSTS_VALU_GFX11);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "SALU Instructions", "Shaders", "Number of SALU Instructions executed",
+             SHADER_INSTRUCTIONS_SALU, SQ_PERF_SEL_INSTS_SALU_GFX11);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Load Instructions", "Shaders", "Number of VMEM load instructions executed",
+             SHADER_INSTRUCTIONS_VMEM_LOAD, SQ_PERF_SEL_INSTS_TEX_LOAD_GFX11);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "SMEM Load Instructions", "Shaders", "Number of SMEM load instructions executed",
+             SHADER_INSTRUCTIONS_SMEM_LOAD, SQ_PERF_SEL_INSTS_SMEM_GFX11);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Store Instructions", "Shaders",
+             "Number of VMEM store instructions executed", SHADER_INSTRUCTIONS_VMEM_STORE,
+             SQ_PERF_SEL_INSTS_TEX_STORE_GFX11);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "LDS Instructions", "Shaders", "Number of LDS Instructions executed",
+             SHADER_INSTRUCTIONS_LDS, SQ_PERF_SEL_INSTS_LDS_GFX11);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "GDS Instructions", "Shaders", "Number of GDS Instructions executed",
+             SHADER_INSTRUCTIONS_GDS, SQ_PERF_SEL_INSTS_GDS_GFX11);
 
-   if (pdev->info.gfx_level >= GFX10_3) {
+      ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "VALU Busy", "Shader Utilization",
+             "Percentage of time the VALU units are busy", SHADER_VALU_BUSY, SQ_PERF_SEL_INST_CYCLES_VALU_GFX11,
+             CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_SIMD);
+      ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "SALU Busy", "Shader Utilization",
+             "Percentage of time the SALU units are busy", SHADER_SALU_BUSY, SQ_PERF_SEL_INSTS_SALU_GFX11,
+             CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_CUS);
+   } else {
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "Waves", "Shaders", "Number of waves executed", SHADER_WAVES, SQ_PERF_SEL_WAVES);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "Instructions", "Shaders", "Number of Instructions executed", SHADER_INSTRUCTIONS,
+             SQ_PERF_SEL_INSTS_ALL_GFX10);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VALU Instructions", "Shaders", "Number of VALU Instructions executed",
+             SHADER_INSTRUCTIONS_VALU, SQ_PERF_SEL_INSTS_VALU_GFX10);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "SALU Instructions", "Shaders", "Number of SALU Instructions executed",
+             SHADER_INSTRUCTIONS_SALU, SQ_PERF_SEL_INSTS_SALU_GFX10);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Load Instructions", "Shaders", "Number of VMEM load instructions executed",
+             SHADER_INSTRUCTIONS_VMEM_LOAD, SQ_PERF_SEL_INSTS_TEX_LOAD_GFX10);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "SMEM Load Instructions", "Shaders", "Number of SMEM load instructions executed",
+             SHADER_INSTRUCTIONS_SMEM_LOAD, SQ_PERF_SEL_INSTS_SMEM_GFX10);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "VMEM Store Instructions", "Shaders",
+             "Number of VMEM store instructions executed", SHADER_INSTRUCTIONS_VMEM_STORE,
+             SQ_PERF_SEL_INSTS_TEX_STORE_GFX10);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "LDS Instructions", "Shaders", "Number of LDS Instructions executed",
+             SHADER_INSTRUCTIONS_LDS, SQ_PERF_SEL_INSTS_LDS_GFX10);
+      ADD_PC(RADV_PC_OP_SUM, GENERIC, "GDS Instructions", "Shaders", "Number of GDS Instructions executed",
+             SHADER_INSTRUCTIONS_GDS, SQ_PERF_SEL_INSTS_GDS_GFX10);
+
+      ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "VALU Busy", "Shader Utilization",
+             "Percentage of time the VALU units are busy", SHADER_VALU_BUSY, SQ_PERF_SEL_INST_CYCLES_VALU_GFX10,
+             CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_SIMD);
+      ADD_PC(RADV_PC_OP_RATIO_DIVSCALE, PERCENTAGE, "SALU Busy", "Shader Utilization",
+             "Percentage of time the SALU units are busy", SHADER_SALU_BUSY, SQ_PERF_SEL_INSTS_SALU_GFX10,
+             CPF_PERF_SEL_CPF_STAT_BUSY_GFX10, CTR_NUM_CUS);
+   }
+
+   if (pdev->info.gfx_level >= GFX12) {
+      ADD_PC(RADV_PC_OP_SUM_WEIGHTED_4, BYTES, "VRAM read size", "Memory", "Number of bytes read from VRAM",
+             VRAM_READ_SIZE, GL2C_PERF_SEL_EA_RDREQ_32B_GFX12, CONSTANT(32), GL2C_PERF_SEL_EA_RDREQ_64B_GFX12,
+             CONSTANT(64), GL2C_PERF_SEL_EA_RDREQ_128B_GFX12, CONSTANT(128), GL2C_PERF_SEL_EA_RDREQ_256B_GFX12,
+             CONSTANT(256));
+      ADD_PC(RADV_PC_OP_SUM_WEIGHTED_4, BYTES, "VRAM write size", "Memory", "Number of bytes written to VRAM",
+             VRAM_WRITE_SIZE, GL2C_PERF_SEL_MC_WRREQ_GFX12, CONSTANT(32), GL2C_PERF_SEL_EA_WRREQ_64B_GFX12,
+             CONSTANT(64), CONSTANT(0), CONSTANT(0), CONSTANT(0), CONSTANT(0));
+   } else if (pdev->info.gfx_level >= GFX10_3) {
       ADD_PC(RADV_PC_OP_SUM_WEIGHTED_4, BYTES, "VRAM read size", "Memory", "Number of bytes read from VRAM",
              VRAM_READ_SIZE, GL2C_PERF_SEL_EA_RDREQ_32B_GFX103, CONSTANT(32), GL2C_PERF_SEL_EA_RDREQ_64B_GFX103,
              CONSTANT(64), GL2C_PERF_SEL_EA_RDREQ_96B_GFX103, CONSTANT(96), GL2C_PERF_SEL_EA_RDREQ_128B_GFX103,
@@ -262,11 +353,22 @@ radv_query_perfcounter_descs(struct radv_physical_device *pdev, uint32_t *count,
              CONSTANT(32), CONSTANT(0), CONSTANT(0), CONSTANT(0), CONSTANT(0));
    }
 
-   ADD_PC(RADV_PC_OP_REVERSE_RATIO, BYTES, "L0 cache hit ratio", "Memory", "Hit ratio of L0 cache", L0_CACHE_HIT_RATIO,
-          TCP_PERF_SEL_REQ_MISS_GFX10, TCP_PERF_SEL_REQ_GFX10);
-   ADD_PC(RADV_PC_OP_REVERSE_RATIO, BYTES, "L1 cache hit ratio", "Memory", "Hit ratio of L1 cache", L1_CACHE_HIT_RATIO,
-          GL1C_PERF_SEL_REQ_MISS, GL1C_PERF_SEL_REQ);
-   if (pdev->info.gfx_level >= GFX10_3) {
+   if (pdev->info.gfx_level >= GFX11) {
+      ADD_PC(RADV_PC_OP_REVERSE_RATIO, BYTES, "L0 cache hit ratio", "Memory", "Hit ratio of L0 cache",
+             L0_CACHE_HIT_RATIO, TCP_PERF_SEL_REQ_MISS_GFX11, TCP_PERF_SEL_REQ_GFX10);
+   } else {
+      ADD_PC(RADV_PC_OP_REVERSE_RATIO, BYTES, "L0 cache hit ratio", "Memory", "Hit ratio of L0 cache",
+             L0_CACHE_HIT_RATIO, TCP_PERF_SEL_REQ_MISS_GFX10, TCP_PERF_SEL_REQ_GFX10);
+   }
+
+   if (pdev->info.gfx_level < GFX12)
+      ADD_PC(RADV_PC_OP_REVERSE_RATIO, BYTES, "L1 cache hit ratio", "Memory", "Hit ratio of L1 cache",
+             L1_CACHE_HIT_RATIO, GL1C_PERF_SEL_REQ_MISS, GL1C_PERF_SEL_REQ);
+
+   if (pdev->info.gfx_level >= GFX12) {
+      ADD_PC(RADV_PC_OP_REVERSE_RATIO, BYTES, "L2 cache hit ratio", "Memory", "Hit ratio of L2 cache",
+             L2_CACHE_HIT_RATIO, GL2C_PERF_SEL_MISS_GFX12, GL2C_PERF_SEL_REQ);
+   } else if (pdev->info.gfx_level >= GFX10_3) {
       ADD_PC(RADV_PC_OP_REVERSE_RATIO, BYTES, "L2 cache hit ratio", "Memory", "Hit ratio of L2 cache",
              L2_CACHE_HIT_RATIO, GL2C_PERF_SEL_MISS_GFX103, GL2C_PERF_SEL_REQ);
    } else {
@@ -486,9 +588,11 @@ radv_emit_select(struct radv_cmd_buffer *cmd_buffer, struct ac_pc_block *block, 
                                      G_REG_SEL(selectors[idx]) | regs->select_or);
    }
 
-   for (idx = 0; idx < regs->num_spm_modules; idx++) {
-      radeon_set_uconfig_reg_seq(regs->select1[idx], 1);
-      radeon_emit(0);
+   if (regs->select1) {
+      for (idx = 0; idx < regs->num_spm_modules; idx++) {
+         radeon_set_uconfig_reg_seq(regs->select1[idx], 1);
+         radeon_emit(0);
+      }
    }
 
    radeon_end();
@@ -539,23 +643,53 @@ radv_pc_sample_block(struct radv_cmd_buffer *cmd_buffer, struct ac_pc_block *blo
 static void
 radv_pc_wait_idle(struct radv_cmd_buffer *cmd_buffer)
 {
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
 
-   radeon_begin(cs);
+   enum ac_barrier_flags flush_bits = AC_BARRIER_SYNC_CS | AC_BARRIER_SYNC_VS | AC_BARRIER_SYNC_PS |
+                                      AC_BARRIER_SYNC_AND_INV_CB | AC_BARRIER_SYNC_AND_INV_DB | AC_BARRIER_PFP_SYNC_ME;
+   enum ac_rgp_flush_bits sqtt_flush_bits = 0;
 
-   radeon_event_write(V_028A90_CS_PARTIAL_FLUSH);
+   radv_cs_emit_cache_flush(device->ws, cs, pdev->info.gfx_level, &cmd_buffer->eop_fence_idx, cmd_buffer->eop_fence_va,
+                            flush_bits, &sqtt_flush_bits, AC_PWS_ACQUIRE_POINT_PFP, 0);
+}
 
-   radeon_emit(PKT3(PKT3_ACQUIRE_MEM, 6, 0));
-   radeon_emit(0);          /* CP_COHER_CNTL */
-   radeon_emit(0xffffffff); /* CP_COHER_SIZE */
-   radeon_emit(0xffffff);   /* CP_COHER_SIZE_HI */
-   radeon_emit(0);          /* CP_COHER_BASE */
-   radeon_emit(0);          /* CP_COHER_BASE_HI */
-   radeon_emit(0x0000000A); /* POLL_INTERVAL */
-   radeon_emit(0);          /* GCR_CNTL */
-   radeon_end();
+/**
+ * On GFX12, the GRBM module in SQG is re-designed and the order of CP write/read transactions
+ * cannot be guaranteed. That can potentially break the usage of the perf counter in legacy mode.
+ * Since the read can be ahead of the write, wrong perf counters results may be reported. The
+ * workaround is to wait for DISABLE_ME1PIPE3_PERF to bet set after sampling.
+ */
+static void
+radv_gfx12_emit_sq_sync_wa(struct radv_cmd_buffer *cmd_buffer, bool disable)
+{
+   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_cmd_stream *cs = cmd_buffer->cs;
+   const uint32_t value = 0x7f /* all shaders */ | S_036760_DISABLE_ME1PIPE3_PERF(disable);
 
-   ac_emit_cp_pfp_sync_me(cs->b, false);
+   if (pdev->info.gfx_level != GFX12)
+      return;
+
+   for (unsigned se = 0; se < pdev->info.max_se; se++) {
+      radv_emit_instance(cmd_buffer, se, -1);
+
+      radeon_begin(cs);
+      radeon_set_uconfig_reg(R_036760_SQG_PERFCOUNTER_CTRL, value);
+
+      /* Wait for DISABLE_ME1PIPE3_PERF to be set. */
+      radeon_emit(PKT3(PKT3_WAIT_REG_MEM, 5, 0));
+      radeon_emit(WAIT_REG_MEM_EQUAL); /* register space */
+      radeon_emit(R_036760_SQG_PERFCOUNTER_CTRL >> 2);
+      radeon_emit(0);
+      radeon_emit(value);      /* reference value */
+      radeon_emit(0xffffffff); /* mask */
+      radeon_emit(4);          /* poll interval */
+      radeon_end();
+   }
+
+   radv_emit_instance(cmd_buffer, -1, -1);
 }
 
 static void
@@ -570,6 +704,8 @@ radv_pc_stop_and_sample(struct radv_cmd_buffer *cmd_buffer, struct radv_pc_query
    radv_emit_instance(cmd_buffer, -1, -1);
    radv_emit_windowed_counters(device, cs, false);
    radv_perfcounter_emit_stop(cs);
+
+   radv_gfx12_emit_sq_sync_wa(cmd_buffer, !end);
 
    for (unsigned pass = 0; pass < pool->num_passes; ++pass) {
       uint64_t pred_va = radv_buffer_get_va(device->perf_counter_bo) + PERF_CTR_BO_PASS_OFFSET + 8 * pass;
@@ -602,7 +738,7 @@ radv_pc_stop_and_sample(struct radv_cmd_buffer *cmd_buffer, struct radv_pc_query
       if (end) {
          uint64_t signal_va = va + pool->b.stride - 8 - 8 * pass;
 
-         ac_emit_cp_write_data_imm(cs->b, V_370_ME, signal_va, 1);
+         ac_emit_cp_write_data_imm(cs->b, V_371_MICRO_ENGINE, signal_va, 1);
       }
 
       *skip_dwords = cs->b->buf + cs->b->cdw - skip_dwords - 1;
@@ -619,18 +755,19 @@ radv_pc_begin_query(struct radv_cmd_buffer *cmd_buffer, struct radv_pc_query_poo
    const struct radv_physical_device *pdev = radv_device_physical(device);
    ASSERTED unsigned cdw_max;
 
-   cmd_buffer->state.uses_perf_counters = true;
+   cmd_buffer->queue_state.uses_perf_counters = true;
 
    cdw_max = radeon_check_space(device->ws, cs->b,
-                                256 +                      /* Random one time stuff */
-                                   10 * pool->num_passes + /* COND_EXECs */
+                                256 +                       /* Random one time stuff */
+                                   16 * pdev->info.max_se + /* GFX12 SQG timing-race WA */
+                                   10 * pool->num_passes +  /* COND_EXECs */
                                    pool->b.stride / 8 * (5 + 8));
 
    radv_cs_add_buffer(device->ws, cs->b, pool->b.bo);
    radv_cs_add_buffer(device->ws, cs->b, device->perf_counter_bo);
 
    uint64_t perf_ctr_va = radv_buffer_get_va(device->perf_counter_bo) + PERF_CTR_BO_FENCE_OFFSET;
-   ac_emit_cp_write_data_imm(cs->b, V_370_ME, perf_ctr_va, 0);
+   ac_emit_cp_write_data_imm(cs->b, V_371_MICRO_ENGINE, perf_ctr_va, 0);
 
    radv_pc_wait_idle(cmd_buffer);
    radv_perfcounter_emit_reset(cs);
@@ -686,7 +823,8 @@ radv_pc_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_pc_query_pool 
 
    cdw_max = radeon_check_space(device->ws, cs->b,
                                 256 + /* Reserved for things that don't scale with passes/counters */
-                                   5 * pool->num_passes + /* COND_EXECs */
+                                   16 * pdev->info.max_se + /* GFX12 SQG timing-race WA */
+                                   5 * pool->num_passes +   /* COND_EXECs */
                                    pool->b.stride / 8 * 8);
 
    radv_cs_add_buffer(device->ws, cs->b, pool->b.bo);
@@ -695,8 +833,8 @@ radv_pc_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_pc_query_pool 
    uint64_t perf_ctr_va = radv_buffer_get_va(device->perf_counter_bo) + PERF_CTR_BO_FENCE_OFFSET;
    radv_cs_emit_write_event_eop(cs, pdev->info.gfx_level, V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM,
                                 EOP_INT_SEL_SEND_DATA_AFTER_WR_CONFIRM, EOP_DATA_SEL_VALUE_32BIT, perf_ctr_va, 1,
-                                cmd_buffer->gfx9_fence_va);
-   radv_cp_wait_mem(cs, WAIT_REG_MEM_EQUAL, perf_ctr_va, 1, 0xffffffff);
+                                cmd_buffer->eop_fence_va);
+   ac_emit_cp_wait_mem(cs->b, perf_ctr_va, 1, 0xffffffff, WAIT_REG_MEM_EQUAL);
 
    radv_pc_wait_idle(cmd_buffer);
    radv_pc_stop_and_sample(cmd_buffer, pool, va, true);

@@ -36,6 +36,7 @@
 #define LP_SCENE_H
 
 #include "util/u_thread.h"
+#include "util/u_atomic.h"
 #include "lp_rast.h"
 #include "lp_debug.h"
 
@@ -198,6 +199,7 @@ struct lp_scene {
    unsigned tiles_x, tiles_y;
 
    int curr_x, curr_y;  /**< for iterating over bins */
+   int curr_bin;        /**< atomic index for iterating over bins */
    mtx_t mutex;
 
    unsigned num_alloced_tiles;
@@ -293,7 +295,9 @@ lp_scene_alloc_aligned(struct lp_scene *scene, unsigned size,
 
    {
       uint8_t *data = block->data + block->used;
-      unsigned offset = (((uintptr_t)data + alignment - 1) & ~(alignment - 1)) - (uintptr_t)data;
+      unsigned offset =
+         (((uintptr_t)data + alignment - 1) & ~((uintptr_t)alignment - 1)) -
+         (uintptr_t)data;
       block->used += offset + size;
       return data + offset;
    }

@@ -23,6 +23,9 @@
  *
  * Authors:
  *    Chia-I Wu <olv@lunarg.com>
+ *
+ * Modifications Copyright (C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
+ *
  */
 
 #include "main/mtypes.h"
@@ -241,8 +244,18 @@ st_framebuffer_validate(struct gl_framebuffer *stfb,
       new_stamp = p_atomic_read(&stfb->drawable->stamp);
    } while(stfb->drawable_stamp != new_stamp);
 
-   width = stfb->Width;
-   height = stfb->Height;
+   /* the color buffer defines the size: after a resize through another context
+    * the depth buffer can still have the old size, and is reallocated to match
+    */
+   int size_idx = -1;
+   for (i = 0; i < stfb->num_statts; i++) {
+      if (!textures[i] || attachment_to_buffer_index(stfb->statts[i]) >= BUFFER_COUNT)
+         continue;
+      if (stfb->statts[i] != ST_ATTACHMENT_DEPTH_STENCIL)
+         size_idx = i;
+   }
+   width = size_idx < 0 ? stfb->Width : textures[size_idx]->width0;
+   height = size_idx < 0 ? stfb->Height : textures[size_idx]->height0;
 
    for (i = 0; i < stfb->num_statts; i++) {
       struct gl_renderbuffer *rb;
@@ -271,9 +284,6 @@ st_framebuffer_validate(struct gl_framebuffer *stfb,
       st_set_ws_renderbuffer_surface(rb, &surf_tmpl);
 
       changed = true;
-
-      width = rb->Width;
-      height = rb->Height;
 
       pipe_resource_reference(&textures[i], NULL);
    }
@@ -397,6 +407,9 @@ st_new_renderbuffer_fb(enum pipe_format format, unsigned samples, bool sw)
       break;
    case PIPE_FORMAT_Z32_UNORM:
       rb->InternalFormat = GL_DEPTH_COMPONENT32;
+      break;
+   case PIPE_FORMAT_Z32_FLOAT:
+      rb->InternalFormat = GL_DEPTH_COMPONENT32F;
       break;
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
    case PIPE_FORMAT_S8_UINT_Z24_UNORM:
@@ -803,7 +816,7 @@ st_context_flush(struct st_context *st, unsigned flags,
    st_flush(st, fence, pipe_flags);
 
    if ((flags & ST_FLUSH_WAIT) && fence && *fence) {
-      st->screen->fence_finish(st->screen, NULL, *fence,
+      st->screen->fence_finish(st->screen, st->pipe, *fence,
                                      OS_TIMEOUT_INFINITE);
       st->screen->fence_reference(st->screen, fence, NULL);
    }
@@ -878,6 +891,14 @@ st_context_teximage(struct st_context *st, GLenum target,
    pipe_resource_reference(&texImage->pt, tex);
    texObj->surface_format = pipe_format;
 
+   /* Cache whether the extra YUV plane-view / lowering setup in
+    * st_get_sampler_views() and st_get_external_sampler_key() must run for
+    * this texture. st_finalize_texture() returns early for surface_based
+    * textures without computing this.
+    */
+   texObj->needs_yuv_plane_views = tex &&
+      st_needs_yuv_plane_views(st->screen, pipe_format, tex);
+
    texObj->needs_validation = true;
 
    _mesa_dirty_texobj(ctx, texObj);
@@ -909,6 +930,34 @@ st_context_invalidate_state(struct st_context *st, unsigned flags)
    }
    if (flags & ST_INVALIDATE_FB_STATE)
       ST_SET_STATE(ctx->NewDriverState, ST_NEW_FB_STATE);
+   if (flags & ST_INVALIDATE_VIEWPORT)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_VIEWPORT);
+   if (flags & ST_INVALIDATE_VS_STATE)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_VS_STATE);
+   if (flags & ST_INVALIDATE_GS_STATE)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_GS_STATE);
+   if (flags & ST_INVALIDATE_TCS_STATE)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_TCS_STATE);
+   if (flags & ST_INVALIDATE_TES_STATE)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_TES_STATE);
+   if (flags & ST_INVALIDATE_MESH_STATE)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_MS_STATE);
+   if (flags & ST_INVALIDATE_RASTERIZER)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_RASTERIZER);
+   if (flags & ST_INVALIDATE_FS_SAMPLERS)
+      ST_SET_STATE2(ctx->NewDriverState, ST_NEW_FS_SAMPLERS, ST_NEW_FS_SAMPLER_VIEWS);
+   if (flags & ST_INVALIDATE_FS_STATE)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_FS_STATE);
+   if (flags & ST_INVALIDATE_BLEND)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_BLEND);
+   if (flags & ST_INVALIDATE_DSA)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_DSA);
+   if (flags & ST_INVALIDATE_SAMPLE_MASK)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_SAMPLE_STATE);
+   if (flags & ST_INVALIDATE_SAMPLE_SHADING)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_SAMPLE_SHADING);
+   if (flags & ST_INVALIDATE_FS_IMAGES)
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_FS_IMAGES);
 }
 
 
@@ -992,6 +1041,9 @@ st_api_create_context(struct pipe_frontend_screen *fscreen,
       return NULL;
    }
 
+   if (attribs->context_flags & PIPE_CONTEXT_PROTECTED)
+      st->ctx->Const.ContextFlags |= GL_CONTEXT_FLAG_PROTECTED_CONTENT_BIT_EXT;
+
    if (attribs->flags & ST_CONTEXT_FLAG_DEBUG) {
       if (!_mesa_set_debug_state_int(st->ctx, GL_DEBUG_OUTPUT, GL_TRUE)) {
          *error = ST_CONTEXT_ERROR_NO_MEMORY;
@@ -1034,8 +1086,7 @@ st_api_create_context(struct pipe_frontend_screen *fscreen,
 
    st->can_scissor_clear = !!st->screen->caps.clear_scissored;
 
-   st->ctx->invalidate_on_gl_viewport =
-      fscreen->get_param(fscreen, ST_MANAGER_BROKEN_INVALIDATE);
+   st->ctx->invalidate_on_gl_viewport = fscreen->broken_invalidate;
 
    st->frontend_screen = fscreen;
 
@@ -1324,7 +1375,7 @@ get_version(struct pipe_screen *screen,
    _mesa_init_constants(&consts, api);
    _mesa_init_extensions(&extensions);
 
-   st_init_limits(screen, &consts, &extensions, api);
+   st_init_limits(screen, &consts, &extensions, options, api);
    st_init_extensions(screen, &consts, &extensions, options, api);
    version = _mesa_get_version(&extensions, &consts, api);
    free(consts.SpirVExtensions);

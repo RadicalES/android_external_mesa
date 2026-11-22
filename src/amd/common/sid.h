@@ -9,6 +9,9 @@
 
 #include "amdgfxregs.h"
 
+#include "amd_cp_packets_gfx11.h"
+#include "amd_cp_packets_gfx12.h"
+
 /* si values */
 #define SI_CONFIG_REG_OFFSET       0x00008000
 #define SI_CONFIG_REG_END          0x0000B000
@@ -33,10 +36,6 @@
 #define SI_SHADOWED_REG_BUFFER_SIZE                                                                \
    (SI_SH_REG_SPACE_SIZE + SI_CONTEXT_REG_SPACE_SIZE + SI_UCONFIG_REG_SPACE_SIZE)
 
-/* All registers defined in this packet section don't exist and the only
- * purpose of these definitions is to define packet encoding that
- * the IB parser understands, and also to have an accurate documentation.
- */
 #define PKT3_NOP                                   0x10
 #define PKT3_SET_BASE                              0x11
 #define PKT3_CLEAR_STATE                           0x12
@@ -44,57 +43,27 @@
 #define PKT3_DISPATCH_DIRECT                       0x15
 #define PKT3_DISPATCH_INDIRECT                     0x16
 #define PKT3_ATOMIC_MEM                            0x1E
-#define   ATOMIC_OP(x)                                ((unsigned)((x)&0x7f) << 0)
-#define     TC_OP_ATOMIC_SUB_RTN_32                   16
-#define     TC_OP_ATOMIC_SUB_RTN_64                   48
-#define     TC_OP_ATOMIC_CMPSWAP_32                   72
-#define     TC_OP_ATOMIC_SUB_64                       112
-#define     TC_OP_ATOMIC_XOR_64                       119
-#define   ATOMIC_COMMAND(x)                           ((unsigned)((x)&0x3) << 8)
-#define   ATOMIC_COMMAND_SEND_RTN                     0x0 /* only RTN opcodes */
-#define   ATOMIC_COMMAND_LOOP                         0x1 /* only RTN opcodes */
-#define   ATOMIC_COMMAND_WR_CONFIRM                   0x2 /* only non-RTN opcodes */
-#define   ATOMIC_COMMAND_SEND_NO_RTN                  0x3 /* only non-RTN opcodes */
-#define   ATOMIC_ENGINE_PFP                           (1 << 30)
 #define PKT3_OCCLUSION_QUERY                       0x1F /* GFX7+ */
 #define PKT3_SET_PREDICATION                       0x20
-#define   PREDICATION_DRAW_NOT_VISIBLE                (0 << 8)
-#define   PREDICATION_DRAW_VISIBLE                    (1 << 8)
-#define   PREDICATION_HINT_WAIT                       (0 << 12)
-#define   PREDICATION_HINT_NOWAIT_DRAW                (1 << 12)
-#define   PRED_OP(x)                                  ((x) << 16)
-#define     PREDICATION_OP_CLEAR                      0x0
-#define     PREDICATION_OP_ZPASS                      0x1
-#define     PREDICATION_OP_PRIMCOUNT                  0x2
-#define     PREDICATION_OP_BOOL64                     0x3
-#define     PREDICATION_OP_BOOL32                     0x4
-#define   PREDICATION_CONTINUE                        (1 << 31)
+#define   PREDICATION_DRAW_NOT_VISIBLE                S_201_PRED_BOOL(V_201_DRAW_IF_NOT_VISIBLE_OR_OVERFLOW)
+#define   PREDICATION_DRAW_VISIBLE                    S_201_PRED_BOOL(V_201_DRAW_IF_VISIBLE_OR_NO_OVERFLOW)
+#define   PREDICATION_HINT_WAIT                       S_201_HINT(V_201_WAIT_UNTIL_FINAL_ZPASS_WRITTEN)
+#define   PREDICATION_HINT_NOWAIT_DRAW                S_201_HINT(V_201_DRAW_IF_NOT_FINAL_ZPASS_WRITTEN)
+#define     PREDICATION_OP_CLEAR                      V_201_CLEAR_PREDICATE
+#define     PREDICATION_OP_ZPASS                      V_201_SET_ZPASS_PREDICATE
+#define     PREDICATION_OP_PRIMCOUNT                  V_201_SET_PRIMCOUNT_PREDICATE
+#define     PREDICATION_OP_BOOL64                     V_201_DX12
+#define     PREDICATION_OP_BOOL32                     V_201_VULKAN
+#define   PREDICATION_CONTINUE                        S_201_CONTINUE_BIT(V_201_CONTINUE_SET_PREDICATION)
 #define PKT3_COND_EXEC                             0x22
-#define   COND_EXEC_USERQ_OVERRULE_CMD                (1 << 31)
 #define PKT3_PRED_EXEC                             0x23
 #define PKT3_DRAW_INDIRECT                         0x24
 #define PKT3_DRAW_INDEX_INDIRECT                   0x25
 #define PKT3_INDEX_BASE                            0x26
 #define PKT3_DRAW_INDEX_2                          0x27
 #define PKT3_CONTEXT_CONTROL                       0x28
-#define   CC0_LOAD_GLOBAL_CONFIG(x)                   (((unsigned)(x)&0x1) << 0)
-#define   CC0_LOAD_PER_CONTEXT_STATE(x)               (((unsigned)(x)&0x1) << 1)
-#define   CC0_LOAD_GLOBAL_UCONFIG(x)                  (((unsigned)(x)&0x1) << 15)
-#define   CC0_LOAD_GFX_SH_REGS(x)                     (((unsigned)(x)&0x1) << 16)
-#define   CC0_LOAD_CS_SH_REGS(x)                      (((unsigned)(x)&0x1) << 24)
-#define   CC0_LOAD_CE_RAM(x)                          (((unsigned)(x)&0x1) << 28)
-#define   CC0_UPDATE_LOAD_ENABLES(x)                  (((unsigned)(x)&0x1) << 31)
-#define   CC1_SHADOW_GLOBAL_CONFIG(x)                 (((unsigned)(x)&0x1) << 0)
-#define   CC1_SHADOW_PER_CONTEXT_STATE(x)             (((unsigned)(x)&0x1) << 1)
-#define   CC1_SHADOW_GLOBAL_UCONFIG(x)                (((unsigned)(x)&0x1) << 15)
-#define   CC1_SHADOW_GFX_SH_REGS(x)                   (((unsigned)(x)&0x1) << 16)
-#define   CC1_SHADOW_CS_SH_REGS(x)                    (((unsigned)(x)&0x1) << 24)
-#define   CC1_UPDATE_SHADOW_ENABLES(x)                (((unsigned)(x)&0x1) << 31)
 #define PKT3_INDEX_TYPE                            0x2A /* GFX6-8 */
 #define PKT3_DRAW_INDIRECT_MULTI                   0x2C
-#define   R_2C3_DRAW_INDEX_LOC                     0x2C3
-#define   S_2C3_COUNT_INDIRECT_ENABLE(x)              (((unsigned)(x)&0x1) << 30)
-#define   S_2C3_DRAW_INDEX_ENABLE(x)                  (((unsigned)(x)&0x1) << 31)
 #define PKT3_DRAW_INDEX_AUTO                       0x2D
 #define PKT3_DRAW_INDEX_IMMD                       0x2E /* GFX6 only */
 #define PKT3_NUM_INSTANCES                         0x2F
@@ -124,11 +93,9 @@
 #define   WAIT_REG_MEM_GREATER_OR_EQUAL               5
 #define   WAIT_REG_MEM_MEM_SPACE(x)                   (((unsigned)(x)&0x3) << 4)
 #define   WAIT_REG_MEM_PFP                            (1 << 8)
+#define   WAIT_REG_MEM_UNCACHED_VI_MEC                (1 << 10)
 #define PKT3_MEM_WRITE                             0x3D /* GFX6 only */
 #define PKT3_INDIRECT_BUFFER                       0x3F /* GFX6+ */
-#define   S_3F3_INHERIT_VMID_MQD_GFX(x)               (((unsigned)(x)&0x1) << 22) /* userqueue only */
-#define   S_3F3_VALID_COMPUTE(x)                      (((unsigned)(x)&0x1) << 23) /* userqueue only */
-#define   S_3F3_INHERIT_VMID_MQD_COMPUTE(x)           (((unsigned)(x)&0x1) << 30) /* userqueue only */
 #define PKT3_COPY_DATA                             0x40
 #define   COPY_DATA_SRC_SEL(x)                        ((x)&0xf)
 #define   COPY_DATA_REG                               0
@@ -160,7 +127,7 @@
 #define PKT3_ME_INITIALIZE                         0x44 /* GFX6 only */
 #define PKT3_COND_WRITE                            0x45
 #define PKT3_EVENT_WRITE                           0x46
-#define   EVENT_TYPE(x)                               ((x) << 0)
+#define   EVENT_TYPE(x)                               S_461_EVENT_TYPE(x)
 /* 0 - any non-TS event
  * 1 - ZPASS_DONE
  * 2 - SAMPLE_PIPELINESTAT
@@ -168,7 +135,7 @@
  * 4 - *S_PARTIAL_FLUSH
  * 5 - TS events
  */
-#define   EVENT_INDEX(x)                              ((x) << 8)
+#define   EVENT_INDEX(x)                              S_461_EVENT_INDEX(x)
 #define   PIXEL_PIPE_STATE_CNTL_COUNTER_ID(x)         ((x) << 3)
 #define   PIXEL_PIPE_STATE_CNTL_STRIDE(x)             ((x) << 9)
 /* 0 - 32 bits
@@ -219,7 +186,7 @@
 #define PKT3_DISPATCH_MESH_INDIRECT_MULTI          0x4C /* Indirect mesh shader only dispatch [GFX only], GFX10.3+ */
 #define   S_4C1_XYZ_DIM_REG(x)                        ((x & 0xFFFF))
 #define   S_4C1_DRAW_INDEX_REG(x)                     ((x & 0xFFFF) << 16)
-#define   S_4C2_DRAW_INDEX_ENABLE(x)                  ((x & 1) << 31)
+#define   S_4C2_DRAW_INDEX_ENABLE(x)                  (((unsigned)(x) & 1) << 31)
 #define   S_4C2_COUNT_INDIRECT_ENABLE(x)              ((x & 1) << 30)
 #define   S_4C2_THREAD_TRACE_MARKER_ENABLE(x)         ((x & 1) << 29)
 #define   S_4C2_XYZ_DIM_ENABLE(x)                     ((x & 1) << 28) /* GFX11+ */
@@ -227,7 +194,7 @@
 #define PKT3_DISPATCH_TASKMESH_GFX                 0x4D /* Task + mesh shader dispatch [GFX side], GFX10.3+ */
 #define   S_4D0_RING_ENTRY_REG(x)                     ((x & 0xFFFF) << 16)
 #define   S_4D0_XYZ_DIM_REG(x)                        ((x & 0xFFFF))
-#define   S_4D1_THREAD_TRACE_MARKER_ENABLE(x)         ((x & 1) << 31)
+#define   S_4D1_THREAD_TRACE_MARKER_ENABLE(x)         (((unsigned)(x) & 1) << 31)
 #define   S_4D1_XYZ_DIM_ENABLE(x)                     ((x & 1) << 30) /* GFX11+ */
 #define   S_4D1_MODE1_ENABLE(x)                       ((x & 1) << 29) /* GFX11+ */
 #define   S_4D1_LINEAR_DISPATCH_ENABLE(x)             ((x & 1) << 28) /* GFX11+ */
@@ -265,6 +232,7 @@
 #define PKT3_DISPATCH_TASKMESH_DIRECT_ACE          0xAA /* Direct task + mesh shader dispatch [ACE side], GFX10.3+ */
 #define PKT3_DISPATCH_TASKMESH_INDIRECT_MULTI_ACE  0xAD /* Indirect task + mesh shader dispatch [ACE side], GFX10.3+ */
 #define   S_AD2_RING_ENTRY_REG(x)                     ((x & 0xFFFF))
+#define   S_AD3_THREAD_TRACE_MARKER_ENABLE(x)         ((x & 1) << 0)
 #define   S_AD3_COUNT_INDIRECT_ENABLE(x)              ((x & 1) << 1)
 #define   S_AD3_DRAW_INDEX_ENABLE(x)                  ((x & 1) << 2)
 #define   S_AD3_XYZ_DIM_ENABLE(x)                     ((x & 1) << 3)
@@ -376,7 +344,7 @@
 #define SDMA_OPCODE_TRAP                           0x6
 #define SDMA_OPCODE_SEMAPHORE                      0x7
 #define SDMA_OPCODE_POLL_REGMEM                    0x8
-#define SDMA_POLL_MEM                              (1 << 31)
+#define SDMA_POLL_MEM                              (1u << 31)
 #define SDMA_POLL_INTERVAL_160_CLK                 0xa
 #define SDMA_POLL_RETRY_INDEFINITELY               0xfff
 #define SDMA_OPCODE_CONSTANT_FILL                  0xb
@@ -386,33 +354,82 @@
 #define SDMA_TS_SUB_OPCODE_GET_GLOBAL_TIMESTAMP    0x2
 #define SDMA_OPCODE_SRBM_WRITE                     0xe
 
+/* SDMA 5.2-6.x cache policy: [1:0] = GL2 policy, [2] = LLC (MALL) no-alloc. */
+#define SDMA_5_2_CP_GL2_LRU                        0x0
+#define SDMA_5_2_CP_GL2_STREAM                     0x1
+#define SDMA_5_2_CP_GL2_NOA                        0x2
+#define SDMA_5_2_CP_GL2_BYPASS                     0x3
+#define SDMA_5_2_CP_LLC_ALLOC                      0x0
+#define SDMA_5_2_CP_LLC_NOALLOC                    0x4
+#define SDMA_5_2_COPY_TILED_SUB_WINDOW_CPV(x)      (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_COPY_TILED_SUB_WINDOW_TILED_CP(x) (((unsigned)(x) & 0x7) << 26)
+#define SDMA_5_2_COPY_TILED_SUB_WINDOW_LINEAR_CP(x) (((unsigned)(x) & 0x7) << 18)
+#define SDMA_5_2_COPY_T2T_SUB_WINDOW_CPV(x)        (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_COPY_T2T_SUB_WINDOW_SRC_CP(x)     (((unsigned)(x) & 0x7) << 26)
+#define SDMA_5_2_COPY_T2T_SUB_WINDOW_DST_CP(x)     (((unsigned)(x) & 0x7) << 18)
+#define SDMA_5_2_COPY_LINEAR_CPV(x)                (((unsigned)(x) & 0x1) << 19)
+#define SDMA_5_2_COPY_LINEAR_DST_CP(x)             (((unsigned)(x) & 0x7) << 18)
+#define SDMA_5_2_COPY_LINEAR_SRC_CP(x)             (((unsigned)(x) & 0x7) << 26)
+#define SDMA_5_2_COPY_LINEAR_SUB_WINDOW_CPV(x)     (((unsigned)(x) & 0x1) << 19)
+#define SDMA_5_2_COPY_LINEAR_SUB_WINDOW_DST_CP(x)  (((unsigned)(x) & 0x7) << 18)
+#define SDMA_5_2_COPY_LINEAR_SUB_WINDOW_SRC_CP(x)  (((unsigned)(x) & 0x7) << 26)
+#define SDMA_5_2_WRITE_LINEAR_CPV(x)               (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_WRITE_LINEAR_CP(x)                (((unsigned)(x) & 0x7) << 26)
+#define SDMA_5_2_FENCE_CPV(x)                      (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_FENCE_CP(x)                       (((unsigned)(x) & 0x7) << 24)
+#define SDMA_5_2_POLL_REGMEM_CPV(x)                (((unsigned)(x) & 0x1) << 24)
+#define SDMA_5_2_POLL_REGMEM_CP(x)                 (((unsigned)(x) & 0x7) << 20)
+#define SDMA_5_2_CONSTANT_FILL_CPV(x)              (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_CONSTANT_FILL_CP(x)               (((unsigned)(x) & 0x7) << 24)
+#define SDMA_5_2_TIMESTAMP_CPV(x)                  (((unsigned)(x) & 0x1) << 28)
+#define SDMA_5_2_TIMESTAMP_CP(x)                   (((unsigned)(x) & 0x7) << 24)
+
+/* SDMA 7.0 MALL policy. */
+#define SDMA_7_0_MALL_POLICY_RT                              0x0
+#define SDMA_7_0_MALL_POLICY_NT                              0x1
+#define SDMA_7_0_MALL_POLICY_HT                              0x2
+#define SDMA_7_0_MALL_POLICY_LU                              0x3
+#define SDMA_7_0_COPY_LINEAR_DST_MALL_POLICY(x)              (((unsigned)(x) & 0x3) << 20)
+#define SDMA_7_0_COPY_LINEAR_SRC_MALL_POLICY(x)              (((unsigned)(x) & 0x3) << 28)
+#define SDMA_7_0_COPY_LINEAR_SUB_WINDOW_DST_MALL_POLICY(x)   (((unsigned)(x) & 0x3) << 20)
+#define SDMA_7_0_COPY_LINEAR_SUB_WINDOW_SRC_MALL_POLICY(x)   (((unsigned)(x) & 0x3) << 28)
+#define SDMA_7_0_COPY_TILED_SUB_WINDOW_LINEAR_MALL_POLICY(x) (((unsigned)(x) & 0x3) << 20)
+#define SDMA_7_0_COPY_TILED_SUB_WINDOW_TILED_MALL_POLICY(x)  (((unsigned)(x) & 0x3) << 28)
+#define SDMA_7_0_COPY_T2T_SUB_WINDOW_DST_MALL_POLICY(x)      (((unsigned)(x) & 0x3) << 20)
+#define SDMA_7_0_COPY_T2T_SUB_WINDOW_SRC_MALL_POLICY(x)      (((unsigned)(x) & 0x3) << 28)
+#define SDMA_7_0_WRITE_LINEAR_MALL_POLICY(x)                 (((unsigned)(x) & 0x3) << 28)
+#define SDMA_7_0_CONSTANT_FILL_MALL_POLICY(x)                (((unsigned)(x) & 0x3) << 26)
+#define SDMA_7_0_FENCE_MALL_POLICY(x)                        (((unsigned)(x) & 0x3) << 26)
+#define SDMA_7_0_TIMESTAMP_MALL_POLICY(x)                    (((unsigned)(x) & 0x3) << 26)
+#define SDMA_7_0_POLL_REGMEM_MALL_POLICY(x)                  (((unsigned)(x) & 0x3) << 22)
+
 /* There is apparently an undocumented HW limitation that
  * prevents the HW from copying the last 255 bytes of (1 << 22) - 1
  */
-#define SDMA_V2_0_COPY_MAX_BYTES 0x3fff00   /* almost 4 MB*/
-#define SDMA_V5_2_COPY_MAX_BYTES 0x3fffff00 /* almost 1 GB */
+#define SDMA_2_0_COPY_MAX_BYTES 0x3fff00   /* almost 4 MB*/
+#define SDMA_5_2_COPY_MAX_BYTES 0x3fffff00 /* almost 1 GB */
 
 #define SDMA_NOP_PAD SDMA_PACKET(SDMA_OPCODE_NOP, 0, 0) /* header-only version */
 
 /* SDMA DCC settings for GFX10+ */
-#define SDMA5_DCC_DATA_FORMAT(x)       ((x) & 0x7f)
-#define SDMA5_DCC_ALPHA_IS_ON_MSB(x)   (((x) & 0x1) << 8)
-#define SDMA5_DCC_NUM_TYPE(x)          (((x) & 0x7) << 9)
-#define SDMA5_DCC_SURF_TYPE(x)         (((x) & 0x3) << 12) /* 0: color, 1: Z, 2: stencil, 3: FMASK */
-#define SDMA5_DCC_LLC_NOALLOC(x)       (((x) & 0x1) << 14) /* don't cache in MALL */
-#define SDMA5_DCC_MAX_COM(x)           (((x) & 0x3) << 24) /* max compressed block size, 0: 64B, 1: 128B, 2: 256B */
-#define SDMA5_DCC_MAX_UCOM(x)          (((x) & 0x3) << 26) /* max uncompressed block size, 0: 64B, 1: 128B, 2: 256B */
-#define SDMA5_DCC_WRITE_COMPRESS(x)    (((x) & 0x1) << 28) /* DCC write compression enabled, dst must be tiled */
-#define SDMA5_DCC_TMZ(x)               (((x) & 0x1) << 29) /* metadata is TMZ */
-#define SDMA5_DCC_PIPE_ALIGNED(x)      (((x) & 0x1) << 31)
+#define SDMA_5_0_DCC_DATA_FORMAT(x)     ((x) & 0x7f)
+#define SDMA_5_0_DCC_ALPHA_IS_ON_MSB(x) (((x) & 0x1) << 8)
+#define SDMA_5_0_DCC_NUM_TYPE(x)        (((x) & 0x7) << 9)
+#define SDMA_5_0_DCC_SURF_TYPE(x)       (((x) & 0x3) << 12) /* 0: color, 1: Z, 2: stencil, 3: FMASK */
+#define SDMA_5_0_DCC_LLC_NOALLOC(x)     (((x) & 0x1) << 14) /* don't cache in MALL */
+#define SDMA_5_0_DCC_MAX_COM(x)         (((x) & 0x3) << 24) /* max compressed block size, 0: 64B, 1: 128B, 2: 256B */
+#define SDMA_5_0_DCC_MAX_UCOM(x)        (((x) & 0x3) << 26) /* max uncompressed block size, 0: 64B, 1: 128B, 2: 256B */
+#define SDMA_5_0_DCC_WRITE_COMPRESS(x)  (((x) & 0x1) << 28) /* DCC write compression enabled, dst must be tiled */
+#define SDMA_5_0_DCC_TMZ(x)             (((x) & 0x1) << 29) /* metadata is TMZ */
+#define SDMA_5_0_DCC_PIPE_ALIGNED(x)    (((unsigned)(x) & 0x1) << 31)
 
 /* SDMA DCC settings for GFX12+ */
-#define SDMA7_DCC_DATA_FORMAT(x)       ((x) & 0x3f)
-#define SDMA7_DCC_NUM_TYPE(x)          (((x) & 0x7) << 9)
-#define SDMA7_DCC_READ_CM(x)           (((x) & 0x3) << 16) /* 0: bypass DCC, 2: decompress reads if PTE.D */
-#define SDMA7_DCC_WRITE_CM(x)          (((x) & 0x3) << 18) /* 0: bypass DCC, 1: write compressed if PTE.D, 2: write uncompressed if PTE.D */
-#define SDMA7_DCC_MAX_COM(x)           (((x) & 0x3) << 24)
-#define SDMA7_DCC_MAX_UCOM(x)          (((x) & 0x1) << 26) /* 1: max uncompressed block size 256B */
+#define SDMA_7_0_DCC_DATA_FORMAT(x)     ((x) & 0x3f)
+#define SDMA_7_0_DCC_NUM_TYPE(x)        (((x) & 0x7) << 9)
+#define SDMA_7_0_DCC_READ_CM(x)         (((x) & 0x3) << 16) /* 0: bypass DCC, 2: decompress reads if PTE.D */
+#define SDMA_7_0_DCC_WRITE_CM(x)        (((x) & 0x3) << 18) /* 0: bypass DCC, 1: write compressed if PTE.D, 2: write uncompressed if PTE.D */
+#define SDMA_7_0_DCC_MAX_COM(x)         (((x) & 0x3) << 24)
+#define SDMA_7_0_DCC_MAX_UCOM(x)        (((x) & 0x1) << 26) /* 1: max uncompressed block size 256B */
 
 enum amd_cmp_class_flags
 {
@@ -431,6 +448,6 @@ enum amd_cmp_class_flags
 /* Use the last bit of AMDGPU_GEM_CREATE_* flag as a virtio-only
  * flag.
  */
-#define AMDGPU_GEM_CREATE_VIRTIO_SHARED 1u << 31
+#define AMDGPU_GEM_CREATE_VIRTIO_SHARED (1ull << 31)
 
 #endif /* _SID_H */

@@ -1,7 +1,7 @@
 /*
 ************************************************************************************************************************
 *
-*  Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.
+*  Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
 *  SPDX-License-Identifier: MIT
 *
 ***********************************************************************************************************************/
@@ -39,8 +39,6 @@ namespace V3
 Lib::Lib()
     :
     Addr::Lib(),
-    m_pipesLog2(0),
-    m_pipeInterleaveLog2(0),
     m_numEquations(0)
 {
     Init();
@@ -59,8 +57,6 @@ Lib::Lib(
     const Client* pClient)
     :
     Addr::Lib(pClient),
-    m_pipesLog2(0),
-    m_pipeInterleaveLog2(0),
     m_numEquations(0)
 {
     Init();
@@ -265,7 +261,7 @@ ADDR_E_RETURNCODE Lib::ComputeSurfaceInfo(
             // Overwrite these parameters if we have a valid format
         }
 
-        if (localIn.bpp != 0)
+        if (localIn.bpp >= 8)
         {
             localIn.width  = Max(localIn.width, 1u);
             localIn.height = Max(localIn.height, 1u);
@@ -394,9 +390,6 @@ VOID Lib::ComputeBlockDimensionForSurf(
     ADDR_EXTENT3D*                                 pExtent
     ) const
 {
-    const ADDR3_COMPUTE_SURFACE_INFO_INPUT* pSurfInfo   = pIn->pSurfInfo;
-    const UINT_32                           log2BlkSize = GetBlockSizeLog2(pSurfInfo->swizzleMode);
-
     HwlCalcBlockSize(pIn, pExtent);
 }
 
@@ -545,18 +538,18 @@ ADDR_E_RETURNCODE Lib::CopyLinearSurface(
             const ADDR3_COPY_MEMSURFACE_REGION* pCurRegion = &pRegions[regionIdx];
 
             void* pMipBase = VoidPtrInc(pIn->pMappedSurface,
-                                        (pIn->singleSubres ? 0 : mipInfo[pCurRegion->mipId].offset));
+                                        pIn->singleSubres ? 0 : mipInfo[pCurRegion->mipId].offset);
 
-            const size_t lineSizeBytes = (localIn.bpp >> 3) * pCurRegion->copyDims.width;
-            const size_t lineImgPitchBytes = (localIn.bpp >> 3) * mipInfo[pCurRegion->mipId].pitch;
+            const size_t lineSizeBytes = (static_cast<size_t>(localIn.bpp) >> 3) * pCurRegion->copyDims.width;
+            const size_t lineImgPitchBytes = (static_cast<size_t>(localIn.bpp) >> 3) * mipInfo[pCurRegion->mipId].pitch;
 
             for (UINT_32 sliceIdx = 0; sliceIdx < pCurRegion->copyDims.depth; sliceIdx++)
             {
                 UINT_32 sliceCoord = sliceIdx + pCurRegion->slice;
-                size_t imgOffsetInMip = (localOut.sliceSize * sliceCoord) +
+                UINT_64 imgOffsetInMip = (localOut.sliceSize * sliceCoord) +
                                         (lineImgPitchBytes * pCurRegion->y) +
                                         (pCurRegion->x * (pIn->bpp >> 3));
-                size_t memOffset = sliceIdx * pCurRegion->memSlicePitch;
+                UINT_64 memOffset = sliceIdx * pCurRegion->memSlicePitch;
 
                 for (UINT_32 yIdx = 0; yIdx < pCurRegion->copyDims.height; yIdx++)
                 {
@@ -609,6 +602,11 @@ ADDR_E_RETURNCODE Lib::CopyMemToSurface(
     {
         if (pIn->size  != sizeof(ADDR3_COPY_MEMSURFACE_INPUT))
         {
+            returnCode = ADDR_INVALIDPARAMS;
+        }
+        else if (pIn->copyFlags.blockMemcpy && pIn->copyFlags.hybridMemcpy)
+        {
+            // Invalid to specify conflicting copy modes.
             returnCode = ADDR_INVALIDPARAMS;
         }
         else
@@ -680,6 +678,11 @@ ADDR_E_RETURNCODE Lib::CopySurfaceToMem(
         {
             returnCode = ADDR_INVALIDPARAMS;
         }
+        else if (pIn->copyFlags.blockMemcpy && pIn->copyFlags.hybridMemcpy)
+        {
+            // Invalid to specify conflicting copy modes.
+            returnCode = ADDR_INVALIDPARAMS;
+        }
         else
         {
             UINT_32 baseSlice    = pRegions[0].slice;
@@ -736,7 +739,7 @@ ADDR_E_RETURNCODE Lib::ComputePipeBankXor(
     const ADDR3_COMPUTE_PIPEBANKXOR_INPUT* pIn,
     ADDR3_COMPUTE_PIPEBANKXOR_OUTPUT*      pOut)
 {
-    ADDR_E_RETURNCODE returnCode;
+    ADDR_E_RETURNCODE returnCode = ADDR_OK;
 
     if ((GetFillSizeFieldsFlags() == TRUE) &&
         ((pIn->size  != sizeof(ADDR3_COMPUTE_PIPEBANKXOR_INPUT)) ||
@@ -746,7 +749,23 @@ ADDR_E_RETURNCODE Lib::ComputePipeBankXor(
     }
     else
     {
-        returnCode = HwlComputePipeBankXor(pIn, pOut);
+        // The swizzle mode determines how many unused bits there are in the address.  We never (ok, rarely...) program
+        // the low eight bits of the address, so the "numSwizzleBits" effectively represents the number of "guaranteed
+        // zero" programmed bits in the address.
+        const UINT_32  numSwizzleBits = GetBlockSizeLog2(pIn->swizzleMode, FALSE) - 8;
+
+        // make sure this configuration supports swizzling
+        if (numSwizzleBits != 0) 
+        {
+            // These cases should have been excluded with the "numSwizzleBits" calculation above, but make sure here.
+            ADDR_ASSERT((IsLinear(pIn->swizzleMode) == FALSE) && (IsBlock256b(pIn->swizzleMode) == FALSE));
+
+            pOut->pipeBankXor = pIn->surfIndex % (1 << numSwizzleBits);
+        }
+        else
+        {
+            pOut->pipeBankXor = 0;
+        }
     }
 
     return returnCode;
@@ -1166,7 +1185,6 @@ ADDR_E_RETURNCODE Lib::ComputeSurfaceInfoSanityCheck(
 
     return HwlValidateNonSwModeParams(&localIn) ? ADDR_OK : ADDR_INVALIDPARAMS;
 }
-
 
 /**
 ************************************************************************************************************************

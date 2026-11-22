@@ -21,7 +21,9 @@
  * IN THE SOFTWARE.
  */
 
-#include "v3dv_private.h"
+#include "v3dv_device.h"
+#include "v3dv_cmd_buffer.h"
+#include "v3dv_entrypoints.h"
 #include "compiler/nir/nir_builder.h"
 
 #include "vk_common_entrypoints.h"
@@ -36,7 +38,7 @@ get_set_event_cs(const nir_shader_compiler_options *options)
       nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
                                 .desc_set = 0,
                                 .binding = 0,
-                                .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+                                .desc_type = nir_descriptor_type_storage_buffer);
 
    nir_def *offset =
       nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 4);
@@ -60,7 +62,7 @@ get_wait_event_cs(const nir_shader_compiler_options *options)
       nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
                                 .desc_set = 0,
                                 .binding = 0,
-                                .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+                                .desc_type = nir_descriptor_type_storage_buffer);
 
    nir_def *offset =
       nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 4);
@@ -209,7 +211,9 @@ v3dv_event_allocate_resources(struct v3dv_device *device)
     * let's make sure we allow for that.
     */
    const uint32_t bo_size = 3 * 4096;
-   struct v3dv_bo *bo = v3dv_bo_alloc(device, bo_size, "events", true);
+   struct v3dv_bo *bo = v3dv_bo_alloc(device, bo_size, "events", true,
+                                      VK_OBJECT_TYPE_DEVICE,
+                                      vk_object_to_u64_handle(&device->vk.base));
    if (!bo) {
       result = vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       goto fail;
@@ -332,7 +336,7 @@ void
 v3dv_event_free_resources(struct v3dv_device *device)
 {
    if (device->events.bo) {
-      v3dv_bo_free(device, device->events.bo);
+      v3dv_bo_free(device, device->events.bo, 0);
       device->events.bo = NULL;
    }
 

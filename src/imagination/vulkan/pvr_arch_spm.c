@@ -46,20 +46,25 @@ uint64_t pvr_arch_spm_scratch_buffer_calc_required_size(
    uint64_t dwords_per_pixel;
    uint64_t buffer_size;
 
-   /* If we're allocating an SPM scratch buffer we'll have a minimum of 1 output
-    * reg and/or tile_buffer.
+   uint32_t max_used_tile_buffers = 0;
+
+   /* The maximum number of output registers / tile buffer dwords it ever
+    * encountered when allocating space in the output registers and any tile
+    * buffers.
     */
-   uint32_t nr_tile_buffers = 1;
-   uint32_t nr_output_regs = 1;
+   uint32_t max_used_dwords = 1;
 
    for (uint32_t i = 0; i < render_count; i++) {
       const struct pvr_renderpass_hwsetup_render *hw_render = &renders[i];
 
-      nr_tile_buffers = MAX2(nr_tile_buffers, hw_render->tile_buffers_count);
-      nr_output_regs = MAX2(nr_output_regs, hw_render->output_regs_count);
+      max_used_tile_buffers = MAX2(max_used_tile_buffers, hw_render->tile_buffers_count);
+      max_used_dwords = MAX2(max_used_dwords, hw_render->output_regs_count);
    }
 
-   dwords_per_pixel = (uint64_t)sample_count * nr_output_regs * nr_tile_buffers;
+   /* Add one to the number of tile buffers to account for the output registers,
+    * which are always used 
+    */
+   dwords_per_pixel = (uint64_t)sample_count * max_used_dwords * (1 + max_used_tile_buffers);
 
    buffer_size = ALIGN_POT((uint64_t)framebuffer_width,
                            ROGUE_CR_PBE_WORD0_MRT0_LINESTRIDE_ALIGNMENT);
@@ -254,6 +259,8 @@ static inline enum ROGUE_PBESTATE_PACKMODE
 pvr_spm_get_pbe_packmode(uint32_t dword_count)
 {
    switch (dword_count) {
+   case 0:
+      FALLTHROUGH;  /* No output regs (no attachments), just choose a value */
    case 1:
       return ROGUE_PBESTATE_PACKMODE_U32;
    case 2:
@@ -464,6 +471,7 @@ VkResult pvr_arch_spm_init_eot_state(
    };
    uint32_t pbe_state_words[PVR_MAX_COLOR_ATTACHMENTS]
                            [ROGUE_NUM_PBESTATE_STATE_WORDS];
+   uint64_t tile_buffer_addrs[PVR_MAX_COLOR_ATTACHMENTS] = {0};
    const struct pvr_device_info *dev_info = &device->pdevice->dev_info;
    uint32_t total_render_target_used = 0;
    struct pvr_pds_upload pds_eot_program;
@@ -548,13 +556,12 @@ VkResult pvr_arch_spm_init_eot_state(
       total_render_target_used++;
 
       /* Store off-chip tile data (i.e. tile buffers). */
+      const struct pvr_device_tile_buffer_state *tile_buffer_state =
+         &device->tile_buffer_state;
 
       for (uint32_t i = 0; i < hw_render->tile_buffers_count; i++) {
-         continue;
-         assert(!"Add support for tile buffers in EOT");
-         pvr_finishme("Add support for tile buffers in EOT");
-
          assert(total_render_target_used < PVR_MAX_COLOR_ATTACHMENTS);
+         assert(i < tile_buffer_state->buffer_count);
 
          mem_stored = pvr_spm_setup_pbe_state(
             dev_info,
@@ -565,6 +572,8 @@ VkResult pvr_arch_spm_init_eot_state(
             next_scratch_buffer_addr,
             pbe_state_words[total_render_target_used],
             spm_eot_state->pbe_reg_words[total_render_target_used]);
+
+         tile_buffer_addrs[total_render_target_used] = tile_buffer_state->buffers[i]->vma->dev_addr.addr;
 
          next_scratch_buffer_addr =
             PVR_DEV_ADDR_OFFSET(next_scratch_buffer_addr, mem_stored);
@@ -577,7 +586,11 @@ VkResult pvr_arch_spm_init_eot_state(
       .emit_count = total_render_target_used,
       .shared_words = false,
       .state_words = pbe_state_words[0],
+      .num_output_regs = hw_render->output_regs_count,
+      .msaa_samples = hw_render->sample_count,
    };
+
+   memcpy(props.tile_buffer_addrs, tile_buffer_addrs, sizeof(tile_buffer_addrs));
 
    eot = pvr_usc_eot(device->pdevice->pco_ctx, &props, dev_info);
    usc_temp_count = pco_shader_data(eot)->common.temps;
@@ -613,6 +626,8 @@ VkResult pvr_arch_spm_init_eot_state(
 static VkFormat pvr_get_format_from_dword_count(uint32_t dword_count)
 {
    switch (dword_count) {
+   case 0:
+      FALLTHROUGH;  /* No output regs (no attachments), just choose a value */
    case 1:
       return VK_FORMAT_R32_UINT;
    case 2:
@@ -779,6 +794,10 @@ VkResult pvr_arch_spm_init_bgobj_state(
       .tile_buffer_count = hw_render->tile_buffers_count,
       .is_multisampled = hw_render->sample_count > 1,
    };
+
+   /* If there are no output registers, just use the shader for 1 output reg */
+   if (!props.output_reg_count)
+      props.output_reg_count = 1;
 
    const uint32_t spm_load_program_idx = pvr_uscgen_spm_load_index(&props);
 

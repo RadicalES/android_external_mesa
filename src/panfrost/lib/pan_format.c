@@ -1,5 +1,7 @@
 /*
  * Copyright (C) 2019 Collabora, Ltd.
+ * Copyright (C) 2026 Arm Ltd.
+ * Copyright (C) 2026 Google LLC
  * SPDX-License-Identifier: MIT
  */
 
@@ -92,7 +94,9 @@ const struct pan_blendable_format
       BFMT_SRGB(R8G8B8A8, R8G8B8A8),
 
       BFMT2(A8_UNORM, R8G8B8A8, R8, 0),
+#if PAN_ARCH < 6
       BFMT2(I8_UNORM, R8G8B8A8, R8, 0),
+#endif
       BFMT2(R5G6B5_UNORM, R5G6B5A0, R5G6B5, 0),
       BFMT2(B5G6R5_UNORM, R5G6B5A0, R5G6B5, 0),
 
@@ -114,6 +118,7 @@ const struct pan_blendable_format
       BFMT_FLOAT(R16_FLOAT, R16F),
       BFMT_FLOAT(R16G16_FLOAT, RG16F),
       BFMT_FLOAT(R16G16B16A16_FLOAT, RGBA16F),
+      BFMT_FLOAT(R16G16B16X16_FLOAT, RGBA16F),
       BFMT_FLOAT(R11G11B10_FLOAT, RG11F_B10F),
 #endif
 };
@@ -134,6 +139,7 @@ const struct pan_blendable_format
 #define FLAGS_VT____ (_V | _T)
 #define FLAGS_VT__IB (_V | _T | _I | _B)
 #define FLAGS__T_Z__ (_T | _Z)
+#define FLAGS_____I_ (_I)
 
 #define FMT(pipe, mali, swizzle, srgb, flags)                                  \
    [PIPE_FORMAT_##pipe] = {                                                    \
@@ -144,12 +150,6 @@ const struct pan_blendable_format
 #if PAN_ARCH >= 7
 #define YUV_NO_SWAP (0)
 #define YUV_SWAP    (1)
-
-#if PAN_ARCH < 14
-#define MALI_YUV_CR_SITING_CENTER_422 (MALI_YUV_CR_SITING_CENTER_Y)
-#else
-#define MALI_YUV_CR_SITING_CENTER_422 (MALI_YUV_CR_SITING_CENTER_X)
-#endif
 
 #define FMT_YUV(pipe, mali, swizzle, swap, siting, flags)                      \
    [PIPE_FORMAT_##pipe] = {                                                    \
@@ -163,7 +163,7 @@ const struct pan_blendable_format
 #define FMTC(pipe, texfeat, interchange, swizzle, srgb)                        \
    [PIPE_FORMAT_##pipe] = {                                                    \
       .hw = MALI_PACK_FMT(texfeat, swizzle, srgb),                             \
-      .bind = (PAN_BIND_SAMPLER_VIEW | PAN_BIND_STORAGE_IMAGE),                \
+      .bind = (PAN_BIND_SAMPLER_VIEW),                                         \
       .texfeat_bit = MALI_##texfeat,                                           \
    }
 #else
@@ -173,7 +173,7 @@ const struct pan_blendable_format
 #define FMTC(pipe, texfeat, interchange, swizzle, srgb)                        \
    [PIPE_FORMAT_##pipe] = {                                                    \
       .hw = MALI_PACK_FMT(interchange, swizzle, srgb),                         \
-      .bind = (PAN_BIND_SAMPLER_VIEW | PAN_BIND_STORAGE_IMAGE),                \
+      .bind = (PAN_BIND_SAMPLER_VIEW),                                         \
       .texfeat_bit = MALI_##texfeat,                                           \
    }
 #endif
@@ -182,7 +182,27 @@ const struct pan_blendable_format
 const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(NONE,                    CONSTANT,        0000, L, VTR_IB),
 
-#if PAN_ARCH >= 7
+#if PAN_ARCH >= 14
+   /* Multiplane formats */
+   FMT_YUV(R8G8_R8B8_UNORM, Y8U8Y8V8_422, UVYA, NO_SWAP, CENTER_422, _T____),
+   FMT_YUV(G8R8_B8R8_UNORM, U8Y8V8Y8_422, UYVA, SWAP,    CENTER_422, _T____),
+   FMT_YUV(R8B8_R8G8_UNORM, Y8U8Y8V8_422, VYUA, NO_SWAP, CENTER_422, _T____),
+   FMT_YUV(B8R8_G8R8_UNORM, U8Y8V8Y8_422, VUYA, SWAP,    CENTER_422, _T____),
+   FMT_YUV(R8_G8B8_420_UNORM, Y8U8V8_420, YUVA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(R8_B8G8_420_UNORM, Y8U8V8_420, YVUA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(R8_G8_B8_420_UNORM, Y8U8V8_420, YUVA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(R8_B8_G8_420_UNORM, Y8U8V8_420, YVUA, NO_SWAP, CENTER, _T____),
+
+   FMT_YUV(R8_G8B8_422_UNORM, Y8U8Y8V8_422, YUVA, NO_SWAP, CENTER_422, _T____),
+   FMT_YUV(R8_B8G8_422_UNORM, U8Y8V8Y8_422, YVUA, NO_SWAP, CENTER_422, _T____),
+
+   FMT_YUV(R10_G10B10_420_UNORM, YUYAAYVYAA_420, YUVA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(R10_G10B10_422_UNORM, Y10X6U10X6Y10X6V10X6_422, YUVA, NO_SWAP, CENTER_422, _T____),
+   /* special internal formats */
+   FMT_YUV(R8G8B8_420_UNORM_PACKED, Y8U8V8_420, YUVA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(R10G10B10_420_UNORM_PACKED, Y10U10V10_420, YUVA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(X6R10X6G10_X6R10X6B10_422_UNORM, Y10X6U10X6Y10X6V10X6_422, UVYA, NO_SWAP, CENTER_422, _T____),
+#elif PAN_ARCH >= 7
    /* Multiplane formats */
    FMT_YUV(R8G8_R8B8_UNORM, YUYV8, UVYA, NO_SWAP, CENTER_422, _T____),
    FMT_YUV(G8R8_B8R8_UNORM, VYUY8, UYVA, SWAP,    CENTER_422, _T____),
@@ -190,14 +210,19 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT_YUV(B8R8_G8R8_UNORM, VYUY8, VUYA, SWAP,    CENTER_422, _T____),
    FMT_YUV(R8_G8B8_420_UNORM, Y8_UV8_420, YUVA, NO_SWAP, CENTER, _T____),
    FMT_YUV(R8_B8G8_420_UNORM, Y8_UV8_420, YVUA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(G8_B8R8_420_UNORM, Y8_UV8_420, UVYA, NO_SWAP, CENTER, _T____),
    FMT_YUV(R8_G8_B8_420_UNORM, Y8_U8_V8_420, YUVA, NO_SWAP, CENTER, _T____),
    FMT_YUV(R8_B8_G8_420_UNORM, Y8_U8_V8_420, YVUA, NO_SWAP, CENTER, _T____),
+   FMT_YUV(G8_B8_R8_420_UNORM, Y8_U8_V8_420, UVYA, NO_SWAP, CENTER, _T____),
 
    FMT_YUV(R8_G8B8_422_UNORM, Y8_UV8_422, YUVA, NO_SWAP, CENTER_422, _T____),
    FMT_YUV(R8_B8G8_422_UNORM, Y8_UV8_422, YVUA, NO_SWAP, CENTER_422, _T____),
+   FMT_YUV(Y8_U8V8_422_UNORM, Y8_UV8_422, UVYA, NO_SWAP, CENTER_422, _T____),
+   FMT_YUV(Y8_U8_V8_422_UNORM, Y8_U8_V8_422, UVYA, NO_SWAP, CENTER_422, _T____),
 
    FMT_YUV(R10_G10B10_420_UNORM, Y10_UV10_420, YUVA, NO_SWAP, CENTER, _T____),
    FMT_YUV(R10_G10B10_422_UNORM, Y10_UV10_422, YUVA, NO_SWAP, CENTER_422, _T____),
+   FMT_YUV(X6G10_X6B10X6R10_420_UNORM, Y10_UV10_420, UVYA, NO_SWAP, CENTER, _T____),
    /* special internal formats */
    FMT_YUV(R8G8B8_420_UNORM_PACKED, Y8_UV8_420, YUVA, NO_SWAP, CENTER, _T____),
    FMT_YUV(R10G10B10_420_UNORM_PACKED, Y10_UV10_420, YUVA, NO_SWAP, CENTER, _T____),
@@ -417,14 +442,23 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R8G8B8A8_UINT,           RGBA8UI,         RGBA, L, VTR_IB),
    FMT(R16G16B16A16_UINT,       RGBA16UI,        RGBA, L, VTR_IB),
    FMT(R32G32B32A32_UINT,       RGBA32UI,        RGBA, L, VTR_IB),
+
+#if PAN_ARCH >= 9
+   /* No native R64 - aliased to RG32UI (matching 8-byte stride). */
+   FMT(R64_UINT,                RG32UI,          RG01, L, ____I_),
+   FMT(R64_SINT,                RG32UI,          RG01, L, ____I_),
+#endif
+
    FMT(R32_FLOAT,               R32F,            R001, L, VTR_IB),
    FMT(R32G32_FLOAT,            RG32F,           RG01, L, VTR_IB),
    FMT(R32G32B32_FLOAT,         RGB32F,          RGB1, L, VTR_IB),
    FMT(R32G32B32A32_FLOAT,      RGBA32F,         RGBA, L, VTR_IB),
    FMT(R8_UNORM,                R8_UNORM,        R001, L, VTR_IB),
    FMT(R16_UNORM,               R16_UNORM,       R001, L, VTR_IB),
+   FMT(X6R10_UNORM,             R16_UNORM,       R001, L, VTR_IB),
    FMT(R8G8_UNORM,              RG8_UNORM,       RG01, L, VTR_IB),
    FMT(R16G16_UNORM,            RG16_UNORM,      RG01, L, VTR_IB),
+   FMT(X6R10X6G10_UNORM,        RG16_UNORM,      RG01, L, VTR_IB),
    FMT(R8G8B8_UNORM,            RGB8_UNORM,      RGB1, L, VTR_IB),
    FMT(B8G8R8_UNORM,            RGB8_UNORM,      BGR1, L, VTR_IB),
 
@@ -464,6 +498,9 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(A4R4G4B4_UNORM,          RGBA4_UNORM,     ARGB, L, VTR___),
    FMT(A4B4G4R4_UNORM,          RGBA4_UNORM,     ABGR, L, VTR___),
    FMT(R16G16B16A16_UNORM,      RGBA16_UNORM,    RGBA, L, VTR_IB),
+#if PAN_ARCH >= 11
+   FMT(X6R10X6G10X6B10X6A10_UNORM, R10X6G10X6B10X6A10X6_UNORM, RGBA, L, _T____),
+#endif
    FMT(B8G8R8A8_UNORM,          RGBA8_UNORM,     BGRA, L, VTR_IB),
    FMT(B8G8R8X8_UNORM,          RGBA8_UNORM,     BGR1, L, VTR_IB),
    FMT(A8R8G8B8_UNORM,          RGBA8_UNORM,     GBAR, L, VTR_IB),

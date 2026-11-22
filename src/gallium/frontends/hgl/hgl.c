@@ -193,20 +193,6 @@ hgl_st_framebuffer_validate(struct st_context *st,
 }
 
 
-static int
-hgl_st_manager_get_param(struct pipe_frontend_screen *fscreen, enum st_manager_param param)
-{
-	CALLED();
-
-	switch (param) {
-		case ST_MANAGER_BROKEN_INVALIDATE:
-			return 1;
-	}
-
-	return 0;
-}
-
-
 static uint32_t hgl_fb_ID = 0;
 
 /**
@@ -288,10 +274,6 @@ hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct
 
 	struct st_context *stContext = (struct st_context*)context->st;
 
-	// Init Gallium3D Post Processing
-	// TODO: no pp filters are enabled yet through postProcessEnable
-	context->postProcess = pp_init(stContext->pipe, context->postProcessEnable, stContext->cso_context, stContext, (void*)st_context_invalidate_state);
-
 	return context;
 }
 
@@ -303,9 +285,6 @@ hgl_destroy_context(struct hgl_context* context)
 		st_context_flush(context->st, 0, NULL, NULL, NULL);
 		st_destroy_context(context->st);
 	}
-
-	if (context->postProcess)
-		pp_free(context->postProcess);
 
 	FREE(context);
 }
@@ -369,7 +348,7 @@ hgl_create_display(struct pipe_screen* screen)
 	display->fscreen = CALLOC_STRUCT(pipe_frontend_screen);
 	assert(display->fscreen);
 	display->fscreen->screen = screen;
-	display->fscreen->get_param = hgl_st_manager_get_param;
+	display->fscreen->broken_invalidate = true;
 	// display->fscreen->st_screen is used by llvmpipe
 
 	return display;

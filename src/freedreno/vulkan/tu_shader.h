@@ -11,9 +11,10 @@
 #define TU_SHADER_H
 
 #include "tu_common.h"
+
 #include "tu_cs.h"
-#include "tu_suballoc.h"
 #include "tu_descriptor_set.h"
+#include "tu_suballoc.h"
 
 struct tu_inline_ubo
 {
@@ -49,10 +50,13 @@ struct tu_const_state
    uint32_t dynamic_offset_loc;
    unsigned num_inline_ubos;
    struct tu_inline_ubo ubos[MAX_INLINE_UBOS];
+   uint32_t num_bindless_base_addresses;
+   uint32_t bindless_base_const_offset_vec4;
 
    struct ir3_driver_ubo fdm_ubo;
    struct ir3_driver_ubo dynamic_offsets_ubo;
    struct ir3_driver_ubo inline_uniforms_ubo;
+   struct ir3_driver_ubo bindless_base_addrs_ubo;
 };
 
 struct tu_shader
@@ -112,6 +116,12 @@ struct tu_shader
          /* If per_layer_viewport is true, the maximum number of layers written to.
           */
          uint8_t max_fdm_layers;
+
+         /* Whether there are read-only input attachments, i.e. input
+          * attachments that are not patched to read from GMEM. Only used for
+          * dynamic rendering.
+          */
+         bool read_only_input_attachments;
       } fs;
    };
 };
@@ -120,16 +130,30 @@ struct tu_shader_key {
    unsigned multiview_mask;
    uint16_t read_only_input_attachments;
    uint8_t max_fdm_layers;
-   bool force_sample_interp; /* Set when VkPipelineMultisampleStateCreateInfo->sampleShadingEnable */
-   bool fragment_density_map;
-   bool fdm_per_layer;
-   bool dynamic_renderpass;
    uint8_t unscaled_input_fragcoord;
-   bool robust_storage_access2;
-   bool robust_uniform_access2;
-   bool lower_view_index_to_device_index;
-   bool custom_resolve;
+
+   bool force_sample_interp : 1; /* Set when VkPipelineMultisampleStateCreateInfo->sampleShadingEnable */
+   bool fragment_density_map : 1;
+   bool fdm_per_layer : 1;
+   bool dynamic_renderpass : 1;
+   bool robust_storage_access2 : 1;
+   bool robust_uniform_access2 : 1;
+   bool lower_view_index_to_device_index : 1;
+   bool custom_resolve : 1;
+   bool emulate_alpha_to_coverage : 1;
+   uint32_t padding : 23;
+
    enum ir3_wavesize_option api_wavesize, real_wavesize;
+
+   /* Shader version to force recompilation when TU_BUILD_ID_OVERRIDE is used. */
+   uint8_t version;
+};
+
+/* Information needed for tu_shader creation that is gathered during NIR
+ * lowering.
+ */
+struct tu_shader_info {
+   bool per_layer_viewport;
 };
 
 extern const struct vk_pipeline_cache_object_ops tu_shader_ops;
@@ -138,10 +162,20 @@ void
 tu_destroy_softfloat(struct tu_device *device);
 
 bool
-tu_nir_lower_multiview(nir_shader *nir, uint32_t mask, struct tu_device *dev);
+tu_nir_lower_multiview(nir_shader *nir, uint32_t mask, struct tu_device *dev,
+                       bool last_stage);
+
+bool
+tu_nir_lower_multiview_sw_vs(nir_shader *nir);
+
+bool
+tu_nir_lower_multiview_sw_fs(nir_shader *nir);
 
 bool
 tu_nir_lower_ray_queries(nir_shader *nir);
+
+bool
+tu_nir_lower_demote_samples(nir_shader *nir);
 
 nir_shader *
 tu_spirv_to_nir(struct tu_device *dev,
@@ -187,11 +221,19 @@ template <chip CHIP>
 void
 tu6_emit_fs(struct tu_cs *cs, const struct ir3_shader_variant *fs);
 
+void
+tu_lower_nir(struct tu_device *dev,
+             nir_shader *nir,
+             const struct tu_shader_key *key,
+             const struct ir3_shader_key *ir3_key,
+             struct tu_shader_info *info);
+
 VkResult
 tu_shader_create(struct tu_device *dev,
                  struct tu_shader **shader_out,
                  nir_shader *nir,
                  const struct tu_shader_key *key,
+                 const struct tu_shader_info *shader_info,
                  const struct ir3_shader_key *ir3_key,
                  const void *key_data,
                  size_t key_size,
@@ -216,7 +258,7 @@ tu_compile_shaders(struct tu_device *device,
                    nir_shader **nir,
                    const struct tu_shader_key *keys,
                    struct tu_pipeline_layout *layout,
-                   const unsigned char *pipeline_sha1,
+                   const unsigned char *pipeline_blake3,
                    struct tu_shader **shaders,
                    char **nir_initial_disasm,
                    void *nir_initial_disasm_mem_ctx,

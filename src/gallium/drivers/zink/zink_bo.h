@@ -110,8 +110,12 @@ zink_bo_init(struct zink_screen *screen);
 void
 zink_bo_deinit(struct zink_screen *screen);
 
-struct pb_buffer *
-zink_bo_create(struct zink_screen *screen, uint64_t size, unsigned alignment, enum zink_heap heap, enum zink_alloc_flag flags, unsigned mem_type_idx, const void *pNext);
+struct pb_buffer_lean *
+zink_bo_create(struct zink_screen *screen, uint64_t size, unsigned alignment, enum zink_heap heap, enum zink_alloc_flag flags, unsigned mem_type_idx, const void *pNext,
+               struct zink_clientptr_heap *clientptr_heap);
+
+void
+zink_bo_destroy(struct zink_screen *screen, struct zink_bo *bo);
 
 bool
 zink_bo_get_kms_handle(struct zink_screen *screen, struct zink_bo *bo, int fd, uint32_t *handle);
@@ -128,10 +132,23 @@ zink_bo_get_mem(const struct zink_bo *bo)
    return bo->mem ? bo->mem : bo->u.slab.real->mem;
 }
 
+/* slabs share memory, so binds must take the lock that mapping takes */
+static ALWAYS_INLINE void
+zink_bo_lock_mem(struct zink_bo *bo)
+{
+   simple_mtx_lock(bo->mem ? &bo->lock : &bo->u.slab.real->lock);
+}
+
+static ALWAYS_INLINE void
+zink_bo_unlock_mem(struct zink_bo *bo)
+{
+   simple_mtx_unlock(bo->mem ? &bo->lock : &bo->u.slab.real->lock);
+}
+
 static ALWAYS_INLINE VkDeviceSize
 zink_bo_get_size(const struct zink_bo *bo)
 {
-   return bo->mem ? bo->base.base.size : bo->u.slab.real->base.base.size;
+   return bo->mem ? bo->base.size : bo->u.slab.real->base.size;
 }
 
 void *
@@ -140,14 +157,39 @@ void
 zink_bo_unmap(struct zink_screen *screen, struct zink_bo *bo);
 
 bool
+zink_bo_clientptr_heap_init(struct zink_screen *screen, struct zink_clientptr_heap *clientptr_heap);
+void
+zink_bo_clientptr_heap_deinit(struct zink_clientptr_heap *clientptr_ranges);
+
+/** Maps the BO to a client pointer range and returns the address
+ *
+ * \param bo must belong to a clientptr_heap
+ * \param new_clientptr_range  Can point an unused client pointer range.
+ *                             If consumed, the object is emptied.
+ *
+ * \return true if the bo can be mapped: in this case either
+ *           \param ptr is set to the mapped address, or if a new range is needed
+ *           \param range_size is set to the needed size of \param new_clientptr_range
+ * \return false on failure
+ */
+bool
+zink_bo_map_clientptr(struct zink_screen *screen, struct zink_bo *bo,
+                      struct pipe_clientptr_range *new_clientptr_range,
+                      uint8_t **ptr, uint32_t *range_size);
+
+bool
+zink_bo_reclaim_clientptr(struct zink_screen *screen, struct zink_clientptr_heap *clientptr_heap,
+                          bool release_all, struct pipe_clientptr_range *range);
+
+bool
 zink_bo_commit(struct zink_context *ctx, struct zink_resource *res, unsigned level, struct pipe_box *box, bool commit, VkSemaphore *sem);
 
 static ALWAYS_INLINE bool
 zink_bo_has_unflushed_usage(const struct zink_bo *bo)
 {
    /* submit_count always matches for unflushed usage */
-   return (bo->reads.u && bo->reads.submit_count == bo->reads.u->submit_count && zink_batch_usage_is_unflushed(bo->reads.u)) ||
-          (bo->writes.u && bo->writes.submit_count == bo->writes.u->submit_count && zink_batch_usage_is_unflushed(bo->writes.u));
+   return (bo->reads.u && zink_batch_submit_count_diff(bo->reads.u->submit_count, bo->reads.submit_count) == 0 && zink_batch_usage_is_unflushed(bo->reads.u)) ||
+          (bo->writes.u && zink_batch_submit_count_diff(bo->writes.u->submit_count, bo->writes.submit_count) == 0 && zink_batch_usage_is_unflushed(bo->writes.u));
 }
 
 static ALWAYS_INLINE bool
@@ -155,16 +197,16 @@ zink_bo_has_usage(const struct zink_bo *bo)
 {
    return zink_bo_has_unflushed_usage(bo) ||
           /* submit_count increments on batch submit and reset, so diff<=1 means same batch submission */
-          (zink_batch_usage_exists(bo->reads.u) && bo->reads.u->submit_count - bo->reads.submit_count <= 1) ||
-          (zink_batch_usage_exists(bo->writes.u) && bo->writes.u->submit_count - bo->writes.submit_count <= 1);
+          (zink_batch_usage_exists(bo->reads.u) && zink_batch_submit_count_diff(bo->reads.u->submit_count, bo->reads.submit_count) <= 1) ||
+          (zink_batch_usage_exists(bo->writes.u) && zink_batch_submit_count_diff(bo->writes.u->submit_count, bo->writes.submit_count) <= 1);
 }
 
 static ALWAYS_INLINE bool
 zink_bo_usage_matches(const struct zink_bo *bo, const struct zink_batch_state *bs)
 {
    /* submit_count increments on batch submit and reset, so diff<=1 means same batch submission */
-   return (zink_batch_usage_matches(bo->reads.u, bs) && bo->reads.u->submit_count - bo->reads.submit_count <= 1) ||
-          (zink_batch_usage_matches(bo->writes.u, bs) && bo->writes.u->submit_count - bo->writes.submit_count <= 1);
+   return (zink_batch_usage_matches(bo->reads.u, bs) && zink_batch_submit_count_diff(bo->reads.u->submit_count, bo->reads.submit_count) <= 1) ||
+          (zink_batch_usage_matches(bo->writes.u, bs) && zink_batch_submit_count_diff(bo->writes.u->submit_count, bo->writes.submit_count) <= 1);
 }
 
 static ALWAYS_INLINE bool
@@ -238,8 +280,8 @@ zink_bo_usage_unset(struct zink_bo *bo, struct zink_batch_state *bs)
 static ALWAYS_INLINE void
 zink_bo_unref(struct zink_screen *screen, struct zink_bo *bo)
 {
-   struct pb_buffer *pbuf = &bo->base;
-   pb_reference_with_winsys(screen, &pbuf, NULL);
+   if (pipe_reference(&bo->base.reference, NULL))
+      zink_bo_destroy(screen, bo);
 }
 
 #endif

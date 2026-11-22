@@ -27,7 +27,6 @@
 #include "freedreno_query_hw.h"
 #include "freedreno_resource.h"
 #include "freedreno_screen.h"
-#include "freedreno_surface.h"
 #include "freedreno_util.h"
 
 #include <errno.h>
@@ -248,7 +247,7 @@ do_blit(struct fd_context *ctx, const struct pipe_blit_info *blit,
  */
 void
 fd_replace_buffer_storage(struct pipe_context *pctx, struct pipe_resource *pdst,
-                          struct pipe_resource *psrc, unsigned num_rebinds, uint32_t rebind_mask,
+                          struct pipe_resource *psrc, unsigned num_rebinds, uint64_t rebind_mask,
                           uint32_t delete_buffer_id)
 {
    struct fd_context *ctx = fd_context(pctx);
@@ -463,6 +462,10 @@ fd_try_shadow_resource(struct fd_context *ctx, struct fd_resource *rsc,
    blit.src.format = pshadow->format;
    blit.mask = util_format_get_mask(prsc->format);
    blit.filter = PIPE_TEX_FILTER_NEAREST;
+
+   /* a separate stencil is not part of what was shadowed */
+   if (rsc->stencil)
+      blit.mask &= ~PIPE_MASK_S;
 
 #define set_box(field, val)                                                    \
    do {                                                                        \
@@ -887,9 +890,19 @@ resource_transfer_map(struct pipe_context *pctx, struct pipe_resource *prsc,
           (usage & PIPE_MAP_DISCARD_RANGE)) {
 
          /* try shadowing only if it avoids a flush, otherwise staging would
-          * be better:
+          * be better.
+          *
+          * Compute-only contexts don't have GMEM tile passes, so the simpler
+          * staging path is better.
+          *
+          * TODO if a resource is shared across contexts with no clear
+          * barrier transition, the staging path could be problematic, since
+          * another thread could race a read reference on the resource after
+          * the rsc->track is swapped but before the shadow blit completes.
+          * I think this scenario only comes up with rusticl.
           */
          if (needs_flush && !(usage & TC_TRANSFER_MAP_NO_INVALIDATE) &&
+               !(ctx->flags & PIPE_CONTEXT_COMPUTE_ONLY) &&
                fd_try_shadow_resource(ctx, rsc, level, box, DRM_FORMAT_MOD_LINEAR)) {
             needs_flush = busy = false;
             ctx->stats.shadow_uploads++;
@@ -1148,8 +1161,6 @@ fd_resource_get_param(struct pipe_screen *pscreen,
       return true;
    case PIPE_RESOURCE_PARAM_OFFSET:
       if (fd_resource_ubwc_enabled(rsc, level)) {
-         if (plane > 0)
-            debug_warning("Unsupported offset query!\n");
          *value = fd_resource_ubwc_offset(rsc, level, layer);
       } else {
          *value = fd_resource_offset(rsc, level, layer);
@@ -1274,7 +1285,9 @@ get_best_layout(struct fd_screen *screen,
    if (!screen->tile_mode(tmpl))
       return FD_LAYOUT_LINEAR;
 
-   if (tmpl->target == PIPE_BUFFER)
+   if ((tmpl->target == PIPE_BUFFER) ||
+       (tmpl->target == PIPE_TEXTURE_1D) ||
+       (tmpl->target == PIPE_TEXTURE_1D_ARRAY))
       return FD_LAYOUT_LINEAR;
 
    if ((tmpl->usage == PIPE_USAGE_STAGING) &&
@@ -1419,6 +1432,29 @@ fd_resource_allocate_and_resolve(struct pipe_screen *pscreen,
 }
 
 /**
+ * A resource whose format has more than one plane must end up with one
+ * pipe_resource per plane, chained via ->next (see fd_resource_plane()).
+ * Check that once allocation is done, rather than assuming in advance which
+ * mechanism produced it: the dri frontend can build the chain itself
+ * (importing an EGLImage plane by plane), or a driver hook can self-allocate
+ * every plane in one call.  Either is fine; a resource left short a plane is
+ * not.
+ */
+static bool
+resource_missing_planes(struct pipe_resource *prsc)
+{
+   unsigned nplanes = util_format_get_num_planes(prsc->format);
+
+   if (util_resource_num(prsc) >= nplanes)
+      return false;
+
+   perf_debug("%" PRSC_FMT ": multi-planar resource is missing %u of %u planes",
+              PRSC_ARGS(prsc), nplanes - util_resource_num(prsc), nplanes);
+
+   return true;
+}
+
+/**
  * Create a new texture object, using the given template info.
  */
 static struct pipe_resource *
@@ -1459,6 +1495,11 @@ fd_resource_create_with_modifiers(struct pipe_screen *pscreen,
       if (!rsc)
          return NULL;
 
+      if (resource_missing_planes(&rsc->b.b)) {
+         fd_resource_destroy(pscreen, &rsc->b.b);
+         return NULL;
+      }
+
       return &rsc->b.b;
    }
 
@@ -1468,8 +1509,38 @@ fd_resource_create_with_modifiers(struct pipe_screen *pscreen,
       return NULL;
    rsc = fd_resource(prsc);
 
+   struct pipe_resource *uv_prsc = NULL;
+   struct fd_resource *uv_rsc = NULL;
+
+   if (screen->layout_multiplanar_resource &&
+       (tmpl->format == PIPE_FORMAT_R8_G8B8_420_UNORM ||
+        tmpl->format == PIPE_FORMAT_Y8_U8V8_420_UNORM)) {
+      struct pipe_resource uv_tmpl = *tmpl;
+      uv_tmpl.format = PIPE_FORMAT_R8G8_UNORM;
+      uv_tmpl.width0 = DIV_ROUND_UP(tmpl->width0, 2);
+      uv_tmpl.height0 = DIV_ROUND_UP(tmpl->height0, 2);
+
+      uint32_t uv_size = 0;
+      uv_prsc = fd_resource_allocate_and_resolve(pscreen, &uv_tmpl, modifiers, count, &uv_size);
+      if (!uv_prsc) {
+         fd_resource_destroy(pscreen, prsc);
+         return NULL;
+      }
+      uv_rsc = fd_resource(uv_prsc);
+
+      size = screen->layout_multiplanar_resource(rsc, uv_rsc);
+   }
+
    realloc_bo(rsc, size);
    if (!rsc->bo)
+      goto fail;
+
+   if (uv_prsc) {
+      uv_rsc->bo = fd_bo_ref(rsc->bo);
+      prsc->next = uv_prsc;
+   }
+
+   if (resource_missing_planes(prsc))
       goto fail;
 
    return prsc;
@@ -1734,6 +1805,11 @@ fd_resource_from_memobj(struct pipe_screen *pscreen,
       return NULL;
    }
 
+   if (resource_missing_planes(prsc)) {
+      fd_resource_destroy(pscreen, prsc);
+      return NULL;
+   }
+
    /* Share the bo with the memory object. */
    fd_resource_set_bo(rsc, fd_bo_ref(memobj->bo));
 
@@ -1819,8 +1895,6 @@ fd_resource_context_init(struct pipe_context *pctx)
    pctx->texture_unmap = u_transfer_helper_transfer_unmap;
    pctx->buffer_subdata = u_default_buffer_subdata;
    pctx->texture_subdata = u_default_texture_subdata;
-   pctx->create_surface = fd_create_surface;
-   pctx->surface_destroy = fd_surface_destroy;
    pctx->resource_copy_region = fd_resource_copy_region;
    pctx->blit = fd_blit_pipe;
    pctx->flush_resource = fd_flush_resource;

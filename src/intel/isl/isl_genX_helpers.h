@@ -81,8 +81,15 @@ isl_encode_valign(uint8_t valign)
 UNUSED static struct isl_extent3d
 isl_get_image_alignment(const struct isl_surf *surf)
 {
+   if (surf->levels == 1 &&
+       surf->logical_level0_px.depth == 1 &&
+       surf->logical_level0_px.array_len == 1) {
+      /* This alignment value is unused for single slice surfaces. */
+      return isl_extent3d(GFX_VERx10 >= 125 ? 128 : 4, 4, 1);
+   }
+
    if (GFX_VERx10 >= 125) {
-      if (isl_tiling_is_64(surf->tiling)) {
+      if (isl_tiling_is_standard(surf->tiling)) {
          /* The hardware ignores the alignment values. Anyway, the surface's
           * true alignment is likely outside the enum range of HALIGN* and
           * VALIGN*.
@@ -103,7 +110,7 @@ isl_get_image_alignment(const struct isl_surf *surf)
                              surf->image_alignment_el.d);
       }
    } else if (GFX_VER >= 9) {
-      if (isl_tiling_is_std_y(surf->tiling) ||
+      if (isl_tiling_is_standard(surf->tiling) ||
           surf->dim_layout == ISL_DIM_LAYOUT_GFX9_1D) {
          /* The hardware ignores the alignment values. Anyway, the surface's
           * true alignment is likely outside the enum range of HALIGN* and
@@ -245,6 +252,10 @@ isl_get_render_compression_format(enum isl_format format)
    case ISL_FORMAT_B8G8R8A8_UNORM_SRGB:
    case ISL_FORMAT_B8G8R8A8_UNORM:
    case ISL_FORMAT_B8G8R8X8_UNORM:
+   case ISL_FORMAT_YCRCB_NORMAL:
+   case ISL_FORMAT_YCRCB_SWAPUVY:
+   case ISL_FORMAT_YCRCB_SWAPUV:
+   case ISL_FORMAT_YCRCB_SWAPY:
       return CMF_R8_G8_B8_A8;
    case ISL_FORMAT_R10G10B10A2_UNORM:
    case ISL_FORMAT_R10G10B10A2_UNORM_SRGB:
@@ -319,6 +330,40 @@ isl_get_render_compression_format(enum isl_format format)
    case ISL_FORMAT_BC7_UNORM:
    case ISL_FORMAT_BC7_UNORM_SRGB:
    case ISL_FORMAT_BC6H_UF16:
+      return CMF_ML8;
+   /* These formats are not in the CMF table in the Bspec 63919 (r60413).
+    * Although they are not supported for sampling, they are reinterpreted and
+    * used for transfer operations. Use the same CMF that we use for the other
+    * compressed formats.
+    */
+   case ISL_FORMAT_ASTC_LDR_2D_4X4_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_5X4_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_5X5_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_6X5_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_6X6_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_8X5_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_8X6_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_8X8_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_10X5_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_10X6_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_10X8_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_10X10_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_12X10_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_12X12_U8SRGB:
+   case ISL_FORMAT_ASTC_LDR_2D_4X4_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_5X4_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_5X5_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_6X5_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_6X6_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_8X5_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_8X6_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_8X8_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_10X5_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_10X6_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_10X8_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_10X10_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_12X10_FLT16:
+   case ISL_FORMAT_ASTC_LDR_2D_12X12_FLT16:
       return CMF_ML8;
    /* These formats are not in the CMF table in the Bspec 63919 (r60413).
     * We choose CMF values for them by their number of channels x channel bit
@@ -432,6 +477,18 @@ isl_get_render_compression_format(enum isl_format format)
    case ISL_FORMAT_R8_SNORM:
    case ISL_FORMAT_R8_SINT:
       return 0x19;
+
+   /* These formats are not in the Enumeration_RenderCompressionFormat section
+    * in Bspec 53726. So, we align our mappings with the Xe2+ version of this
+    * function.
+    */
+   case ISL_FORMAT_L8A8_UNORM_SRGB:
+      return 0xA;  /* R8G8_UNORM */
+   case ISL_FORMAT_L8_UNORM_SRGB:
+      return 0x18; /* R8_UNORM */
+   case ISL_FORMAT_R9G9B9E5_SHAREDEXP:
+      return 0xD;  /* R11G11B10_FLOAT */
+
    default:
       UNREACHABLE("Unsupported render compression format!");
       return 0;

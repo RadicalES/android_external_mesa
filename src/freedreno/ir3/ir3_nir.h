@@ -54,6 +54,7 @@ uint8_t ir3_nir_vectorize_filter(const nir_instr *instr, const void *data);
 bool ir3_nir_lower_64b_undef(nir_shader *shader);
 bool ir3_nir_lower_64b_global(nir_shader *shader);
 bool ir3_nir_lower_64b_regs(nir_shader *shader);
+bool ir3_nir_lower_64b_image(nir_shader *shader);
 
 nir_mem_access_size_align ir3_mem_access_size_align(
    nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size, uint32_t align,
@@ -72,6 +73,7 @@ void ir3_nir_lower_io_vars_to_temporaries(nir_shader *s);
 void ir3_finalize_nir(struct ir3_compiler *compiler,
                       const struct ir3_shader_nir_options *options,
                       nir_shader *s);
+void ir3_nir_lower_io(nir_shader *s);
 void ir3_nir_post_finalize(struct ir3_shader *shader);
 void ir3_nir_lower_variant(struct ir3_shader_variant *so,
                            const struct ir3_shader_nir_options *options,
@@ -94,6 +96,7 @@ void ir3_const_alloc_all_reserved_space(struct ir3_const_allocations *const_allo
 
 uint32_t ir3_nir_scan_driver_consts(struct ir3_compiler *compiler,
                                     nir_shader *shader,
+                                    const struct ir3_shader_key *key,
                                     struct ir3_const_image_dims *image_dims);
 void ir3_alloc_driver_params(struct ir3_const_allocations *const_alloc,
                              uint32_t *num_driver_params,
@@ -103,6 +106,7 @@ bool ir3_nir_lower_load_constant(nir_shader *nir, struct ir3_shader_variant *v);
 void ir3_nir_analyze_ubo_ranges(nir_shader *nir, struct ir3_shader_variant *v);
 bool ir3_nir_lower_ubo_loads(nir_shader *nir, struct ir3_shader_variant *v);
 bool ir3_nir_lower_const_global_loads(nir_shader *nir, struct ir3_shader_variant *v);
+bool ir3_nir_can_lower_to_ldg_k(nir_intrinsic_instr *intrin);
 bool ir3_nir_fixup_load_const_ir3(nir_shader *nir);
 bool ir3_nir_opt_preamble(nir_shader *nir, struct ir3_shader_variant *v);
 bool ir3_nir_opt_prefetch_descriptors(nir_shader *nir, struct ir3_shader_variant *v);
@@ -146,6 +150,7 @@ struct driver_param_info {
 };
 
 bool ir3_get_driver_param_info(const nir_shader *shader,
+                               const struct ir3_shader_key *key,
                                nir_intrinsic_instr *intr,
                                struct driver_param_info *param_info);
 
@@ -172,7 +177,6 @@ is_intrinsic_store(nir_intrinsic_op op)
    case nir_intrinsic_store_ssbo:
    case nir_intrinsic_store_shared:
    case nir_intrinsic_store_global:
-   case nir_intrinsic_store_global_ir3:
       return true;
    default:
       return false;
@@ -189,7 +193,6 @@ is_intrinsic_load(nir_intrinsic_op op)
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_shared:
    case nir_intrinsic_load_global:
-   case nir_intrinsic_load_global_ir3:
    case nir_intrinsic_load_const_ir3:
       return true;
    default:
@@ -208,6 +211,24 @@ unsigned ir3_nir_max_offset_shift(nir_intrinsic_instr *intr, const void *data);
  */
 gl_system_value
 ir3_nir_intrinsic_barycentric_sysval(nir_intrinsic_instr *intr);
+
+nir_io_offset ir3_nir_get_global_offset(nir_builder *b,
+                                        struct ir3_compiler *compiler,
+                                        nir_def *offset, unsigned offset_shift);
+
+/* Returns true if an intrinsic reading memory can be safely moved into the
+ * preamble. It's assumed the intrinsic is already reorderable. Either it must
+ * be always executed, or it must be safe to execute even if the original shader
+ * never executed it (i.e. it must be speculatable).
+ */
+static inline bool
+ir3_nir_is_prefetchable(nir_intrinsic_instr *intr)
+{
+   return intr->instr.block->cf_node.parent->type == nir_cf_node_function ||
+      (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE);
+}
+
+bool ir3_nir_is_preamble_speculatable(nir_shader *s);
 
 ENDC;
 

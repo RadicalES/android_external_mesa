@@ -15,6 +15,7 @@
 
 #include "util/sparse_array.h"
 
+#include "vn_descriptor.h"
 #include "vn_wsi.h"
 
 struct vn_format_properties_entry {
@@ -37,7 +38,7 @@ struct vn_image_format_properties {
 
 struct vn_image_format_cache_entry {
    struct vn_image_format_properties properties;
-   uint8_t key[SHA1_DIGEST_LENGTH];
+   uint8_t key[BLAKE3_KEY_LEN];
    struct list_head head;
 };
 
@@ -100,8 +101,10 @@ struct vn_physical_device {
    VkImageLayout copy_src_layouts[64];
    VkImageLayout copy_dst_layouts[64];
 
-   VkQueueFamilyProperties2 *queue_family_properties;
-   VkQueueFamilyGlobalPriorityProperties *global_priority_properties;
+   VkQueueFamilyProperties2 *qfp;
+   VkQueueFamilyGlobalPriorityProperties *qfgpp;
+   VkQueueFamilyOwnershipTransferPropertiesKHR *qfotp;
+   VkQueueFamilyOptimalImageTransferGranularityPropertiesKHR *qfoitgp;
    uint32_t queue_family_count;
    bool sparse_binding_disabled;
    /* Track the queue family index to emulate a second queue. -1 means no
@@ -117,22 +120,19 @@ struct vn_physical_device {
       VkExternalMemoryHandleTypeFlags supported_handle_types;
    } external_memory;
 
-   struct {
-      bool fence_exportable;
-      bool semaphore_exportable;
-      bool semaphore_importable;
-   } renderer_sync_fd;
-
    VkExternalFenceHandleTypeFlags external_fence_handles;
    VkExternalSemaphoreHandleTypeFlags external_binary_semaphore_handles;
    VkExternalSemaphoreHandleTypeFlags external_timeline_semaphore_handles;
 
    struct wsi_device wsi_device;
 
-   simple_mtx_t format_update_mutex;
+   simple_mtx_t mutex;
    struct util_sparse_array format_properties;
 
    struct vn_image_format_properties_cache image_format_cache;
+
+   atomic_bool descriptor_sizes_initialized;
+   VkDeviceSize descriptor_sizes[VN_NUM_DESCRIPTOR_TYPES];
 };
 VK_DEFINE_HANDLE_CASTS(vn_physical_device,
                        base.vk.base,
@@ -152,7 +152,7 @@ vn_queue_family_can_feedback(struct vn_physical_device *physical_dev,
     */
    assert(queue_family_index < physical_dev->queue_family_count);
    const struct VkQueueFamilyProperties2 *props =
-      &physical_dev->queue_family_properties[queue_family_index];
+      &physical_dev->qfp[queue_family_index];
    const VkQueueFlags transfer_flags =
       VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
    return props->queueFamilyProperties.queueFlags & transfer_flags;

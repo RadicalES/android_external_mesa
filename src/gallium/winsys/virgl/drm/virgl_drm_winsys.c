@@ -677,7 +677,12 @@ static bool virgl_drm_winsys_resource_get_handle(struct virgl_winsys *qws,
    } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
       whandle->handle = res->bo_handle;
    } else if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
-      if (drmPrimeHandleToFD(qdws->fd, res->bo_handle, DRM_CLOEXEC, (int*)&whandle->handle))
+      const uint32_t blob_flags = VIRGL_RESOURCE_FLAG_MAP_PERSISTENT |
+                                  VIRGL_RESOURCE_FLAG_MAP_COHERENT;
+      uint32_t flags = DRM_CLOEXEC;
+      if (!(res->flags & blob_flags))
+         flags |= DRM_RDWR;
+      if (drmPrimeHandleToFD(qdws->fd, res->bo_handle, flags, (int*)&whandle->handle))
             return false;
       mtx_lock(&qdws->bo_handles_mutex);
       _mesa_hash_table_insert(qdws->bo_handles, (void *)(uintptr_t)res->bo_handle, res);
@@ -1305,19 +1310,20 @@ virgl_drm_screen_destroy(struct pipe_screen *pscreen)
 {
    struct virgl_screen *screen = virgl_screen(pscreen);
    bool destroy;
+   int fd = -1;
 
    simple_mtx_lock(&virgl_screen_mutex);
    destroy = --screen->refcnt == 0;
    if (destroy) {
-      int fd = virgl_drm_winsys(screen->vws)->fd;
+      fd = virgl_drm_winsys(screen->vws)->fd;
       _mesa_hash_table_remove_key(fd_tab, intptr_to_pointer(fd));
-      close(fd);
    }
    simple_mtx_unlock(&virgl_screen_mutex);
 
    if (destroy) {
       pscreen->destroy = screen->winsys_priv;
       pscreen->destroy(pscreen);
+      close(fd);
    }
 }
 

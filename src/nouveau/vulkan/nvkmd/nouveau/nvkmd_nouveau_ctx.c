@@ -62,6 +62,7 @@ nvkmd_nouveau_create_exec_ctx(struct nvkmd_dev *_dev,
    STATIC_ASSERT(NVKMD_ENGINE_3D       == (int)NOUVEAU_WS_ENGINE_3D);
    STATIC_ASSERT(NVKMD_ENGINE_M2MF     == (int)NOUVEAU_WS_ENGINE_M2MF);
    STATIC_ASSERT(NVKMD_ENGINE_COMPUTE  == (int)NOUVEAU_WS_ENGINE_COMPUTE);
+   STATIC_ASSERT(NVKMD_ENGINE_VDEC     == (int)NOUVEAU_WS_ENGINE_VDEC);
 
    err = nouveau_ws_context_create(dev->ws_dev, (int)engines, &ctx->ws_ctx);
    if (err != 0) {
@@ -76,17 +77,18 @@ nvkmd_nouveau_create_exec_ctx(struct nvkmd_dev *_dev,
    if (err < 0) {
       nouveau_ws_context_destroy(ctx->ws_ctx);
       FREE(ctx);
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
-   ctx->max_push = MIN2(NVKMD_NOUVEAU_MAX_PUSH, dev->ws_dev->max_push);
+   ctx->max_push = dev->ws_dev->max_push;
+   ctx->req_push = UTIL_DYNARRAY_INIT;
 
    ctx->req = (struct drm_nouveau_exec) {
       .channel = ctx->ws_ctx->channel,
       .push_count = 0,
       .wait_count = 0,
       .sig_count = 0,
-      .push_ptr = (uintptr_t)&ctx->req_push,
+      .push_ptr = 0,
       .wait_ptr = (uintptr_t)&ctx->req_wait,
       .sig_ptr = (uintptr_t)&ctx->req_sig,
    };
@@ -100,6 +102,8 @@ static void
 nvkmd_nouveau_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
 {
    struct nvkmd_nouveau_exec_ctx *ctx = nvkmd_nouveau_exec_ctx(_ctx);
+
+   util_dynarray_fini(&ctx->req_push);
 
    ASSERTED int err = drmSyncobjDestroy(ctx->ws_dev->fd, ctx->syncobj);
    assert(err == 0);
@@ -140,6 +144,7 @@ nvkmd_nouveau_exec_ctx_flush(struct nvkmd_ctx *_ctx,
        ctx->req.sig_count == 0)
       return VK_SUCCESS;
 
+   ctx->req.push_ptr = (uintptr_t)util_dynarray_begin(&ctx->req_push);
    int err = drmCommandWriteRead(ctx->ws_dev->fd, DRM_NOUVEAU_EXEC,
                                  &ctx->req, sizeof(ctx->req));
    if (err) {
@@ -148,6 +153,7 @@ nvkmd_nouveau_exec_ctx_flush(struct nvkmd_ctx *_ctx,
          result = VK_ERROR_DEVICE_LOST;
       return vk_errorf(log_obj, result, "DRM_NOUVEAU_EXEC failed: %m");
    }
+   util_dynarray_clear(&ctx->req_push);
 
    ctx->req.push_count = 0;
    ctx->req.wait_count = 0;
@@ -162,7 +168,16 @@ nvkmd_nouveau_exec_ctx_exec(struct nvkmd_ctx *_ctx,
                             uint32_t exec_count,
                             const struct nvkmd_ctx_exec *execs)
 {
+   if (exec_count == 0)
+      return VK_SUCCESS;
+
    struct nvkmd_nouveau_exec_ctx *ctx = nvkmd_nouveau_exec_ctx(_ctx);
+   const uint32_t size_needed = MIN2(
+      ctx->req_push.size + exec_count * sizeof(struct drm_nouveau_exec_push),
+      ctx->max_push * sizeof(struct drm_nouveau_exec_push));
+
+   if (util_dynarray_ensure_cap(&ctx->req_push, size_needed) == NULL)
+      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    for (uint32_t i = 0; i < exec_count; i++) {
       uint32_t incomplete_count = 0;
@@ -191,11 +206,13 @@ nvkmd_nouveau_exec_ctx_exec(struct nvkmd_ctx *_ctx,
       if (execs[i].no_prefetch)
          flags |= DRM_NOUVEAU_EXEC_PUSH_NO_PREFETCH;
 
-      ctx->req_push[ctx->req.push_count++] = (struct drm_nouveau_exec_push) {
+      struct drm_nouveau_exec_push push = {
          .va = execs[i].addr,
          .va_len = execs[i].size_B,
          .flags = flags,
       };
+      util_dynarray_append(&ctx->req_push, push);
+      ctx->req.push_count++;
    }
 
    return VK_SUCCESS;
@@ -366,6 +383,7 @@ nvkmd_nouveau_bind_ctx_bind(struct nvkmd_ctx *_ctx,
 {
    struct nvkmd_nouveau_bind_ctx *ctx = nvkmd_nouveau_bind_ctx(_ctx);
 
+   struct nvkmd_va *prev_va = NULL;
    for (uint32_t i = 0; i < bind_count; i++) {
       STATIC_ASSERT(NVKMD_BIND_OP_BIND   == DRM_NOUVEAU_VM_BIND_OP_MAP);
       STATIC_ASSERT(NVKMD_BIND_OP_UNBIND == DRM_NOUVEAU_VM_BIND_OP_UNMAP);
@@ -386,8 +404,10 @@ nvkmd_nouveau_bind_ctx_bind(struct nvkmd_ctx *_ctx,
          struct drm_nouveau_vm_bind_op *prev_op =
             &ctx->req_ops[ctx->req.op_count - 1];
 
-         /* Try to coalesce bind ops together if we can */
-         if (op.op == prev_op->op &&
+         /* Try to coalesce bind ops together if we can (We can only merge
+          * operations if they are part of the same VA mapping) */
+         if (binds[i].va == prev_va &&
+             op.op == prev_op->op &&
              op.flags == prev_op->flags &&
              op.handle == prev_op->handle &&
              op.addr == prev_op->addr + prev_op->range &&
@@ -404,6 +424,7 @@ nvkmd_nouveau_bind_ctx_bind(struct nvkmd_ctx *_ctx,
       }
 
       ctx->req_ops[ctx->req.op_count++] = op;
+      prev_va = binds[i].va;
    }
 
    return VK_SUCCESS;

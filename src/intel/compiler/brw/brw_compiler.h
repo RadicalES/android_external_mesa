@@ -1,24 +1,6 @@
 /*
- * Copyright © 2010 - 2015 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * Copyright © 2010-2015 Intel Corporation
+ * SPDX-License-Identifier: MIT
  */
 
 #pragma once
@@ -30,13 +12,15 @@
 #include "isl/isl.h"
 #include "mda/debug_archiver.h"
 #include "util/macros.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/enum_operators.h"
 #include "util/ralloc.h"
 #include "util/shader_stats.h"
 #include "util/u_math.h"
 #include "brw_isa_info.h"
-#include "compiler/intel_shader_enums.h"
+#include "compiler/intel_nir.h"
+#include "compiler/intel_shader.h"
+#include "compiler/intel_nir.h"
 #include "nir_shader_compiler_options.h"
 
 #ifdef __cplusplus
@@ -60,6 +44,16 @@ struct brw_storage_format {
    uint32_t isl_formats[3];
 };
 
+struct brw_reg_set {
+   struct ra_regs *regs;
+
+   /**
+    * Array of the ra classes for the unaligned contiguous register
+    * block sizes used, indexed by register size.
+    */
+   struct ra_class *classes[REG_CLASS_COUNT];
+};
+
 struct brw_compiler {
    const struct intel_device_info *devinfo;
 
@@ -70,20 +64,12 @@ struct brw_compiler {
 
    struct brw_isa_info isa;
 
-   struct {
-      struct ra_regs *regs;
-
-      /**
-       * Array of the ra classes for the unaligned contiguous register
-       * block sizes used, indexed by register size.
-       */
-      struct ra_class *classes[REG_CLASS_COUNT];
-   } reg_set;
+   struct brw_reg_set reg_set;
+   struct brw_reg_set reg_set_debug;
 
    void (*shader_debug_log)(void *, unsigned *id, const char *str, ...) PRINTFLIKE(3, 4);
    void (*shader_perf_log)(void *, unsigned *id, const char *str, ...) PRINTFLIKE(3, 4);
 
-   bool use_tcs_multi_patch;
    struct nir_shader_compiler_options nir_options[MESA_ALL_SHADER_STAGES];
 
    /**
@@ -93,27 +79,9 @@ struct brw_compiler {
    bool precise_trig;
 
    /**
-    * Whether indirect UBO loads should use the sampler or go through the
-    * data/constant cache.  For the sampler, UBO surface states have to be set
-    * up with VK_FORMAT_R32G32B32A32_FLOAT whereas if it's going through the
-    * constant or data cache, UBOs must use VK_FORMAT_RAW.
+    * Whether to limit sin/cos inputs to [-2pi, 2pi] to improve accuracy.
     */
-   bool indirect_ubos_use_sampler;
-
-   /**
-    * Gfx12.5+ has a bit in the SEND instruction extending the bindless
-    * surface offset range from 20 to 26 bits, effectively giving us 4Gb of
-    * bindless surface descriptors instead of 64Mb previously.
-    */
-   bool extended_bindless_surface_offset;
-
-   /**
-    * Gfx11+ has a bit in the dword 3 of the sampler message header that
-    * indicates whether the sampler handle is relative to the dynamic state
-    * base address (0) or the bindless sampler base address (1). The driver
-    * can select this.
-    */
-   bool use_bindless_sampler_offset;
+   bool limit_trig_input_range;
 
    /**
     * Should DPAS instructions be lowered?
@@ -246,6 +214,12 @@ PRAGMA_DIAGNOSTIC_ERROR(-Wpadded)
 enum brw_robustness_flags {
    BRW_ROBUSTNESS_UBO  = BITFIELD_BIT(0),
    BRW_ROBUSTNESS_SSBO = BITFIELD_BIT(1),
+   BRW_ROBUSTNESS_SLM  = BITFIELD_BIT(2),
+};
+
+enum brw_divergent_atomics_flags {
+   BRW_OPT_DIVERGENT_ATOMICS_BUFFER = BITFIELD_BIT(0),
+   BRW_OPT_DIVERGENT_ATOMICS_IMAGE  = BITFIELD_BIT(1),
 };
 
 struct brw_base_prog_key {
@@ -255,20 +229,23 @@ struct brw_base_prog_key {
     */
    uint32_t view_mask;
 
-   enum brw_robustness_flags robust_flags:2;
+   /** Use efficient 64bit bit mode
+    *
+    * Gfx35+ only.
+    */
+   bool use_efficient_64bit : 1;
 
-   bool uses_inline_push_addr:1;
+   enum brw_robustness_flags robust_flags:3;
 
    enum intel_vue_layout vue_layout:2;
 
-   /**
-    * Apply workarounds for SIN and COS input range problems.
-    * This limits input range for SIN and COS to [-2p : 2p] to
-    * avoid precision issues.
-    */
-   bool limit_trig_input_range:1;
+   enum brw_divergent_atomics_flags divergent_atomics_flags:2;
 
-   uint32_t padding:26;
+   enum intel_atomic_branch_cases atomic_branch_flags:3;
+
+   enum intel_code_motion code_motion:2;
+
+   uint32_t padding:19;
 };
 
 /**
@@ -330,7 +307,15 @@ struct brw_vs_prog_key {
     */
    bool no_vf_slot_compaction : 1;
 
-   uint32_t padding:30;
+   /** Percentage of the register file that should be used for the payload
+    *
+    * Limit the number of vector registers delivered to the payload by
+    * adjusting the VF input data delivered (it'll be fetch from the URB
+    * instead). Range [0, 100].
+    */
+   unsigned max_payload_percent : 8;
+
+   uint32_t padding:22;
 };
 
 /** The program key for Tessellation Control Shaders. */
@@ -398,17 +383,13 @@ struct brw_mesh_prog_key
 };
 
 /** The program key for Fragment/Pixel Shaders. */
-struct brw_wm_prog_key {
+struct brw_fs_prog_key {
    struct brw_base_prog_key base;
-
-   float min_sample_shading;
 
    /* Some collection of BRW_WM_IZ_* */
    unsigned nr_color_regions:5;
    bool alpha_test_replicate_alpha:1;
    enum intel_sometimes alpha_to_coverage:2;
-
-   bool force_dual_color_blend:1;
 
    /** Whether or inputs are interpolated at sample rate by default
     *
@@ -418,7 +399,7 @@ struct brw_wm_prog_key {
     * us to run per-sample.  Even when running per-sample due to gl_SampleID,
     * we may still interpolate unqualified inputs at the pixel center.
     */
-   enum intel_sometimes persample_interp:2;
+   bool persample_interp:1;
 
    /* Whether or not we are running on a multisampled framebuffer */
    enum intel_sometimes multisample_fbo:2;
@@ -429,21 +410,29 @@ struct brw_wm_prog_key {
    /* Is provoking vertex last? */
    enum intel_sometimes provoking_vertex_last:2;
 
+   /* If the shader reads FullyCovered, we need to know if conservative
+    * rasterization is on, which may be dynamic.
+    */
+   enum intel_sometimes conservative_raster:2;
+
    bool ignore_sample_mask_out:1;
    bool coarse_pixel:1;
-   bool api_sample_shading:1;
+
+   /* Keep the SIMD32 variant even if the throughput model ties it. */
+   bool prefer_simd32:1;
+
    unsigned pad:12;
 };
 
 static inline bool
-brw_wm_prog_key_is_dynamic(const struct brw_wm_prog_key *key)
+brw_fs_prog_key_is_dynamic(const struct brw_fs_prog_key *key)
 {
    return
       key->mesh_input == INTEL_SOMETIMES ||
       key->provoking_vertex_last == INTEL_SOMETIMES ||
       key->alpha_to_coverage == INTEL_SOMETIMES ||
-      key->persample_interp == INTEL_SOMETIMES ||
       key->multisample_fbo == INTEL_SOMETIMES ||
+      key->conservative_raster == INTEL_SOMETIMES ||
       key->base.vue_layout == INTEL_VUE_LAYOUT_SEPARATE_MESH;
 }
 
@@ -468,7 +457,7 @@ union brw_any_prog_key {
    struct brw_tcs_prog_key tcs;
    struct brw_tes_prog_key tes;
    struct brw_gs_prog_key gs;
-   struct brw_wm_prog_key wm;
+   struct brw_fs_prog_key fs;
    struct brw_cs_prog_key cs;
    struct brw_bs_prog_key bs;
    struct brw_task_prog_key task;
@@ -479,85 +468,6 @@ PRAGMA_DIAGNOSTIC_POP
 
 /** Max number of render targets in a shader */
 #define BRW_MAX_DRAW_BUFFERS 8
-
-struct brw_ubo_range
-{
-   uint16_t block;
-
-   /* In units of 32-byte registers */
-   uint8_t start;
-   uint8_t length;
-};
-
-/* We reserve the first 2^16 values for builtins */
-#define BRW_PARAM_IS_BUILTIN(param) (((param) & 0xffff0000) == 0)
-
-enum brw_param_builtin {
-   BRW_PARAM_BUILTIN_ZERO,
-
-   BRW_PARAM_BUILTIN_CLIP_PLANE_0_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_0_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_0_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_0_W,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_1_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_1_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_1_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_1_W,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_2_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_2_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_2_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_2_W,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_3_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_3_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_3_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_3_W,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_4_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_4_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_4_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_4_W,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_5_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_5_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_5_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_5_W,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_6_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_6_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_6_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_6_W,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_7_X,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_7_Y,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_7_Z,
-   BRW_PARAM_BUILTIN_CLIP_PLANE_7_W,
-
-   BRW_PARAM_BUILTIN_TESS_LEVEL_OUTER_X,
-   BRW_PARAM_BUILTIN_TESS_LEVEL_OUTER_Y,
-   BRW_PARAM_BUILTIN_TESS_LEVEL_OUTER_Z,
-   BRW_PARAM_BUILTIN_TESS_LEVEL_OUTER_W,
-   BRW_PARAM_BUILTIN_TESS_LEVEL_INNER_X,
-   BRW_PARAM_BUILTIN_TESS_LEVEL_INNER_Y,
-
-   BRW_PARAM_BUILTIN_PATCH_VERTICES_IN,
-
-   BRW_PARAM_BUILTIN_BASE_WORK_GROUP_ID_X,
-   BRW_PARAM_BUILTIN_BASE_WORK_GROUP_ID_Y,
-   BRW_PARAM_BUILTIN_BASE_WORK_GROUP_ID_Z,
-   BRW_PARAM_BUILTIN_WORK_GROUP_SIZE_X,
-   BRW_PARAM_BUILTIN_WORK_GROUP_SIZE_Y,
-   BRW_PARAM_BUILTIN_WORK_GROUP_SIZE_Z,
-   BRW_PARAM_BUILTIN_WORK_DIM,
-};
-
-#define BRW_PARAM_BUILTIN_CLIP_PLANE(idx, comp) \
-   (BRW_PARAM_BUILTIN_CLIP_PLANE_0_X + ((idx) << 2) + (comp))
-
-#define BRW_PARAM_BUILTIN_IS_CLIP_PLANE(param)  \
-   ((param) >= BRW_PARAM_BUILTIN_CLIP_PLANE_0_X && \
-    (param) <= BRW_PARAM_BUILTIN_CLIP_PLANE_7_W)
-
-#define BRW_PARAM_BUILTIN_CLIP_PLANE_IDX(param) \
-   (((param) - BRW_PARAM_BUILTIN_CLIP_PLANE_0_X) >> 2)
-
-#define BRW_PARAM_BUILTIN_CLIP_PLANE_COMP(param) \
-   (((param) - BRW_PARAM_BUILTIN_CLIP_PLANE_0_X) & 0x3)
 
 struct brw_stage_prog_data {
    mesa_shader_stage stage;
@@ -576,8 +486,6 @@ struct brw_stage_prog_data {
     *
     *    (robust_ubo_ranges & (1 << j)) &&
     *    (i < push_reg_mask_param[j] * 16)
-    *
-    * brw_compiler::compact_params must be false if robust_ubo_ranges used
     */
    uint8_t robust_ubo_ranges;
    unsigned push_reg_mask_param;
@@ -608,19 +516,11 @@ struct brw_stage_prog_data {
    /** Number of GRF registers used. */
    unsigned grf_used;
 
-   bool use_alt_mode; /**< Use ALT floating point mode?  Otherwise, IEEE. */
+   uint64_t source_hash;
 
-   uint32_t source_hash;
-
-   /* Whether shader uses atomic operations. */
-   bool uses_atomic_load_store;
+   /* Was this shader compiled with Jay? */
+   bool is_jay;
 };
-
-/**
- * Convert a number of GRF registers used (grf_used in prog_data) into
- * a number of GRF register blocks supported by the hardware on PTL+.
- */
-unsigned ptl_register_blocks(unsigned grf_used);
 
 enum brw_pixel_shader_computed_depth_mode {
    BRW_PSCDEPTH_OFF   = 0, /* PS does not compute depth */
@@ -631,10 +531,10 @@ enum brw_pixel_shader_computed_depth_mode {
 
 /* Data about a particular attempt to compile a program.  Note that
  * there can be many of these, each in a different GL state
- * corresponding to a different brw_wm_prog_key struct, with different
+ * corresponding to a different brw_fs_prog_key struct, with different
  * compiled programs.
  */
-struct brw_wm_prog_data {
+struct brw_fs_prog_data {
    struct brw_stage_prog_data base;
 
    /**
@@ -677,6 +577,7 @@ struct brw_wm_prog_data {
    bool uses_pos_offset;
    bool uses_omask;
    bool uses_kill;
+   bool uses_src_xy;
    bool uses_src_depth;
    bool uses_src_w;
    bool uses_depth_w_coefficients;
@@ -687,6 +588,7 @@ struct brw_wm_prog_data {
    bool uses_vmask;
    bool has_side_effects;
    bool pulls_bary;
+   bool uses_fully_covered;
 
    /**
     * Whether nonperspective interpolation modes are used by the
@@ -701,46 +603,42 @@ struct brw_wm_prog_data {
     */
    bool vertex_attributes_bypass;
 
-   /** True if the shader wants sample shading
-    *
-    * This corresponds to whether or not a gl_SampleId, gl_SamplePosition, or
-    * a sample-qualified input are used in the shader.  It is independent of
-    * GL_MIN_SAMPLE_SHADING_VALUE in GL or minSampleShading in Vulkan.
-    */
-   bool sample_shading;
+   /** Shader is using per-sample interpolation */
+   bool persample_interp;
 
-   /** True if the API wants sample shading
-    *
-    * Not used by the compiler, but useful for restore from the cache. The
-    * driver is expected to write the value it wants.
-    */
-   bool api_sample_shading;
+   /** Whether this shader uses the FS config push data value */
+   bool uses_fs_config;
 
-   /** Min sample shading value
+   /** Whether this shader uses the FS color offset push data value
     *
-    * Not used by the compiler, but useful for restore from the cache. The
-    * driver is expected to write the value it wants.
+    * Efficient 64bit mode only
     */
-   float min_sample_shading;
+   bool uses_fs_color_offset;
+
+   /** Whether this shader uses the FS color map push data value
+    *
+    * Efficient 64bit mode only
+    */
+   bool uses_fs_color_map;
 
    /** Should this shader be dispatched per-sample */
-   enum intel_sometimes persample_dispatch;
+   bool persample_dispatch;
 
    /**
     * Shader is ran at the coarse pixel shading dispatch rate (3DSTATE_CPS).
     */
-   enum intel_sometimes coarse_pixel_dispatch;
+   bool coarse_pixel_dispatch;
+
+   /**
+    * Whether the shader was compiled with a preference for SIMD32.
+    */
+   bool prefer_simd32;
 
    /**
     * Shader writes the SampleMask and this is AND-ed with the API's
     * SampleMask to generate a new coverage mask.
     */
    enum intel_sometimes alpha_to_coverage;
-
-   /**
-    * Whether the shader is dispatch with a preceeding mesh shader.
-    */
-   enum intel_sometimes mesh_input;
 
    /*
     * Provoking vertex may be dynamically set to last and we need to know
@@ -749,16 +647,10 @@ struct brw_wm_prog_data {
    enum intel_sometimes provoking_vertex_last;
 
    /**
-    * Push constant location of intel_msaa_flags (dynamic configuration of the
+    * Push constant location of intel_fs_config (dynamic configuration of the
     * pixel shader) in bytes.
     */
-   unsigned msaa_flags_param;
-
-   /**
-    * Push constant location of the remapping offset in the instruction heap
-    * for Wa_18019110168 in bytes.
-    */
-   unsigned per_primitive_remap_param;
+   unsigned fs_config_param;
 
    /**
     * Mask of which interpolation modes are required by the fragment shader.
@@ -791,7 +683,6 @@ struct brw_wm_prog_data {
     * For varying slots that are not used by the FS, the value is -1.
     */
    int urb_setup[VARYING_SLOT_MAX];
-   int urb_setup_channel[VARYING_SLOT_MAX];
 
    /**
     * Cache structure into the urb_setup array above that contains the
@@ -801,17 +692,6 @@ struct brw_wm_prog_data {
    uint8_t urb_setup_attribs[VARYING_SLOT_MAX];
    uint8_t urb_setup_attribs_count;
 };
-
-static inline bool
-brw_wm_prog_data_is_dynamic(const struct brw_wm_prog_data *prog_data)
-{
-   return prog_data->mesh_input == INTEL_SOMETIMES ||
-      (prog_data->vertex_attributes_bypass &&
-       prog_data->provoking_vertex_last == INTEL_SOMETIMES) ||
-      prog_data->alpha_to_coverage == INTEL_SOMETIMES ||
-      prog_data->coarse_pixel_dispatch == INTEL_SOMETIMES ||
-      prog_data->persample_dispatch == INTEL_SOMETIMES;
-}
 
 #ifdef GFX_VERx10
 
@@ -827,7 +707,7 @@ brw_wm_prog_data_is_dynamic(const struct brw_wm_prog_data *prog_data)
  * If the given KSP is enabled, a SIMD width of 8, 16, or 32 is
  * returned.  Note that for a multipolygon dispatch kernel 8 is always
  * returned, since multipolygon kernels use the "_8" fields from
- * brw_wm_prog_data regardless of their SIMD width.  If the KSP is
+ * brw_fs_prog_data regardless of their SIMD width.  If the KSP is
  * invalid, 0 is returned.
  */
 static inline unsigned
@@ -890,7 +770,7 @@ brw_fs_simd_width_for_ksp(unsigned ksp_idx, bool simd8_enabled,
    (brw_wm_state_simd_width_for_ksp((wm_state), (ksp_idx)) != 0)
 
 static inline uint32_t
-_brw_wm_prog_data_prog_offset(const struct brw_wm_prog_data *prog_data,
+_brw_fs_prog_data_prog_offset(const struct brw_fs_prog_data *prog_data,
                               unsigned simd_width)
 {
    switch (simd_width) {
@@ -901,12 +781,12 @@ _brw_wm_prog_data_prog_offset(const struct brw_wm_prog_data *prog_data,
    }
 }
 
-#define brw_wm_prog_data_prog_offset(prog_data, wm_state, ksp_idx) \
-   _brw_wm_prog_data_prog_offset(prog_data, \
+#define brw_fs_prog_data_prog_offset(prog_data, wm_state, ksp_idx) \
+   _brw_fs_prog_data_prog_offset(prog_data, \
       brw_wm_state_simd_width_for_ksp(wm_state, ksp_idx))
 
 static inline uint8_t
-_brw_wm_prog_data_dispatch_grf_start_reg(const struct brw_wm_prog_data *prog_data,
+_brw_fs_prog_data_dispatch_grf_start_reg(const struct brw_fs_prog_data *prog_data,
                                          unsigned simd_width)
 {
    switch (simd_width) {
@@ -917,35 +797,9 @@ _brw_wm_prog_data_dispatch_grf_start_reg(const struct brw_wm_prog_data *prog_dat
    }
 }
 
-#define brw_wm_prog_data_dispatch_grf_start_reg(prog_data, wm_state, ksp_idx) \
-   _brw_wm_prog_data_dispatch_grf_start_reg(prog_data, \
+#define brw_fs_prog_data_dispatch_grf_start_reg(prog_data, wm_state, ksp_idx) \
+   _brw_fs_prog_data_dispatch_grf_start_reg(prog_data, \
       brw_wm_state_simd_width_for_ksp(wm_state, ksp_idx))
-
-static inline bool
-brw_wm_prog_data_is_persample(const struct brw_wm_prog_data *prog_data,
-                              enum intel_msaa_flags pushed_msaa_flags)
-{
-   return intel_fs_is_persample(prog_data->persample_dispatch,
-                                prog_data->sample_shading,
-                                pushed_msaa_flags);
-}
-
-static inline uint32_t
-wm_prog_data_barycentric_modes(const struct brw_wm_prog_data *prog_data,
-                               enum intel_msaa_flags pushed_msaa_flags)
-{
-   return intel_fs_barycentric_modes(prog_data->persample_dispatch,
-                                     prog_data->barycentric_interp_modes,
-                                     pushed_msaa_flags);
-}
-
-static inline bool
-brw_wm_prog_data_is_coarse(const struct brw_wm_prog_data *prog_data,
-                           enum intel_msaa_flags pushed_msaa_flags)
-{
-   return intel_fs_is_coarse(prog_data->coarse_pixel_dispatch,
-                             pushed_msaa_flags);
-}
 
 struct brw_push_const_block {
    unsigned dwords;     /* Dword count, not reg aligned */
@@ -971,11 +825,7 @@ struct brw_cs_prog_data {
    unsigned prog_spilled;
 
    bool uses_barrier;
-   bool uses_inline_data;
-   /** Whether inline push data is used to provide a 64bit pointer to push
-    * constants
-    */
-   bool uses_inline_push_addr;
+   bool uses_fence;
    bool uses_btd_stack_ids;
    bool uses_systolic;
    uint8_t generate_local_id;
@@ -983,6 +833,9 @@ struct brw_cs_prog_data {
 
    /* True if shader has any sample operation */
    bool uses_sampler;
+
+   /* True if the shader was compiled with SIMD32 forced */
+   bool force_simd32;
 
    struct {
       struct brw_push_const_block cross_thread;
@@ -1005,11 +858,6 @@ brw_cs_prog_data_prog_offset(const struct brw_cs_prog_data *prog_data,
 struct brw_bs_prog_data {
    struct brw_stage_prog_data base;
 
-   /** Whether inline push data is used to provide a 64bit pointer to push
-    * constants
-    */
-   bool uses_inline_push_addr;
-
    /** SIMD size of the root shader */
    uint8_t simd_size;
 
@@ -1018,22 +866,7 @@ struct brw_bs_prog_data {
 
    /** Offset into the shader where the resume SBT is located */
    uint32_t resume_sbt_offset;
-
-   /** Number of resume shaders */
-   uint32_t num_resume_shaders;
 };
-
-/**
- * Enum representing the i965-specific vertex results that don't correspond
- * exactly to any element of gl_varying_slot.  The values of this enum are
- * assigned such that they don't conflict with gl_varying_slot.
- */
-typedef enum
-{
-   BRW_VARYING_SLOT_PAD = VARYING_SLOT_MAX,
-   BRW_VARYING_SLOT_COUNT
-} brw_varying_slot;
-
 
 #define BRW_VUE_HEADER_VARYING_MASK \
    (VARYING_BIT_VIEWPORT | \
@@ -1061,7 +894,7 @@ static inline unsigned brw_vue_slot_to_offset(unsigned slot)
 }
 
 /**
- * Convert a vertex output (brw_varying_slot) into a byte offset within the
+ * Convert a vertex output (gl_varying_slot) into a byte offset within the
  * VUE.
  */
 static inline unsigned
@@ -1099,7 +932,6 @@ struct brw_vue_prog_data {
    bool include_vue_handles;
 
    unsigned urb_read_length;
-   unsigned total_grf;
 
    uint32_t clip_distance_mask;
    uint32_t cull_distance_mask;
@@ -1121,7 +953,6 @@ struct brw_vs_prog_data {
 
    bool uses_vertexid;
    bool uses_instanceid;
-   bool uses_is_indexed_draw;
    bool uses_firstvertex;
    bool uses_baseinstance;
    bool uses_drawid;
@@ -1152,12 +983,6 @@ struct brw_tcs_prog_data
 
    /** Should the non-SINGLE_PATCH payload provide primitive ID? */
    bool include_primitive_id;
-
-   /** Whether the tessellation domain is unknown at compile time
-    *
-    * Used with VK_EXT_shader_object
-    */
-   bool dynamic_domain;
 
    /** Number vertices in output patch */
    int instances;
@@ -1250,9 +1075,6 @@ struct brw_mue_map {
    /* Per vertex offset in bytes from the start of the MUE (32B aligned) */
    uint32_t per_vertex_offset;
 
-   /* Size of the per vertex header (32B aligned) */
-   uint32_t per_vertex_header_size;
-
    /* Per vertex stride in bytes (32B aligned) */
    uint32_t per_vertex_stride;
 
@@ -1309,7 +1131,7 @@ union brw_any_prog_data {
    struct brw_tcs_prog_data tcs;
    struct brw_tes_prog_data tes;
    struct brw_gs_prog_data gs;
-   struct brw_wm_prog_data wm;
+   struct brw_fs_prog_data fs;
    struct brw_cs_prog_data cs;
    struct brw_bs_prog_data bs;
    struct brw_task_prog_data task;
@@ -1336,7 +1158,7 @@ DEFINE_PROG_DATA_DOWNCAST(vs,  prog_data->stage == MESA_SHADER_VERTEX)
 DEFINE_PROG_DATA_DOWNCAST(tcs, prog_data->stage == MESA_SHADER_TESS_CTRL)
 DEFINE_PROG_DATA_DOWNCAST(tes, prog_data->stage == MESA_SHADER_TESS_EVAL)
 DEFINE_PROG_DATA_DOWNCAST(gs,  prog_data->stage == MESA_SHADER_GEOMETRY)
-DEFINE_PROG_DATA_DOWNCAST(wm,  prog_data->stage == MESA_SHADER_FRAGMENT)
+DEFINE_PROG_DATA_DOWNCAST(fs,  prog_data->stage == MESA_SHADER_FRAGMENT)
 DEFINE_PROG_DATA_DOWNCAST(cs,  mesa_shader_stage_uses_workgroup(prog_data->stage))
 DEFINE_PROG_DATA_DOWNCAST(bs,  brw_shader_stage_is_bindless(prog_data->stage))
 
@@ -1425,18 +1247,18 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo);
 uint64_t
 brw_get_compiler_config_value(const struct brw_compiler *compiler);
 
-/* Provides a string sha1 hash of all device information fields that could
+/* Provides a string blake3 hash of all device information fields that could
  * affect shader compilation.
  */
 void
-brw_device_sha1(char *hex, const struct intel_device_info *devinfo);
+brw_device_blake3(char *hex, const struct intel_device_info *devinfo);
 
 /* For callers computing their own UUID or hash.  Hashes all device
  * information fields that could affect shader compilation into the provided
- * sha1_ctx.
+ * blake3_ctx.
  */
 void
-brw_device_sha1_update(struct mesa_sha1 *sha1_ctx,
+brw_device_blake3_update(blake3_hasher *blake3_ctx,
                        const struct intel_device_info *devinfo);
 
 unsigned
@@ -1450,211 +1272,68 @@ struct brw_compile_params {
 
    nir_shader *nir;
 
+   const struct brw_base_prog_key *key;
+   struct brw_stage_prog_data *prog_data;
+
+   /** Filled by the compiler, one entry per compiled variant. */
    struct genisa_stats *stats;
 
    void *log_data;
 
+   /** Filled by the compiler when the compilation fails.  Allocated from
+    * mem_ctx.
+    */
    char *error_str;
 
    uint64_t debug_flag;
 
-   uint32_t source_hash;
+   struct {
+      const struct intel_vue_map *input_vue_map;
+   } tes;
+
+   struct {
+      const struct brw_tue_map *tue_map;
+
+      /** Load provoking vertex for wa_18019110168
+       *
+       * The callback returns a 32bit integer representing the provoking vertex.
+       */
+      void *wa_18019110168_data;
+      nir_def *(*wa_18019110168_load_provoking_vertex)(nir_builder *b,
+                                                       void *data);
+   } mesh;
+
+   struct {
+      const struct intel_vue_map *vue_map;
+      const struct brw_mue_map *mue_map;
+
+      bool use_rep_send;
+      uint8_t max_polygons;
+
+      /** Load per primitive remapping offset for wa_18019110168
+       *
+       * The callback returns a 32bit integer representing the offset of the
+       * table in the instruction heap.
+       */
+      void *wa_18019110168_data;
+      nir_def *(*wa_18019110168_load_per_primitive_remap_table_offset)(
+         nir_builder *b, void *data);
+
+      void *rt_write_data;
+      intel_nir_rt_write_cb rt_write_cb;
+   } fs;
+
+   struct {
+      unsigned num_resume_shaders;
+      struct nir_shader **resume_shaders;
+   } bs;
 
    debug_archiver *archiver;
 };
 
-/**
- * Parameters for compiling a vertex shader.
- *
- * Some of these will be modified during the shader compilation.
- */
-struct brw_compile_vs_params {
-   struct brw_compile_params base;
-
-   const struct brw_vs_prog_key *key;
-   struct brw_vs_prog_data *prog_data;
-};
-
-/**
- * Compile a vertex shader.
- *
- * Returns the final assembly and updates the parameters structure.
- */
 const unsigned *
-brw_compile_vs(const struct brw_compiler *compiler,
-               struct brw_compile_vs_params *params);
-
-/**
- * Parameters for compiling a tessellation control shader.
- *
- * Some of these will be modified during the shader compilation.
- */
-struct brw_compile_tcs_params {
-   struct brw_compile_params base;
-
-   const struct brw_tcs_prog_key *key;
-   struct brw_tcs_prog_data *prog_data;
-};
-
-/**
- * Compile a tessellation control shader.
- *
- * Returns the final assembly and updates the parameters structure.
- */
-const unsigned *
-brw_compile_tcs(const struct brw_compiler *compiler,
-                struct brw_compile_tcs_params *params);
-
-/**
- * Parameters for compiling a tessellation evaluation shader.
- *
- * Some of these will be modified during the shader compilation.
- */
-struct brw_compile_tes_params {
-   struct brw_compile_params base;
-
-   const struct brw_tes_prog_key *key;
-   struct brw_tes_prog_data *prog_data;
-   const struct intel_vue_map *input_vue_map;
-};
-
-/**
- * Compile a tessellation evaluation shader.
- *
- * Returns the final assembly and updates the parameters structure.
- */
-const unsigned *
-brw_compile_tes(const struct brw_compiler *compiler,
-                struct brw_compile_tes_params *params);
-
-/**
- * Parameters for compiling a geometry shader.
- *
- * Some of these will be modified during the shader compilation.
- */
-struct brw_compile_gs_params {
-   struct brw_compile_params base;
-
-   const struct brw_gs_prog_key *key;
-   struct brw_gs_prog_data *prog_data;
-};
-
-/**
- * Compile a geometry shader.
- *
- * Returns the final assembly and updates the parameters structure.
- */
-const unsigned *
-brw_compile_gs(const struct brw_compiler *compiler,
-               struct brw_compile_gs_params *params);
-
-struct brw_compile_task_params {
-   struct brw_compile_params base;
-
-   const struct brw_task_prog_key *key;
-   struct brw_task_prog_data *prog_data;
-};
-
-const unsigned *
-brw_compile_task(const struct brw_compiler *compiler,
-                 struct brw_compile_task_params *params);
-
-struct brw_compile_mesh_params {
-   struct brw_compile_params base;
-
-   const struct brw_mesh_prog_key *key;
-   struct brw_mesh_prog_data *prog_data;
-   const struct brw_tue_map *tue_map;
-
-   /** Load provoking vertex
-    *
-    * The callback returns a 32bit integer representing the provoking vertex.
-    */
-   void *load_provoking_vertex_data;
-   nir_def *(*load_provoking_vertex)(nir_builder *b, void *data);
-};
-
-const unsigned *
-brw_compile_mesh(const struct brw_compiler *compiler,
-                 struct brw_compile_mesh_params *params);
-
-/**
- * Parameters for compiling a fragment shader.
- *
- * Some of these will be modified during the shader compilation.
- */
-struct brw_compile_fs_params {
-   struct brw_compile_params base;
-
-   const struct brw_wm_prog_key *key;
-   struct brw_wm_prog_data *prog_data;
-
-   const struct intel_vue_map *vue_map;
-   const struct brw_mue_map *mue_map;
-
-   bool allow_spilling;
-   bool use_rep_send;
-   uint8_t max_polygons;
-};
-
-/**
- * Compile a fragment shader.
- *
- * Returns the final assembly and updates the parameters structure.
- */
-const unsigned *
-brw_compile_fs(const struct brw_compiler *compiler,
-               struct brw_compile_fs_params *params);
-
-/**
- * Parameters for compiling a compute shader.
- *
- * Some of these will be modified during the shader compilation.
- */
-struct brw_compile_cs_params {
-   struct brw_compile_params base;
-
-   const struct brw_cs_prog_key *key;
-   struct brw_cs_prog_data *prog_data;
-};
-
-/**
- * Compile a compute shader.
- *
- * Returns the final assembly and updates the parameters structure.
- */
-const unsigned *
-brw_compile_cs(const struct brw_compiler *compiler,
-               struct brw_compile_cs_params *params);
-
-/**
- * Parameters for compiling a Bindless shader.
- *
- * Some of these will be modified during the shader compilation.
- */
-struct brw_compile_bs_params {
-   struct brw_compile_params base;
-
-   const struct brw_bs_prog_key *key;
-   struct brw_bs_prog_data *prog_data;
-
-   unsigned num_resume_shaders;
-   struct nir_shader **resume_shaders;
-};
-
-/**
- * Compile a Bindless shader.
- *
- * Returns the final assembly and updates the parameters structure.
- */
-const unsigned *
-brw_compile_bs(const struct brw_compiler *compiler,
-               struct brw_compile_bs_params *params);
-
-void brw_debug_key_recompile(const struct brw_compiler *c, void *log,
-                             mesa_shader_stage stage,
-                             const struct brw_base_prog_key *old_key,
-                             const struct brw_base_prog_key *key);
+brw_compile(const struct brw_compiler *compiler,
+            struct brw_compile_params *params);
 
 unsigned
 brw_cs_push_const_total_size(const struct brw_cs_prog_data *cs_prog_data,
@@ -1704,7 +1383,7 @@ brw_stage_has_packed_dispatch(ASSERTED const struct intel_device_info *devinfo,
     * enabled by setting the macro below to true.
     */
    #define ENABLE_TEST_DISPATCH_PACKING false
-   assert(devinfo->ver <= 30);
+   assert(devinfo->ver <= 35);
 
    switch (stage) {
    case MESA_SHADER_FRAGMENT: {
@@ -1716,11 +1395,11 @@ brw_stage_has_packed_dispatch(ASSERTED const struct intel_device_info *devinfo,
        * the SIMD thread, so dispatch of unlit samples cannot be avoided in
        * general and we should return false.
        */
-      const struct brw_wm_prog_data *wm_prog_data =
-         (const struct brw_wm_prog_data *)prog_data;
+      const struct brw_fs_prog_data *fs_prog_data =
+         (const struct brw_fs_prog_data *)prog_data;
       return devinfo->verx10 < 125 &&
-             !wm_prog_data->persample_dispatch &&
-             wm_prog_data->uses_vmask &&
+             !fs_prog_data->persample_dispatch &&
+             fs_prog_data->uses_vmask &&
              max_polygons < 2;
    }
    case MESA_SHADER_COMPUTE:
@@ -1757,7 +1436,7 @@ brw_compute_first_fs_urb_slot_required(uint64_t inputs_read,
 void
 brw_compute_sbe_per_vertex_urb_read(const struct intel_vue_map *prev_stage_vue_map,
                                     bool mesh, bool per_primitive_remapping,
-                                    const struct brw_wm_prog_data *wm_prog_data,
+                                    const struct brw_fs_prog_data *fs_prog_data,
                                     uint32_t *out_first_slot,
                                     uint32_t *num_slots,
                                     uint32_t *out_num_varyings,
@@ -1784,6 +1463,8 @@ brw_compute_sbe_per_primitive_urb_read(uint64_t inputs_read,
 #define BRW_TASK_MESH_PUSH_CONSTANTS_SIZE_DW \
    (BRW_TASK_MESH_INLINE_DATA_SIZE_DW - BRW_TASK_MESH_PUSH_CONSTANTS_START_DW)
 
+#define BRW_SRCHASH_EMPTY (uint64_t)-1
+
 /**
  * This enum is used as the base indice of the nir_load_topology_id_intel
  * intrinsic. This is used to return different values based on some aspect of
@@ -1801,6 +1482,44 @@ enum brw_topology_id
    /* A value composed of EU ID, thread ID & SIMD lane ID. */
    BRW_TOPOLOGY_ID_EU_THREAD_SIMD,
 };
+
+static inline unsigned
+intel_vrt_register_file_size(const struct intel_device_info *devinfo,
+                             uint64_t source_hash,
+                             unsigned size)
+{
+   if (devinfo->ver < 30)
+      return 128;
+
+   unsigned vrt_size = MIN2(align(size, size > 192 ? 64 : 32), 256);
+
+   // Jay uses vrt_size here to determine its number of GRFs before its RA stage
+   if (unlikely(intel_threads_per_eu_set != (uint32_t)-1)) {
+      if (intel_threads_per_eu_srchash == BRW_SRCHASH_EMPTY ||
+          intel_threads_per_eu_srchash == source_hash) {
+         fprintf(stderr,
+                 "INTEL_THREADS_PER_EU: set=%u for src_hash=0x%" PRIx64 "\n",
+                 intel_threads_per_eu_set, source_hash);
+         vrt_size = ROUND_DOWN_TO(1024 / intel_threads_per_eu_set, 32);
+      }
+   } else if (unlikely(intel_threads_per_eu_min != (uint32_t)-1)) {
+      if (intel_threads_per_eu_srchash == BRW_SRCHASH_EMPTY ||
+          intel_threads_per_eu_srchash == source_hash) {
+         fprintf(stderr,
+                 "INTEL_THREADS_PER_EU: min=%u for src_hash=0x%" PRIx64 "\n",
+                 intel_threads_per_eu_min, source_hash);
+         vrt_size = MIN2(vrt_size, ROUND_DOWN_TO(1024 / intel_threads_per_eu_min, 32));
+      }
+   }
+
+   return vrt_size;
+}
+
+static inline unsigned
+intel_max_vrt_threads(const struct intel_device_info *devinfo, unsigned grfs)
+{
+   return devinfo->ver >= 30 ? MIN2(1024 / grfs, 10) : UINT32_MAX;
+}
 
 #ifdef __cplusplus
 } /* extern "C" */

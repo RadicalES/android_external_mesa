@@ -51,6 +51,7 @@
 
 #include "genxml/gen70_pack.h"
 #include "genxml/genX_bits.h"
+#include "wsi_common_private.h"
 
 const struct gfx8_border_color anv_default_border_colors[] = {
    [VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK] =  { .float32 = { 0.0, 0.0, 0.0, 0.0 } },
@@ -65,7 +66,7 @@ static void
 anv_device_init_border_colors(struct anv_device *device)
 {
    device->border_colors =
-      anv_state_pool_emit_data(&device->dynamic_state_pool,
+      anv_state_pool_emit_data(anv_device_get_dynamic_state_pool(device),
                                sizeof(anv_default_border_colors),
                                64, anv_default_border_colors);
 }
@@ -147,24 +148,24 @@ decode_get_bo(void *v_batch, bool ppgtt, uint64_t address)
 
    assert(ppgtt);
 
-   if (get_bo_from_pool(&ret_bo, &device->dynamic_state_pool.block_pool, address))
+   if (get_bo_from_pool(&ret_bo, &anv_device_get_dynamic_state_pool(device)->block_pool, address))
       return ret_bo;
    if (get_bo_from_shader_heap(&ret_bo, device, address))
       return ret_bo;
-   if (get_bo_from_pool(&ret_bo, &device->binding_table_pool.block_pool, address))
+   if (get_bo_from_pool(&ret_bo, &anv_device_get_binding_table_pool(device)->block_pool, address))
       return ret_bo;
-   if (get_bo_from_pool(&ret_bo, &device->scratch_surface_state_pool.block_pool, address))
-      return ret_bo;
-   if (device->physical->indirect_descriptors &&
-       get_bo_from_pool(&ret_bo, &device->bindless_surface_state_pool.block_pool, address))
-      return ret_bo;
-   if (get_bo_from_pool(&ret_bo, &device->internal_surface_state_pool.block_pool, address))
+   if (get_bo_from_pool(&ret_bo, &anv_device_get_scratch_surface_state_pool(device)->block_pool, address))
       return ret_bo;
    if (device->physical->indirect_descriptors &&
-       get_bo_from_pool(&ret_bo, &device->indirect_push_descriptor_pool.block_pool, address))
+       get_bo_from_pool(&ret_bo, &anv_device_get_bindless_surface_state_pool(device)->block_pool, address))
+      return ret_bo;
+   if (get_bo_from_pool(&ret_bo, &anv_device_get_internal_surface_state_pool(device)->block_pool, address))
+      return ret_bo;
+   if (device->physical->indirect_descriptors &&
+       get_bo_from_pool(&ret_bo, &anv_device_get_indirect_push_descriptor_pool(device)->block_pool, address))
       return ret_bo;
    if (device->info->has_aux_map &&
-       get_bo_from_pool(&ret_bo, &device->aux_tt_pool.block_pool, address))
+       get_bo_from_pool(&ret_bo, &anv_device_get_aux_tt_pool(device)->block_pool, address))
       return ret_bo;
 
    if (!device->cmd_buffer_being_decoded)
@@ -172,17 +173,21 @@ decode_get_bo(void *v_batch, bool ppgtt, uint64_t address)
 
    struct anv_batch_bo **bbo;
    u_vector_foreach(bbo, &device->cmd_buffer_being_decoded->seen_bbos) {
+      struct anv_bo *bo = (*bbo)->bo;
       /* The decoder zeroes out the top 16 bits, so we need to as well */
-      uint64_t bo_address = (*bbo)->bo->offset & (~0ull >> 16);
+      uint64_t bo_address = bo->offset & (~0ull >> 16);
 
-      if (address >= bo_address && address < bo_address + (*bbo)->bo->size) {
+      if (address >= bo_address &&
+          address < (bo_address + bo->size)) {
          return (struct intel_batch_decode_bo) {
             .addr = bo_address,
-            .size = (*bbo)->bo->size,
-            .map = (*bbo)->bo->map,
+            .size = bo->size,
+            .map = bo->map,
          };
       }
+   }
 
+   u_vector_foreach(bbo, &device->cmd_buffer_being_decoded->seen_bbos) {
       uint32_t dep_words = (*bbo)->relocs.dep_words;
       BITSET_WORD *deps = (*bbo)->relocs.deps;
       for (uint32_t w = 0; w < dep_words; w++) {
@@ -192,7 +197,7 @@ decode_get_bo(void *v_batch, bool ppgtt, uint64_t address)
             uint32_t gem_handle = w * BITSET_WORDBITS + i;
             struct anv_bo *bo = anv_device_lookup_bo(device, gem_handle);
             assert(bo->refcount > 0);
-            bo_address = bo->offset & (~0ull >> 16);
+            uint64_t bo_address = bo->offset & (~0ull >> 16);
             if (address >= bo_address && address < bo_address + bo->size) {
                return (struct intel_batch_decode_bo) {
                   .addr = bo_address,
@@ -221,7 +226,7 @@ intel_aux_map_buffer_alloc(void *driver_ctx, uint32_t size)
 
    struct anv_device *device = (struct anv_device*)driver_ctx;
 
-   struct anv_state_pool *pool = &device->aux_tt_pool;
+   struct anv_state_pool *pool = anv_device_get_aux_tt_pool(device);
    buf->state = anv_state_pool_alloc(pool, size, size);
 
    buf->base.gpu = pool->block_pool.bo->offset + buf->state.offset;
@@ -236,7 +241,7 @@ intel_aux_map_buffer_free(void *driver_ctx, struct intel_buffer *buffer)
 {
    struct intel_aux_map_buffer *buf = (struct intel_aux_map_buffer*)buffer;
    struct anv_device *device = (struct anv_device*)driver_ctx;
-   struct anv_state_pool *pool = &device->aux_tt_pool;
+   struct anv_state_pool *pool = anv_device_get_aux_tt_pool(device);
    anv_state_pool_free(pool, buf->state);
    free(buf);
 }
@@ -331,6 +336,485 @@ anv_device_finish_trtt(struct anv_device *device)
    vk_free(&device->vk.alloc, trtt->page_table_bos);
 }
 
+static void
+anv_device_init_descriptors_view(struct anv_device *device)
+{
+   if (!device->info->has_lsc)
+      return;
+
+   struct anv_physical_device *pdevice = device->physical;
+
+   /* For descriptor buffers, unused in efficient 64bit */
+   if (!pdevice->uses_efficient_64bit) {
+      device->descriptor_buffer_view_state =
+         anv_state_pool_alloc(anv_device_get_scratch_surface_state_pool(device),
+                              device->isl_dev.ss.size, 64);
+
+      const uint64_t size = anv_physical_device_get_dynamic_visible_pool_va(pdevice)->size +
+                            anv_physical_device_get_push_descriptor_buffer_pool_va(pdevice)->size;
+      assert(size <= 4ull * 1024 * 1024 * 1024);
+
+      isl_buffer_fill_state(&device->isl_dev,
+                            device->descriptor_buffer_view_state.map,
+                            .address = anv_physical_device_get_dynamic_visible_pool_va(pdevice)->addr,
+                            .size_B = size,
+                            .mocs = anv_mocs(device, NULL, ISL_SURF_USAGE_CONSTANT_BUFFER_BIT),
+                            .format = ISL_FORMAT_RAW,
+                            .swizzle = ISL_SWIZZLE_IDENTITY,
+                            .stride_B = 1,
+                            .is_scratch = false,
+                            .usage = ISL_SURF_USAGE_CONSTANT_BUFFER_BIT);
+   }
+
+   /* For descriptors */
+   {
+      device->descriptor_view_state =
+         anv_state_pool_alloc(anv_device_get_scratch_surface_state_pool(device),
+                              device->isl_dev.ss.size, 64);
+
+      const uint64_t addr =
+         pdevice->uses_efficient_64bit ?
+         pdevice->va.bindless_surface_state_pool.addr :
+         pdevice->va.internal_surface_state_pool.addr;
+      const uint64_t size =
+         pdevice->uses_efficient_64bit ?
+         pdevice->va.bindless_surface_state_pool.size :
+         (pdevice->va.internal_surface_state_pool.size +
+          pdevice->va.bindless_surface_state_pool.size);
+
+      isl_buffer_fill_state(&device->isl_dev,
+                            device->descriptor_view_state.map,
+                            .address = addr,
+                            .size_B = size,
+                            .mocs = anv_mocs(device, NULL, ISL_SURF_USAGE_CONSTANT_BUFFER_BIT),
+                            .format = ISL_FORMAT_RAW,
+                            .swizzle = ISL_SWIZZLE_IDENTITY,
+                            .stride_B = 1,
+                            .is_scratch = false,
+                            .usage = ISL_SURF_USAGE_CONSTANT_BUFFER_BIT);
+   }
+}
+
+static void
+anv_device_finish_descriptors_view(struct anv_device *device)
+{
+   if (!device->info->has_lsc)
+      return;
+
+   anv_state_pool_free(anv_device_get_scratch_surface_state_pool(device),
+                       device->descriptor_buffer_view_state);
+   anv_state_pool_free(anv_device_get_scratch_surface_state_pool(device),
+                       device->descriptor_view_state);
+}
+
+static VkResult
+anv_device_bind_null_va(struct anv_device *device,
+                        struct anv_va_range *range,
+                        enum anv_vm_bind_op op)
+{
+   struct anv_vm_bind bind = {
+      .address = range->addr,
+      .size = range->size,
+      .op = op,
+   };
+   struct anv_sparse_submission submit = {
+      .binds = &bind,
+      .binds_len = 1,
+      .binds_capacity = 1,
+   };
+   return device->kmd_backend->vm_bind(device, &submit,
+                                       ANV_VM_BIND_FLAG_SIGNAL_BIND_TIMELINE);
+}
+
+static VkResult
+anv_device_init_vma_heaps(struct anv_device *device)
+{
+   simple_mtx_init(&device->vma_mutex, mtx_plain);
+
+   if (device->physical->uses_efficient_64bit) {
+      util_vma_heap_init(&device->vma_desc,
+                         device->physical->va.bindless_surface_state_pool.addr,
+                         device->physical->va.bindless_surface_state_pool.size);
+   } else if (!device->physical->indirect_descriptors) {
+      util_vma_heap_init(&device->vma_lo,
+                         device->physical->va.low_heap.addr,
+                         device->physical->va.low_heap.size);
+      util_vma_heap_init(&device->vma_dynamic_visible,
+                         device->physical->va.dynamic_visible_pool.addr,
+                         device->physical->va.dynamic_visible_pool.size);
+      util_vma_heap_init(&device->vma_desc,
+                         device->physical->va.bindless_surface_state_pool.addr,
+                         device->physical->va.bindless_surface_state_pool.size);
+   } else {
+      util_vma_heap_init(&device->vma_lo,
+                         device->physical->va.low_heap.addr,
+                         device->physical->va.low_heap.size);
+      util_vma_heap_init(&device->vma_dynamic_visible,
+                         device->physical->va.dynamic_visible_pool.addr,
+                         device->physical->va.dynamic_visible_pool.size);
+      util_vma_heap_init(&device->vma_desc,
+                         device->physical->va.indirect_descriptor_pool.addr,
+                         device->physical->va.indirect_descriptor_pool.size);
+   }
+
+   util_vma_heap_init(&device->vma_trtt,
+                      device->physical->va.trtt.addr,
+                      device->physical->va.trtt.size);
+   util_vma_heap_init(&device->vma_hi,
+                      device->physical->va.high_heap.addr,
+                      device->physical->va.high_heap.size);
+
+   /* Reduce the usable size of the null initialized heap by enough pages so
+    * that no batch buffers get placed where the CS could end up prefetching
+    * beyond the limit of the null pages.
+    */
+   unsigned max_prefetch = intel_device_info_get_max_engine_prefetch(device->info);
+   max_prefetch = align(max_prefetch, device->info->mem_alignment);
+   util_vma_heap_init(&device->vma_null_initialized,
+                      device->physical->va.null_initialized_heap.addr,
+                      device->physical->va.null_initialized_heap.size - max_prefetch);
+
+   return VK_SUCCESS;
+}
+
+static void
+anv_device_finish_vma_heaps(struct anv_device *device)
+{
+   util_vma_heap_finish(&device->vma_null_initialized);
+   util_vma_heap_finish(&device->vma_trtt);
+   util_vma_heap_finish(&device->vma_desc);
+   util_vma_heap_finish(&device->vma_hi);
+   if (!device->physical->uses_efficient_64bit) {
+      util_vma_heap_finish(&device->vma_dynamic_visible);
+      util_vma_heap_finish(&device->vma_lo);
+   }
+   simple_mtx_destroy(&device->vma_mutex);
+}
+
+static VkResult
+anv_state_pools_init_efficient_64bit(struct anv_device *device)
+{
+   return anv_state_pool_init(&device->internal_surface_state_pool, device,
+                              &(struct anv_state_pool_params) {
+                                 .name         = "internal pool",
+                                 .base_address = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->addr,
+                                 .block_size   = 4096,
+                                 .max_size     = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->size,
+                              });
+}
+
+static void
+anv_state_pool_finish_efficient_64bit(struct anv_device *device)
+{
+   anv_state_pool_finish(&device->internal_surface_state_pool);
+}
+
+static VkResult
+anv_state_pools_init_direct_descriptors(struct anv_device *device)
+{
+   VkResult result;
+
+   result = anv_state_pool_init(&device->dynamic_state_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "dynamic pool",
+                                   .base_address = anv_physical_device_get_dynamic_state_pool_va(device->physical)->addr,
+                                   .block_size   = 16384,
+                                   .max_size     = anv_physical_device_get_dynamic_state_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   /* The border color pointer is limited to 24 bits, so we need to make
+    * sure that any such color used at any point in the program doesn't
+    * exceed that limit.
+    * We achieve that by reserving all the custom border colors we support
+    * right off the bat, so they are close to the base address.
+    */
+   result = anv_state_reserved_array_pool_init(&device->custom_border_colors,
+                                               &device->dynamic_state_pool,
+                                               MAX_CUSTOM_BORDER_COLORS,
+                                               sizeof(struct gfx8_border_color), 64);
+   if (result != VK_SUCCESS)
+      goto fail_dynamic_state_pool;
+
+   /* Put the scratch surface states at the beginning of the internal surface
+    * state pool.
+    */
+   result = anv_state_pool_init(&device->scratch_surface_state_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "scratch surface state pool",
+                                   .base_address = anv_physical_device_get_scratch_surface_state_pool_va(device->physical).addr,
+                                   .block_size   = 4096,
+                                   .max_size     = anv_physical_device_get_scratch_surface_state_pool_va(device->physical).size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_custom_border_color_pool;
+
+   result = anv_state_pool_init(&device->internal_surface_state_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "internal surface state pool",
+                                   .base_address = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->addr,
+                                   .start_offset = anv_physical_device_get_scratch_surface_state_pool_va(device->physical).size,
+                                   .block_size   = 4096,
+                                   .max_size     = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_scratch_surface_state_pool;
+
+   /* We're using 3DSTATE_BINDING_TABLE_POOL_ALLOC to give the binding
+    * table its own base address separately from surface state base.
+    */
+   result = anv_state_pool_init(&device->binding_table_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "binding table pool",
+                                   .base_address = anv_physical_device_get_binding_table_pool_va(device->physical)->addr,
+                                   .block_size   = device->physical->drirc.perf.bt_block_size,
+                                   .max_size     = anv_physical_device_get_binding_table_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_internal_surface_state_pool;
+
+   if (device->vk.enabled_extensions.EXT_descriptor_buffer) {
+      /* On Gfx12.5+ because of the bindless stages (Mesh, Task, RT), the only
+       * way we can wire push descriptors is through the bindless heap. This
+       * state pool is a 1Gb carve out of the 4Gb HW heap.
+       */
+      result = anv_state_pool_init(&device->push_descriptor_buffer_pool, device,
+                                   &(struct anv_state_pool_params) {
+                                      .name         = "push descriptor buffer state pool",
+                                      .base_address = anv_physical_device_get_push_descriptor_buffer_pool_va(device->physical)->addr,
+                                      .block_size   = 4096,
+                                      .max_size     = anv_physical_device_get_push_descriptor_buffer_pool_va(device->physical)->size,
+                                   });
+      if (result != VK_SUCCESS)
+         goto fail_binding_table_pool;
+   }
+
+   if (device->info->has_aux_map) {
+      result = anv_state_pool_init(&device->aux_tt_pool, device,
+                                   &(struct anv_state_pool_params) {
+                                      .name         = "aux-tt pool",
+                                      .base_address = anv_physical_device_get_aux_tt_pool_va(device->physical)->addr,
+                                      .block_size   = 16384,
+                                      .max_size     = anv_physical_device_get_aux_tt_pool_va(device->physical)->size,
+                                   });
+      if (result != VK_SUCCESS)
+         goto fail_push_descriptor_buffer_pool;
+   }
+
+   return result;
+
+fail_push_descriptor_buffer_pool:
+   if (device->vk.enabled_extensions.EXT_descriptor_buffer)
+      anv_state_pool_finish(&device->push_descriptor_buffer_pool);
+fail_binding_table_pool:
+   anv_state_pool_finish(&device->binding_table_pool);
+fail_internal_surface_state_pool:
+   anv_state_pool_finish(&device->internal_surface_state_pool);
+fail_scratch_surface_state_pool:
+   anv_state_pool_finish(&device->scratch_surface_state_pool);
+fail_custom_border_color_pool:
+   anv_state_reserved_array_pool_finish(&device->custom_border_colors);
+fail_dynamic_state_pool:
+   anv_state_pool_finish(&device->dynamic_state_pool);
+fail:
+   return result;
+}
+
+static void
+anv_state_pool_finish_direct_descriptors(struct anv_device *device)
+{
+   anv_state_reserved_array_pool_finish(&device->custom_border_colors);
+   if (device->info->has_aux_map)
+      anv_state_pool_finish(&device->aux_tt_pool);
+   if (device->vk.enabled_extensions.EXT_descriptor_buffer)
+      anv_state_pool_finish(&device->push_descriptor_buffer_pool);
+   anv_state_pool_finish(&device->binding_table_pool);
+   anv_state_pool_finish(&device->scratch_surface_state_pool);
+   anv_state_pool_finish(&device->internal_surface_state_pool);
+   anv_state_pool_finish(&device->dynamic_state_pool);
+}
+
+static VkResult
+anv_state_pools_init_indirect_descriptors(struct anv_device *device)
+{
+   VkResult result;
+
+   /* Because scratch is also relative to General State Base Address, we leave
+    * the base address 0 and start the pool memory at an offset.  This way we
+    * get the correct offsets in the anv_states that get allocated from it.
+    */
+   result = anv_state_pool_init(&device->general_state_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "general pool",
+                                   .base_address = 0,
+                                   .start_offset = device->physical->va.general_state_pool.addr,
+                                   .block_size   = 16384,
+                                   .max_size     = device->physical->va.general_state_pool.size
+                                });
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   result = anv_state_pool_init(&device->dynamic_state_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "dynamic pool",
+                                   .base_address = anv_physical_device_get_dynamic_state_pool_va(device->physical)->addr,
+                                   .block_size   = 16384,
+                                   .max_size     = anv_physical_device_get_dynamic_state_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_general_state_pool;
+
+   /* The border color pointer is limited to 24 bits, so we need to make
+    * sure that any such color used at any point in the program doesn't
+    * exceed that limit.
+    * We achieve that by reserving all the custom border colors we support
+    * right off the bat, so they are close to the base address.
+    */
+   result = anv_state_reserved_array_pool_init(&device->custom_border_colors,
+                                               &device->dynamic_state_pool,
+                                               MAX_CUSTOM_BORDER_COLORS,
+                                               sizeof(struct gfx8_border_color), 64);
+   if (result != VK_SUCCESS)
+      goto fail_dynamic_state_pool;
+
+   result = anv_state_pool_init(&device->internal_surface_state_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "internal surface state pool",
+                                   .base_address = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->addr,
+                                   .block_size   = 4096,
+                                   .max_size     = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_custom_border_color_pool;
+
+   result = anv_state_pool_init(&device->bindless_surface_state_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "bindless surface state pool",
+                                   .base_address = anv_physical_device_get_bindless_surface_state_pool_va(device->physical)->addr,
+                                   .block_size   = 4096,
+                                   .max_size     = anv_physical_device_get_bindless_surface_state_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_internal_surface_state_pool;
+
+   /* The binding table should be in front of the surface states in virtual
+    * address space so that all surface states can be express as relative
+    * offsets from the binding table location.
+    */
+   assert(anv_physical_device_get_binding_table_pool_va(device->physical)->addr <
+          anv_physical_device_get_internal_surface_state_pool_va(device->physical)->addr);
+   int64_t bt_pool_offset = (int64_t)anv_physical_device_get_binding_table_pool_va(device->physical)->addr -
+      (int64_t)anv_physical_device_get_internal_surface_state_pool_va(device->physical)->addr;
+   assert(INT32_MIN < bt_pool_offset && bt_pool_offset < 0);
+   result = anv_state_pool_init(&device->binding_table_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "binding table pool",
+                                   .base_address = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->addr,
+                                   .start_offset = bt_pool_offset,
+                                   .block_size   = 64 * 1024,
+                                   .max_size     = anv_physical_device_get_internal_surface_state_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_bindless_surface_state_pool;
+
+   result = anv_state_pool_init(&device->indirect_push_descriptor_pool, device,
+                                &(struct anv_state_pool_params) {
+                                   .name         = "indirect push descriptor pool",
+                                   .base_address = anv_physical_device_get_indirect_push_descriptor_pool_va(device->physical)->addr,
+                                   .block_size   = 4096,
+                                   .max_size     = anv_physical_device_get_indirect_push_descriptor_pool_va(device->physical)->size,
+                                });
+   if (result != VK_SUCCESS)
+      goto fail_binding_table_pool;
+
+   if (device->info->has_aux_map) {
+      result = anv_state_pool_init(&device->aux_tt_pool, device,
+                                   &(struct anv_state_pool_params) {
+                                      .name         = "aux-tt pool",
+                                      .base_address = anv_physical_device_get_aux_tt_pool_va(device->physical)->addr,
+                                      .block_size   = 16384,
+                                      .max_size     = anv_physical_device_get_aux_tt_pool_va(device->physical)->size,
+                                   });
+      if (result != VK_SUCCESS)
+         goto fail_indirect_push_descriptor_pool;
+   }
+
+   return result;
+
+fail_indirect_push_descriptor_pool:
+   anv_state_pool_finish(&device->indirect_push_descriptor_pool);
+fail_binding_table_pool:
+   anv_state_pool_finish(&device->binding_table_pool);
+fail_bindless_surface_state_pool:
+   anv_state_pool_finish(&device->bindless_surface_state_pool);
+fail_internal_surface_state_pool:
+   anv_state_pool_finish(&device->internal_surface_state_pool);
+fail_custom_border_color_pool:
+   anv_state_reserved_array_pool_finish(&device->custom_border_colors);
+fail_dynamic_state_pool:
+   anv_state_pool_finish(&device->dynamic_state_pool);
+fail_general_state_pool:
+   anv_state_pool_finish(&device->general_state_pool);
+fail:
+   return result;
+}
+
+static void
+anv_state_pool_finish_indirect_descriptors(struct anv_device *device)
+{
+   anv_state_reserved_array_pool_finish(&device->custom_border_colors);
+   if (device->info->has_aux_map)
+      anv_state_pool_finish(&device->aux_tt_pool);
+   anv_state_pool_finish(&device->indirect_push_descriptor_pool);
+   anv_state_pool_finish(&device->binding_table_pool);
+   anv_state_pool_finish(&device->internal_surface_state_pool);
+   anv_state_pool_finish(&device->bindless_surface_state_pool);
+   anv_state_pool_finish(&device->dynamic_state_pool);
+   anv_state_pool_finish(&device->general_state_pool);
+}
+
+static VkResult
+anv_state_pools_init(struct anv_device *device)
+{
+   VkResult result;
+
+   result = anv_shader_heap_init(&device->shader_heap, device,
+                                 device->physical->va.shader_heap,
+                                 21 /* 2MiB */, 26 /* 64MiB */);
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   if (device->physical->uses_efficient_64bit) {
+      result = anv_state_pools_init_efficient_64bit(device);
+   } else if (!device->physical->indirect_descriptors) {
+      result = anv_state_pools_init_direct_descriptors(device);
+   } else {
+      result = anv_state_pools_init_indirect_descriptors(device);
+   }
+   if (result != VK_SUCCESS)
+      goto fail_shader_heap;
+
+   return VK_SUCCESS;
+
+fail_shader_heap:
+   anv_shader_heap_finish(&device->shader_heap);
+fail:
+   return result;
+}
+
+static void
+anv_state_pools_finish(struct anv_device *device)
+{
+   if (device->physical->uses_efficient_64bit)
+      anv_state_pool_finish_efficient_64bit(device);
+   else if (!device->physical->indirect_descriptors)
+      anv_state_pool_finish_direct_descriptors(device);
+   else
+      anv_state_pool_finish_indirect_descriptors(device);
+   anv_shader_heap_finish(&device->shader_heap);
+}
+
 VkResult anv_CreateDevice(
     VkPhysicalDevice                            physicalDevice,
     const VkDeviceCreateInfo*                   pCreateInfo,
@@ -349,7 +833,8 @@ VkResult anv_CreateDevice(
     * queues with flags we don't support.
     */
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
-      if (pCreateInfo->pQueueCreateInfos[i].flags & ~VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT)
+      if (pCreateInfo->pQueueCreateInfos[i].flags & ~(VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT |
+                                                      VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR))
          return vk_error(physical_device, VK_ERROR_INITIALIZATION_FAILED);
 
       const struct anv_queue_family *family =
@@ -424,17 +909,19 @@ VkResult anv_CreateDevice(
 
          const unsigned decode_flags = INTEL_BATCH_DECODE_DEFAULT_FLAGS;
 
-         intel_batch_decode_ctx_init_brw(decoder,
-                                         &physical_device->compiler->isa,
+         intel_batch_decode_ctx_init_gen(decoder,
                                          &physical_device->info,
                                          stderr, decode_flags, NULL,
                                          decode_get_bo, NULL, device);
          intel_batch_stats_reset(decoder);
 
+         decoder->use_efficient_64bit = physical_device->uses_efficient_64bit;
          decoder->engine = physical_device->queue.families[i].engine_class;
-         decoder->dynamic_base = physical_device->va.dynamic_state_pool.addr;
-         decoder->surface_base = physical_device->va.internal_surface_state_pool.addr;
-         decoder->instruction_base = physical_device->va.instruction_state_pool.addr;
+         if (!physical_device->uses_efficient_64bit) {
+            decoder->dynamic_base = anv_physical_device_get_dynamic_state_pool_va(physical_device)->addr;
+            decoder->surface_base = anv_physical_device_get_internal_surface_state_pool_va(physical_device)->addr;
+            decoder->instruction_base = physical_device->va.shader_heap.addr;
+         }
       }
    }
 
@@ -446,6 +933,11 @@ VkResult anv_CreateDevice(
    if (device->fd == -1) {
       result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
       goto fail_device;
+   }
+
+   if (intel_virtio_init_fd(device->fd) < 0) {
+      result = VK_ERROR_INCOMPATIBLE_DRIVER;
+      goto fail_fd;
    }
 
    switch (device->info->kmd_type) {
@@ -461,7 +953,11 @@ VkResult anv_CreateDevice(
 
    device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
    device->vk.command_buffer_ops = &anv_cmd_buffer_ops;
-   vk_device_set_drm_fd(&device->vk, device->fd);
+
+   if (physical_device->info.is_virtio)
+      device->vk.sync = intel_virtio_sync_provider(device->fd);
+   else
+      vk_device_set_drm_fd(&device->vk, device->fd);
 
    uint32_t num_queues = 0;
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++)
@@ -479,54 +975,37 @@ VkResult anv_CreateDevice(
       goto fail_context_id;
    }
 
-   if (pthread_mutex_init(&device->vma_mutex, NULL) != 0) {
-      result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+   result = anv_device_init_vma_heaps(device);
+   if (result != VK_SUCCESS)
       goto fail_queues_alloc;
-   }
-
-   /* keep the page with address zero out of the allocator */
-   util_vma_heap_init(&device->vma_lo,
-                      device->physical->va.low_heap.addr,
-                      device->physical->va.low_heap.size);
-
-   util_vma_heap_init(&device->vma_hi,
-                      device->physical->va.high_heap.addr,
-                      device->physical->va.high_heap.size);
-
-   if (device->physical->indirect_descriptors) {
-      util_vma_heap_init(&device->vma_desc,
-                         device->physical->va.indirect_descriptor_pool.addr,
-                         device->physical->va.indirect_descriptor_pool.size);
-   } else {
-      util_vma_heap_init(&device->vma_desc,
-                         device->physical->va.bindless_surface_state_pool.addr,
-                         device->physical->va.bindless_surface_state_pool.size);
-   }
-
-   /* Always initialized because the the memory types point to this and they
-    * are on the physical device.
-    */
-   util_vma_heap_init(&device->vma_dynamic_visible,
-                      device->physical->va.dynamic_visible_pool.addr,
-                      device->physical->va.dynamic_visible_pool.size);
-   util_vma_heap_init(&device->vma_trtt,
-                      device->physical->va.trtt.addr,
-                      device->physical->va.trtt.size);
 
    list_inithead(&device->memory_objects);
    list_inithead(&device->image_private_objects);
 
-   if (pthread_mutex_init(&device->mutex, NULL) != 0) {
+   simple_mtx_init(&device->mutex, mtx_plain);
+
+   if (mtx_init(&device->fault.mutex, mtx_plain) != thrd_success) {
       result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
-      goto fail_vmas;
+      goto fail_mutex;
    }
+
+   if (u_cnd_monotonic_init(&device->fault.lost_cnd) != thrd_success) {
+      result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+      goto fail_fault_mutex;
+   }
+
+   result = anv_device_bind_null_va(device,
+                                    &device->physical->va.null_initialized_heap,
+                                    ANV_VM_BIND);
+   if (result != VK_SUCCESS)
+      goto fail_fault_cnd;
 
    if (physical_device->instance->vk.trace_mode & VK_TRACE_MODE_RMV)
       anv_memory_trace_init(device);
 
    result = anv_bo_cache_init(&device->bo_cache, device);
    if (result != VK_SUCCESS)
-      goto fail_mutex;
+      goto fail_null_vma_init;
 
    if (!anv_slab_bo_init(device))
       goto fail_cache;
@@ -538,169 +1017,11 @@ VkResult anv_CreateDevice(
                        0 /* alloc_flags */);
    }
 
-   /* Because scratch is also relative to General State Base Address, we leave
-    * the base address 0 and start the pool memory at an offset.  This way we
-    * get the correct offsets in the anv_states that get allocated from it.
-    */
-   result = anv_state_pool_init(&device->general_state_pool, device,
-                                &(struct anv_state_pool_params) {
-                                   .name         = "general pool",
-                                   .base_address = 0,
-                                   .start_offset = device->physical->va.general_state_pool.addr,
-                                   .block_size   = 16384,
-                                   .max_size     = device->physical->va.general_state_pool.size
-                                });
+   result = anv_state_pools_init(device);
    if (result != VK_SUCCESS)
       goto fail_batch_bo_pool;
 
-   result = anv_state_pool_init(&device->dynamic_state_pool, device,
-                                &(struct anv_state_pool_params) {
-                                   .name         = "dynamic pool",
-                                   .base_address = device->physical->va.dynamic_state_pool.addr,
-                                   .block_size   = 16384,
-                                   .max_size     = device->physical->va.dynamic_state_pool.size,
-                                });
-   if (result != VK_SUCCESS)
-      goto fail_general_state_pool;
-
-   /* The border color pointer is limited to 24 bits, so we need to make
-    * sure that any such color used at any point in the program doesn't
-    * exceed that limit.
-    * We achieve that by reserving all the custom border colors we support
-    * right off the bat, so they are close to the base address.
-    */
-   result = anv_state_reserved_array_pool_init(&device->custom_border_colors,
-                                               &device->dynamic_state_pool,
-                                               MAX_CUSTOM_BORDER_COLORS,
-                                               sizeof(struct gfx8_border_color), 64);
-   if (result != VK_SUCCESS)
-      goto fail_dynamic_state_pool;
-
-   result = anv_shader_heap_init(&device->shader_heap, device,
-                                 device->physical->va.instruction_state_pool,
-                                 21 /* 2MiB */, 27 /* 64MiB */);
-   if (result != VK_SUCCESS)
-      goto fail_custom_border_color_pool;
-
-   if (device->info->verx10 >= 125) {
-      /* Put the scratch surface states at the beginning of the internal
-       * surface state pool.
-       */
-      result = anv_state_pool_init(&device->scratch_surface_state_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "scratch surface state pool",
-                                      .base_address = device->physical->va.scratch_surface_state_pool.addr,
-                                      .block_size   = 4096,
-                                      .max_size     = device->physical->va.scratch_surface_state_pool.size,
-                                   });
-      if (result != VK_SUCCESS)
-         goto fail_shader_vma_heap;
-
-      result = anv_state_pool_init(&device->internal_surface_state_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "internal surface state pool",
-                                      .base_address = device->physical->va.internal_surface_state_pool.addr,
-                                      .start_offset = device->physical->va.scratch_surface_state_pool.size,
-                                      .block_size   = 4096,
-                                      .max_size     = device->physical->va.internal_surface_state_pool.size,
-                                   });
-   } else {
-      result = anv_state_pool_init(&device->internal_surface_state_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "internal surface state pool",
-                                      .base_address = device->physical->va.internal_surface_state_pool.addr,
-                                      .block_size   = 4096,
-                                      .max_size     = device->physical->va.internal_surface_state_pool.size,
-                                   });
-   }
-   if (result != VK_SUCCESS)
-      goto fail_scratch_surface_state_pool;
-
-   if (device->physical->indirect_descriptors) {
-      result = anv_state_pool_init(&device->bindless_surface_state_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "bindless surface state pool",
-                                      .base_address = device->physical->va.bindless_surface_state_pool.addr,
-                                      .block_size   = 4096,
-                                      .max_size     = device->physical->va.bindless_surface_state_pool.size,
-                                   });
-      if (result != VK_SUCCESS)
-         goto fail_internal_surface_state_pool;
-   }
-
-   if (device->info->verx10 >= 125) {
-      /* We're using 3DSTATE_BINDING_TABLE_POOL_ALLOC to give the binding
-       * table its own base address separately from surface state base.
-       */
-      result = anv_state_pool_init(&device->binding_table_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "binding table pool",
-                                      .base_address = device->physical->va.binding_table_pool.addr,
-                                      .block_size   = BINDING_TABLE_POOL_BLOCK_SIZE,
-                                      .max_size     = device->physical->va.binding_table_pool.size,
-                                   });
-   } else {
-      /* The binding table should be in front of the surface states in virtual
-       * address space so that all surface states can be express as relative
-       * offsets from the binding table location.
-       */
-      assert(device->physical->va.binding_table_pool.addr <
-             device->physical->va.internal_surface_state_pool.addr);
-      int64_t bt_pool_offset = (int64_t)device->physical->va.binding_table_pool.addr -
-                               (int64_t)device->physical->va.internal_surface_state_pool.addr;
-      assert(INT32_MIN < bt_pool_offset && bt_pool_offset < 0);
-      result = anv_state_pool_init(&device->binding_table_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "binding table pool",
-                                      .base_address = device->physical->va.internal_surface_state_pool.addr,
-                                      .start_offset = bt_pool_offset,
-                                      .block_size   = BINDING_TABLE_POOL_BLOCK_SIZE,
-                                      .max_size     = device->physical->va.internal_surface_state_pool.size,
-                                   });
-   }
-   if (result != VK_SUCCESS)
-      goto fail_bindless_surface_state_pool;
-
-   if (device->physical->indirect_descriptors) {
-      result = anv_state_pool_init(&device->indirect_push_descriptor_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "indirect push descriptor pool",
-                                      .base_address = device->physical->va.indirect_push_descriptor_pool.addr,
-                                      .block_size   = 4096,
-                                      .max_size     = device->physical->va.indirect_push_descriptor_pool.size,
-                                   });
-      if (result != VK_SUCCESS)
-         goto fail_binding_table_pool;
-   }
-
-   if (device->vk.enabled_extensions.EXT_descriptor_buffer &&
-       device->info->verx10 >= 125) {
-      /* On Gfx12.5+ because of the bindless stages (Mesh, Task, RT), the only
-       * way we can wire push descriptors is through the bindless heap. This
-       * state pool is a 1Gb carve out of the 4Gb HW heap.
-       */
-      result = anv_state_pool_init(&device->push_descriptor_buffer_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "push descriptor buffer state pool",
-                                      .base_address = device->physical->va.push_descriptor_buffer_pool.addr,
-                                      .block_size   = 4096,
-                                      .max_size     = device->physical->va.push_descriptor_buffer_pool.size,
-                                   });
-      if (result != VK_SUCCESS)
-         goto fail_indirect_push_descriptor_pool;
-   }
-
    if (device->info->has_aux_map) {
-      result = anv_state_pool_init(&device->aux_tt_pool, device,
-                                   &(struct anv_state_pool_params) {
-                                      .name         = "aux-tt pool",
-                                      .base_address = device->physical->va.aux_tt_pool.addr,
-                                      .block_size   = 16384,
-                                      .max_size     = device->physical->va.aux_tt_pool.size,
-                                   });
-      if (result != VK_SUCCESS)
-         goto fail_push_descriptor_buffer_pool;
-
       device->aux_map_ctx = intel_aux_map_init(device, &aux_map_allocator,
                                                &physical_device->info);
       if (!device->aux_map_ctx)
@@ -720,7 +1041,7 @@ VkResult anv_CreateDevice(
 
    if (intel_needs_workaround(device->info, 14019708328)) {
       result = anv_device_alloc_bo(device, "dummy_aux", 4096,
-                                   0 /* alloc_flags */,
+                                   ANV_BO_ALLOC_INTERNAL /* alloc_flags */,
                                    0 /* explicit_address */,
                                    &device->dummy_aux_bo);
       ANV_DMR_BO_ALLOC(&device->vk.base, device->dummy_aux_bo, result);
@@ -739,8 +1060,8 @@ VkResult anv_CreateDevice(
     */
    if (device->info->verx10 >= 200) {
       result = anv_device_alloc_bo(device, "mem_fence", 4096,
-                                   ANV_BO_ALLOC_NO_LOCAL_MEM, 0,
-                                   &device->mem_fence_bo);
+                                   ANV_BO_ALLOC_NO_LOCAL_MEM | ANV_BO_ALLOC_INTERNAL,
+                                   0, &device->mem_fence_bo);
       ANV_DMR_BO_ALLOC(&device->vk.base, device->mem_fence_bo, result);
       if (result != VK_SUCCESS)
          goto fail_alloc_device_bo;
@@ -760,6 +1081,10 @@ VkResult anv_CreateDevice(
    memcpy(device->rt_uuid_addr.bo->map + device->rt_uuid_addr.offset,
           physical_device->rt_uuid,
           sizeof(physical_device->rt_uuid));
+
+   /* A null cache line for bounded UBO loads. */
+   wa_addr = anv_address_add_aligned(wa_addr, 64, 64);
+   device->null_cacheline_addr = wa_addr;
 
    /* Make sure the workaround address is the last one in the workaround BO,
     * so that writes never overwrite other bits of data stored in the
@@ -831,7 +1156,7 @@ VkResult anv_CreateDevice(
       n_cps_states *= MAX_VIEWPORTS;
 
       device->cps_states =
-         anv_state_pool_alloc(&device->dynamic_state_pool,
+         anv_state_pool_alloc(anv_device_get_dynamic_state_pool(device),
                               n_cps_states * CPS_STATE_length(device->info) * 4,
                               32);
       if (device->cps_states.map == NULL)
@@ -846,7 +1171,7 @@ VkResult anv_CreateDevice(
        * structures to zero and they have a valid descriptor.
        */
       device->null_surface_state =
-         anv_state_pool_alloc(&device->bindless_surface_state_pool,
+         anv_state_pool_alloc(anv_device_get_bindless_surface_state_pool(device),
                               device->isl_dev.ss.size,
                               device->isl_dev.ss.align);
       isl_null_fill_state(&device->isl_dev, device->null_surface_state.map,
@@ -859,7 +1184,7 @@ VkResult anv_CreateDevice(
        * pool.
        */
       device->null_surface_state =
-         anv_state_pool_alloc(&device->internal_surface_state_pool,
+         anv_state_pool_alloc(anv_device_get_internal_surface_state_pool(device),
                               device->isl_dev.ss.size,
                               device->isl_dev.ss.align);
       isl_null_fill_state(&device->isl_dev, device->null_surface_state.map,
@@ -890,7 +1215,10 @@ VkResult anv_CreateDevice(
          goto fail_trivial_batch_bo_and_scratch_pool;
    }
 
-   struct vk_pipeline_cache_create_info pcc_info = { .weak_ref = true, };
+   struct vk_pipeline_cache_create_info pcc_info = {
+      .weak_ref = true,
+      .skip_disk_cache = ANV_DEBUG(SKIP_DISK_CACHE),
+   };
    device->vk.mem_cache =
       vk_pipeline_cache_create(&device->vk, &pcc_info, NULL);
    if (!device->vk.mem_cache) {
@@ -904,6 +1232,7 @@ VkResult anv_CreateDevice(
     * cache just for BLORP/RT that's forced to always be enabled.
     */
    struct vk_pipeline_cache_create_info internal_pcc_info = {
+      .skip_disk_cache = ANV_DEBUG(SKIP_DISK_CACHE),
       .force_enable = true,
       .weak_ref = false,
    };
@@ -914,11 +1243,7 @@ VkResult anv_CreateDevice(
       goto fail_default_pipeline_cache;
    }
 
-   /* The device (currently is ICL/TGL) does not have float64 support. */
-   if (!device->info->has_64bit_float)
-      anv_load_fp64_shader(device);
-
-   if (INTEL_DEBUG(DEBUG_SHADER_PRINT)) {
+   if (anv_needs_printf_buffer()) {
       result = anv_device_print_init(device);
       if (result != VK_SUCCESS)
          goto fail_internal_cache;
@@ -928,7 +1253,7 @@ VkResult anv_CreateDevice(
       device->vk.enabled_features.robustBufferAccess ||
       device->vk.enabled_features.nullDescriptor;
 
-   device->breakpoint = anv_state_pool_alloc(&device->dynamic_state_pool, 4,
+   device->breakpoint = anv_state_pool_alloc(anv_device_get_dynamic_state_pool(device), 4,
                                              4);
    p_atomic_set(&device->draw_call_count, 0);
    p_atomic_set(&device->dispatch_call_count, 0);
@@ -959,6 +1284,12 @@ VkResult anv_CreateDevice(
       goto fail_trtt;
    }
 
+   result = anv_device_init_shader_dump(device);
+   if (result != VK_SUCCESS) {
+      result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_rt_shaders;
+   }
+
    anv_device_init_blorp(device);
 
    anv_device_init_border_colors(device);
@@ -971,9 +1302,16 @@ VkResult anv_CreateDevice(
 
    anv_device_init_embedded_samplers(device);
 
+   anv_device_init_descriptors_view(device);
+
    BITSET_ONES(device->gfx_dirty_state);
+   /* Only dirtied when the index buffer is changing */
    BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_INDEX_BUFFER);
+   /* Only programmed if streamout is enabled */
    BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_SO_DECL_LIST);
+   /* Only programmed when line stipple is enabled, avoids PIPE_CONTROL */
+   BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_LINE_STIPPLE);
+
    if (device->info->ver < 11)
       BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_VF_SGVS_2);
    if (device->info->ver < 12) {
@@ -1015,6 +1353,9 @@ VkResult anv_CreateDevice(
          if (result != VK_SUCCESS)
             goto fail_queues;
 
+         device->view_queues |=
+            device->queues[device->queue_count].family->queueFlags &
+            (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
          device->queue_count++;
       }
    }
@@ -1029,7 +1370,10 @@ VkResult anv_CreateDevice(
    if (result != VK_SUCCESS)
       goto fail_meta_device;
 
+   device->vk.disable_lto = device->physical->drirc.debug.disable_lto;
+
    simple_mtx_init(&device->accel_struct_build.mutex, mtx_plain);
+   simple_mtx_init(&device->fp64_mutex, mtx_plain);
 
    *pDevice = anv_device_to_handle(device);
 
@@ -1038,14 +1382,20 @@ VkResult anv_CreateDevice(
  fail_meta_device:
    vk_meta_device_finish(&device->vk, &device->meta_device);
  fail_utrace:
+   for (uint32_t i = 0; i < device->queue_count; i++)
+      anv_queue_drain(&device->queues[i]);
    anv_device_utrace_finish(device);
  fail_queues:
    for (uint32_t i = 0; i < device->queue_count; i++)
       anv_queue_finish(&device->queues[i]);
+   anv_device_perf_finish(device);
+   anv_device_finish_descriptors_view(device);
    anv_device_finish_embedded_samplers(device);
    anv_device_finish_blorp(device);
    anv_device_finish_astc_emu(device);
    anv_device_finish_internal_kernels(device);
+   anv_device_finish_shader_dump(device);
+ fail_rt_shaders:
    anv_device_finish_rt_shaders(device);
  fail_trtt:
    anv_device_finish_trtt(device);
@@ -1055,7 +1405,7 @@ VkResult anv_CreateDevice(
                                    device->companion_rcs_cmd_pool, NULL);
    }
  fail_print:
-   if (INTEL_DEBUG(DEBUG_SHADER_PRINT))
+   if (anv_needs_printf_buffer())
       anv_device_print_fini(device);
  fail_internal_cache:
    vk_pipeline_cache_destroy(device->internal_cache, NULL);
@@ -1096,33 +1446,7 @@ VkResult anv_CreateDevice(
       device->aux_map_ctx = NULL;
    }
  fail_aux_tt_pool:
-   if (device->info->has_aux_map)
-      anv_state_pool_finish(&device->aux_tt_pool);
- fail_push_descriptor_buffer_pool:
-   if (device->vk.enabled_extensions.EXT_descriptor_buffer &&
-       device->info->verx10 >= 125)
-      anv_state_pool_finish(&device->push_descriptor_buffer_pool);
- fail_indirect_push_descriptor_pool:
-   if (device->physical->indirect_descriptors)
-      anv_state_pool_finish(&device->indirect_push_descriptor_pool);
- fail_binding_table_pool:
-   anv_state_pool_finish(&device->binding_table_pool);
- fail_bindless_surface_state_pool:
-   if (device->physical->indirect_descriptors)
-      anv_state_pool_finish(&device->bindless_surface_state_pool);
- fail_internal_surface_state_pool:
-   anv_state_pool_finish(&device->internal_surface_state_pool);
- fail_scratch_surface_state_pool:
-   if (device->info->verx10 >= 125)
-      anv_state_pool_finish(&device->scratch_surface_state_pool);
- fail_shader_vma_heap:
-      anv_shader_heap_finish(&device->shader_heap);
- fail_custom_border_color_pool:
-   anv_state_reserved_array_pool_finish(&device->custom_border_colors);
- fail_dynamic_state_pool:
-   anv_state_pool_finish(&device->dynamic_state_pool);
- fail_general_state_pool:
-   anv_state_pool_finish(&device->general_state_pool);
+   anv_state_pools_finish(device);
  fail_batch_bo_pool:
    if (device->vk.enabled_extensions.KHR_acceleration_structure)
       anv_bo_pool_finish(&device->bvh_bo_pool);
@@ -1130,20 +1454,23 @@ VkResult anv_CreateDevice(
    anv_slab_bo_deinit(device);
  fail_cache:
    anv_bo_cache_finish(&device->bo_cache);
+ fail_null_vma_init:
+   anv_device_bind_null_va(device,
+                           &device->physical->va.null_initialized_heap,
+                           ANV_VM_UNBIND);
+ fail_fault_cnd:
+   u_cnd_monotonic_destroy(&device->fault.lost_cnd);
+ fail_fault_mutex:
+   mtx_destroy(&device->fault.mutex);
  fail_mutex:
-   pthread_mutex_destroy(&device->mutex);
- fail_vmas:
-   util_vma_heap_finish(&device->vma_trtt);
-   util_vma_heap_finish(&device->vma_dynamic_visible);
-   util_vma_heap_finish(&device->vma_desc);
-   util_vma_heap_finish(&device->vma_hi);
-   util_vma_heap_finish(&device->vma_lo);
-   pthread_mutex_destroy(&device->vma_mutex);
+   simple_mtx_destroy(&device->mutex);
+   anv_device_finish_vma_heaps(device);
  fail_queues_alloc:
    vk_free(&device->vk.alloc, device->queues);
  fail_context_id:
    anv_device_destroy_context_or_vm(device);
  fail_fd:
+   intel_virtio_unref_fd(device->fd);
    close(device->fd);
  fail_device:
    vk_device_finish(&device->vk);
@@ -1162,6 +1489,9 @@ void anv_DestroyDevice(
    if (!device)
       return;
 
+   if (anv_needs_printf_buffer())
+      vk_check_printf_status(&device->vk, &device->printf);
+
    anv_memory_trace_finish(device);
 
    struct anv_physical_device *pdevice = device->physical;
@@ -1169,11 +1499,10 @@ void anv_DestroyDevice(
    /* Do TRTT batch garbage collection before destroying queues. */
    anv_device_finish_trtt(device);
 
-   if (device->accel_struct_build.radix_sort) {
-      radix_sort_vk_destroy(device->accel_struct_build.radix_sort,
-                            _device, &device->vk.alloc);
-   }
    vk_meta_device_finish(&device->vk, &device->meta_device);
+
+   for (uint32_t i = 0; i < device->queue_count; i++)
+      anv_queue_drain(&device->queues[i]);
 
    anv_device_utrace_finish(device);
 
@@ -1189,13 +1518,19 @@ void anv_DestroyDevice(
 
    anv_device_finish_internal_kernels(device);
 
-   if (INTEL_DEBUG(DEBUG_SHADER_PRINT))
+   anv_device_finish_shader_dump(device);
+
+   anv_device_finish_descriptors_view(device);
+
+   if (anv_needs_printf_buffer())
       anv_device_print_fini(device);
 
    vk_pipeline_cache_destroy(device->internal_cache, NULL);
    vk_pipeline_cache_destroy(device->vk.mem_cache, NULL);
 
    anv_device_finish_embedded_samplers(device);
+
+   anv_device_perf_finish(device);
 
    if (ANV_SUPPORT_RT && device->info->has_ray_tracing) {
       ANV_DMR_BO_FREE(&device->vk.base, device->btd_fifo_bo);
@@ -1207,15 +1542,14 @@ void anv_DestroyDevice(
                                    device->companion_rcs_cmd_pool, NULL);
    }
 
-   anv_state_reserved_array_pool_finish(&device->custom_border_colors);
 #ifdef HAVE_VALGRIND
    /* We only need to free these to prevent valgrind errors.  The backing
     * BO will go away in a couple of lines so we don't actually leak.
     */
-   anv_state_pool_free(&device->dynamic_state_pool, device->border_colors);
-   anv_state_pool_free(&device->dynamic_state_pool, device->slice_hash);
-   anv_state_pool_free(&device->dynamic_state_pool, device->cps_states);
-   anv_state_pool_free(&device->dynamic_state_pool, device->breakpoint);
+   anv_state_pool_free(anv_device_get_dynamic_state_pool(device), device->border_colors);
+   anv_state_pool_free(anv_device_get_dynamic_state_pool(device), device->slice_hash);
+   anv_state_pool_free(anv_device_get_dynamic_state_pool(device), device->cps_states);
+   anv_state_pool_free(anv_device_get_dynamic_state_pool(device), device->breakpoint);
 #endif
 
    for (unsigned i = 0; i < ARRAY_SIZE(device->rt_scratch_bos); i++) {
@@ -1259,23 +1593,8 @@ void anv_DestroyDevice(
    if (device->info->has_aux_map) {
       intel_aux_map_finish(device->aux_map_ctx);
       device->aux_map_ctx = NULL;
-      anv_state_pool_finish(&device->aux_tt_pool);
    }
-   if (device->vk.enabled_extensions.EXT_descriptor_buffer &&
-       device->info->verx10 >= 125)
-      anv_state_pool_finish(&device->push_descriptor_buffer_pool);
-   if (device->physical->indirect_descriptors)
-      anv_state_pool_finish(&device->indirect_push_descriptor_pool);
-   anv_state_pool_finish(&device->binding_table_pool);
-   if (device->info->verx10 >= 125)
-      anv_state_pool_finish(&device->scratch_surface_state_pool);
-   anv_state_pool_finish(&device->internal_surface_state_pool);
-   if (device->physical->indirect_descriptors)
-      anv_state_pool_finish(&device->bindless_surface_state_pool);
-
-   anv_shader_heap_finish(&device->shader_heap);
-   anv_state_pool_finish(&device->dynamic_state_pool);
-   anv_state_pool_finish(&device->general_state_pool);
+   anv_state_pools_finish(device);
 
    if (device->vk.enabled_extensions.KHR_acceleration_structure)
       anv_bo_pool_finish(&device->bvh_bo_pool);
@@ -1284,16 +1603,15 @@ void anv_DestroyDevice(
    anv_slab_bo_deinit(device);
    anv_bo_cache_finish(&device->bo_cache);
 
-   util_vma_heap_finish(&device->vma_trtt);
-   util_vma_heap_finish(&device->vma_dynamic_visible);
-   util_vma_heap_finish(&device->vma_desc);
-   util_vma_heap_finish(&device->vma_hi);
-   util_vma_heap_finish(&device->vma_lo);
-   pthread_mutex_destroy(&device->vma_mutex);
+   anv_device_finish_vma_heaps(device);
 
-   pthread_mutex_destroy(&device->mutex);
+   u_cnd_monotonic_destroy(&device->fault.lost_cnd);
+   mtx_destroy(&device->fault.mutex);
+
+   simple_mtx_destroy(&device->mutex);
 
    simple_mtx_destroy(&device->accel_struct_build.mutex);
+   simple_mtx_destroy(&device->fp64_mutex);
 
    ralloc_free(device->fp64_nir);
 
@@ -1326,21 +1644,6 @@ VkResult anv_EnumerateInstanceLayerProperties(
    return vk_error(NULL, VK_ERROR_LAYER_NOT_PRESENT);
 }
 
-VkResult
-anv_device_wait(struct anv_device *device, struct anv_bo *bo,
-                int64_t timeout)
-{
-   int ret = anv_gem_wait(device, bo->gem_handle, &timeout);
-   if (ret == -1 && errno == ETIME) {
-      return VK_TIMEOUT;
-   } else if (ret == -1) {
-      /* We don't know the real error. */
-      return vk_device_set_lost(&device->vk, "gem wait failed: %m");
-   } else {
-      return VK_SUCCESS;
-   }
-}
-
 static struct util_vma_heap *
 anv_vma_heap_for_flags(struct anv_device *device,
                        enum anv_bo_alloc_flags alloc_flags)
@@ -1357,6 +1660,9 @@ anv_vma_heap_for_flags(struct anv_device *device,
    if (alloc_flags & ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL)
       return &device->vma_dynamic_visible;
 
+   if (alloc_flags & ANV_BO_ALLOC_NULL_INITIALIZED_HEAP)
+      return &device->vma_null_initialized;
+
    return &device->vma_hi;
 }
 
@@ -1367,7 +1673,7 @@ anv_vma_alloc(struct anv_device *device,
               uint64_t client_address,
               struct util_vma_heap **out_vma_heap)
 {
-   pthread_mutex_lock(&device->vma_mutex);
+   simple_mtx_lock(&device->vma_mutex);
 
    uint64_t addr = 0;
    *out_vma_heap = anv_vma_heap_for_flags(device, alloc_flags);
@@ -1375,7 +1681,9 @@ anv_vma_alloc(struct anv_device *device,
    if (alloc_flags & ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS) {
       assert(*out_vma_heap == &device->vma_hi ||
              *out_vma_heap == &device->vma_dynamic_visible ||
-             *out_vma_heap == &device->vma_trtt);
+             *out_vma_heap == &device->vma_trtt ||
+             (device->physical->uses_efficient_64bit &&
+              *out_vma_heap == &device->vma_desc));
 
       if (client_address) {
          if (util_vma_heap_alloc_addr(*out_vma_heap,
@@ -1396,7 +1704,12 @@ anv_vma_alloc(struct anv_device *device,
    addr = util_vma_heap_alloc(*out_vma_heap, size, align);
 
 done:
-   pthread_mutex_unlock(&device->vma_mutex);
+   simple_mtx_unlock(&device->vma_mutex);
+
+   if (addr == 0 && client_address) {
+      mesa_logi("Virtual address allocation failed, consider running with "
+                "anv_enable_alloc_oversubscription=false");
+   }
 
    assert(addr == intel_48b_address(addr));
    return intel_canonical_address(addr);
@@ -1411,15 +1724,16 @@ anv_vma_free(struct anv_device *device,
           vma_heap == &device->vma_hi ||
           vma_heap == &device->vma_desc ||
           vma_heap == &device->vma_dynamic_visible ||
-          vma_heap == &device->vma_trtt);
+          vma_heap == &device->vma_trtt ||
+          vma_heap == &device->vma_null_initialized);
 
    const uint64_t addr_48b = intel_48b_address(address);
 
-   pthread_mutex_lock(&device->vma_mutex);
+   simple_mtx_lock(&device->vma_mutex);
 
    util_vma_heap_free(vma_heap, addr_48b, size);
 
-   pthread_mutex_unlock(&device->vma_mutex);
+   simple_mtx_unlock(&device->vma_mutex);
 }
 
 VkResult anv_AllocateMemory(
@@ -1448,7 +1762,8 @@ VkResult anv_AllocateMemory(
    if (aligned_alloc_size > mem_heap->size)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-   uint64_t mem_heap_used = p_atomic_read(&mem_heap->used);
+   uint64_t mem_heap_used = p_atomic_read(
+      &pdevice->memory.heaps_budget->used[mem_type->heapIndex]);
    if (mem_heap_used + aligned_alloc_size > mem_heap->size)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
@@ -1469,11 +1784,11 @@ VkResult anv_AllocateMemory(
    const struct wsi_memory_allocate_info *wsi_info = NULL;
    uint64_t client_address = 0;
 
-   vk_foreach_struct_const(ext, pAllocateInfo->pNext) {
+   vk_foreach_struct_const(sType, ext, pAllocateInfo->pNext) {
       /* VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA isn't a real enum
        * value, so use cast to avoid compiler warn
        */
-      switch ((uint32_t)ext->sType) {
+      switch ((uint32_t)sType) {
       case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
       case VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID:
       case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
@@ -1483,11 +1798,11 @@ VkResult anv_AllocateMemory(
          break;
 
       case VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR:
-         fd_info = (void *)ext;
+         fd_info = ext;
          break;
 
       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
-         dedicated_info = (void *)ext;
+         dedicated_info = ext;
          break;
 
       case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO: {
@@ -1498,11 +1813,11 @@ VkResult anv_AllocateMemory(
       }
 
       case VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA:
-         wsi_info = (void *)ext;
+         wsi_info = ext;
          break;
 
       default:
-         vk_debug_ignored_stype(ext->sType);
+         vk_debug_ignored_stype(sType);
          break;
       }
    }
@@ -1596,14 +1911,18 @@ VkResult anv_AllocateMemory(
           * consumer side relying on implicit fencing can have a fence to
           * wait for render complete.
           */
-         if (pdevice->instance->external_memory_implicit_sync &&
-             (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+         if (pdevice->drirc.debug.external_memory_implicit_sync &&
+             (image->vk.usage & VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR))
             alloc_flags |= ANV_BO_ALLOC_IMPLICIT_WRITE;
       }
    }
 
-   if (mem_type->dynamic_visible)
-      alloc_flags |= ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL;
+   if (mem_type->dynamic_visible) {
+      alloc_flags |=
+         device->physical->uses_efficient_64bit ?
+         ANV_BO_ALLOC_DESCRIPTOR_POOL :
+         ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL;
+   }
 
    if (mem->vk.ahardware_buffer) {
       result = anv_import_ahb_memory(_device, mem);
@@ -1622,7 +1941,7 @@ VkResult anv_AllocateMemory(
                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
              fd_info->handleType ==
                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
-      if (alloc_flags & ANV_BO_ALLOC_COMPRESSED) {
+      if ((alloc_flags & ANV_BO_ALLOC_COMPRESSED) && image != NULL) {
          /* First, when importing a compressed buffer on Xe2+, we are sure
           * about that the buffer is from a resource created with modifiers
           * supporting compression, even the info of modifier is not available
@@ -1640,7 +1959,6 @@ VkResult anv_AllocateMemory(
           * heap and then PAT entry in the later vm_bind stage.
           */
          assert(device->info->ver >= 20);
-         assert(image);
          if (vk_format_is_color(image->vk.format))
             alloc_flags |= ANV_BO_ALLOC_SCANOUT;
       }
@@ -1664,6 +1982,16 @@ VkResult anv_AllocateMemory(
                             "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT: "
                             "%"PRIu64"B > %"PRIu64"B",
                             aligned_alloc_size, mem->bo->size);
+         anv_device_release_bo(device, mem->bo);
+         goto fail;
+      }
+
+      if ((mem->vk.alloc_flags &
+           VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
+          !(mem->bo->alloc_flags & ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS)) {
+         result = vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "The same BO was imported without BDA and then "
+                            "reimported for capture/replay.");
          anv_device_release_bo(device, mem->bo);
          goto fail;
       }
@@ -1699,6 +2027,16 @@ VkResult anv_AllocateMemory(
                                                   &mem->bo);
       if (result != VK_SUCCESS)
          goto fail;
+
+      if ((mem->vk.alloc_flags &
+           VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
+          !(mem->bo->alloc_flags & ANV_BO_ALLOC_CLIENT_VISIBLE_ADDRESS)) {
+         result = vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "The same BO was imported without BDA and then "
+                            "reimported for capture/replay.");
+         anv_device_release_bo(device, mem->bo);
+         goto fail;
+      }
 
       goto success;
    }
@@ -1737,18 +2075,20 @@ VkResult anv_AllocateMemory(
    }
 
  success:
-   mem_heap_used = p_atomic_add_return(&mem_heap->used, mem->bo->size);
+   mem_heap_used = p_atomic_add_return(
+      &pdevice->memory.heaps_budget->used[mem_type->heapIndex], mem->bo->size);
    if (mem_heap_used > mem_heap->size) {
-      p_atomic_add(&mem_heap->used, -mem->bo->size);
+      p_atomic_add(&pdevice->memory.heaps_budget->used[mem_type->heapIndex],
+                   -mem->bo->size);
       anv_device_release_bo(device, mem->bo);
       result = vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                          "Out of heap memory");
       goto fail;
    }
 
-   pthread_mutex_lock(&device->mutex);
+   simple_mtx_lock(&device->mutex);
    list_addtail(&mem->link, &device->memory_objects);
-   pthread_mutex_unlock(&device->mutex);
+   simple_mtx_unlock(&device->mutex);
 
    ANV_RMV(heap_create, device, mem, false, 0);
    ANV_DMR_BO_ALLOC_IMPORT(&mem->vk.base, mem->bo, result,
@@ -1842,23 +2182,24 @@ void anv_FreeMemory(
 {
    ANV_FROM_HANDLE(anv_device, device, _device);
    ANV_FROM_HANDLE(anv_device_memory, mem, _mem);
+   struct anv_physical_device *pdevice = device->physical;
 
    if (mem == NULL)
       return;
 
-   pthread_mutex_lock(&device->mutex);
+   simple_mtx_lock(&device->mutex);
    list_del(&mem->link);
-   pthread_mutex_unlock(&device->mutex);
+   simple_mtx_unlock(&device->mutex);
 
    if (mem->map) {
-      const VkMemoryUnmapInfoKHR unmap = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR,
+      const VkMemoryUnmapInfo unmap = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO,
          .memory = _mem,
       };
-      anv_UnmapMemory2KHR(_device, &unmap);
+      anv_UnmapMemory2(_device, &unmap);
    }
 
-   p_atomic_add(&device->physical->memory.heaps[mem->type->heapIndex].used,
+   p_atomic_add(&pdevice->memory.heaps_budget->used[mem->type->heapIndex],
                 -mem->bo->size);
 
    ANV_DMR_BO_FREE_IMPORT(&mem->vk.base, mem->bo,
@@ -1871,9 +2212,9 @@ void anv_FreeMemory(
    vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 }
 
-VkResult anv_MapMemory2KHR(
+VkResult anv_MapMemory2(
     VkDevice                                    _device,
-    const VkMemoryMapInfoKHR*                   pMemoryMapInfo,
+    const VkMemoryMapInfo*                      pMemoryMapInfo,
     void**                                      ppData)
 {
    ANV_FROM_HANDLE(anv_device, device, _device);
@@ -1945,9 +2286,9 @@ VkResult anv_MapMemory2KHR(
    return VK_SUCCESS;
 }
 
-VkResult anv_UnmapMemory2KHR(
+VkResult anv_UnmapMemory2(
     VkDevice                                    _device,
-    const VkMemoryUnmapInfoKHR*                 pMemoryUnmapInfo)
+    const VkMemoryUnmapInfo*                    pMemoryUnmapInfo)
 {
    ANV_FROM_HANDLE(anv_device, device, _device);
    ANV_FROM_HANDLE(anv_device_memory, mem, pMemoryUnmapInfo->memory);
@@ -2038,13 +2379,13 @@ void anv_GetDeviceMemoryCommitment(
    *pCommittedMemoryInBytes = 0;
 }
 
-static inline clockid_t
-anv_get_default_cpu_clock_id(void)
+static inline VkTimeDomainKHR
+anv_get_default_cpu_time_domain(void)
 {
 #ifdef CLOCK_MONOTONIC_RAW
-   return CLOCK_MONOTONIC_RAW;
+   return VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR;
 #else
-   return CLOCK_MONOTONIC;
+   return VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
 #endif
 }
 
@@ -2077,6 +2418,18 @@ is_gpu_time_domain(VkTimeDomainKHR domain)
    return domain == VK_TIME_DOMAIN_DEVICE_KHR;
 }
 
+static VkTimeDomainKHR
+get_effective_time_domain(const VkCalibratedTimestampInfoKHR *timestamp)
+{
+   if (timestamp->timeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT) {
+      const VkSwapchainCalibratedTimestampInfoEXT *swap =
+         vk_find_struct_const(timestamp->pNext, SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT);
+      return wsi_common_get_time_domain(swap->swapchain, swap->presentStage, swap->timeDomainId);
+   } else {
+      return timestamp->timeDomain;
+   }
+}
+
 VkResult anv_GetCalibratedTimestampsKHR(
    VkDevice                                     _device,
    uint32_t                                     timestampCount,
@@ -2091,13 +2444,21 @@ VkResult anv_GetCalibratedTimestampsKHR(
    uint64_t begin, end;
    uint64_t max_clock_period = 0;
    const enum intel_kmd_type kmd_type = device->physical->info.kmd_type;
-   const bool has_correlate_timestamp = kmd_type == INTEL_KMD_TYPE_XE;
+   const bool has_correlate_timestamp =
+      kmd_type == INTEL_KMD_TYPE_XE &&
+      unlikely(!device->physical->drirc.debug.disable_xe_engine_cycles);
+   const VkTimeDomainKHR default_cpu_time_domain = anv_get_default_cpu_time_domain();
+   const clockid_t default_cpu_clock_id = vk_time_domain_to_clockid(default_cpu_time_domain);
    clockid_t cpu_clock_id = -1;
+   VkResult result;
 
-   begin = end = vk_clock_gettime(anv_get_default_cpu_clock_id());
+   result = vk_device_get_timestamp(&device->vk, default_cpu_time_domain, &end);
+   if (result != VK_SUCCESS)
+      return vk_error(device, result);
+   begin = end;
 
    for (d = 0, increment = 1; d < timestampCount; d += increment) {
-      const VkTimeDomainKHR current = pTimestampInfos[d].timeDomain;
+      const VkTimeDomainKHR current = get_effective_time_domain(&pTimestampInfos[d]);
       /* If we have a request pattern like this :
        * - domain0 = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR or VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR
        * - domain1 = VK_TIME_DOMAIN_DEVICE_KHR
@@ -2106,7 +2467,7 @@ VkResult anv_GetCalibratedTimestampsKHR(
        * We can combine all of those into a single ioctl for maximum accuracy.
        */
       if (has_correlate_timestamp && (d + 1) < timestampCount) {
-         const VkTimeDomainKHR next = pTimestampInfos[d + 1].timeDomain;
+         const VkTimeDomainKHR next = get_effective_time_domain(&pTimestampInfos[d + 1]);
 
          if ((is_cpu_time_domain(current) && is_gpu_time_domain(next)) ||
              (is_gpu_time_domain(current) && is_cpu_time_domain(next))) {
@@ -2142,17 +2503,17 @@ VkResult anv_GetCalibratedTimestampsKHR(
             /* If we can consume a third element */
             if ((d + 2) < timestampCount &&
                 is_cpu_time_domain(current) &&
-                current == pTimestampInfos[d + 2].timeDomain) {
+                current == get_effective_time_domain(&pTimestampInfos[d + 2])) {
                pTimestamps[d + 2] = cpu_end_timestamp;
                increment++;
             }
 
             /* If we're the first element, we can replace begin */
-            if (d == 0 && cpu_clock_id == anv_get_default_cpu_clock_id())
+            if (d == 0 && cpu_clock_id == default_cpu_clock_id)
                begin = cpu_timestamp;
 
             /* If we're in the same clock domain as begin/end. We can set the end. */
-            if (cpu_clock_id == anv_get_default_cpu_clock_id())
+            if (cpu_clock_id == default_cpu_clock_id)
                end = cpu_end_timestamp;
 
             continue;
@@ -2172,7 +2533,10 @@ VkResult anv_GetCalibratedTimestampsKHR(
          max_clock_period = MAX2(max_clock_period, device_period);
          break;
       case VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR:
-         pTimestamps[d] = vk_clock_gettime(CLOCK_MONOTONIC);
+         result = vk_device_get_timestamp(
+            &device->vk, VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR, &pTimestamps[d]);
+         if (result != VK_SUCCESS)
+            return vk_error(device, result);
          max_clock_period = MAX2(max_clock_period, 1);
          break;
 
@@ -2187,11 +2551,31 @@ VkResult anv_GetCalibratedTimestampsKHR(
       }
    }
 
+   for (uint32_t i = 0; i < timestampCount; i++) {
+      if (pTimestampInfos[i].timeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT) {
+         /* Need to rescale device timestamps to nanoseconds. */
+         const VkSwapchainCalibratedTimestampInfoEXT *swap =
+               vk_find_struct_const(pTimestampInfos[i].pNext, SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT);
+         if (wsi_common_get_time_domain(swap->swapchain, swap->presentStage, swap->timeDomainId) ==
+             VK_TIME_DOMAIN_DEVICE_KHR) {
+            pTimestamps[i] = (uint64_t)((double)pTimestamps[i] * 1e9 / (double)device->physical->info.timestamp_frequency);
+         }
+
+         /* Timestamps in QueueOperationsEnd are always derived from a device timestamp,
+          * even if the reported time domain is not. */
+         if (swap->presentStage == VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT)
+            max_clock_period = MAX2(max_clock_period, device_period);
+      }
+   }
+
    /* If last timestamp was not get with has_correlate_timestamp method or
     * if it was but last cpu clock is not the default one, get time again
     */
-   if (increment == 1 || cpu_clock_id != anv_get_default_cpu_clock_id())
-      end = vk_clock_gettime(anv_get_default_cpu_clock_id());
+   if (increment == 1 || cpu_clock_id != default_cpu_clock_id) {
+      result = vk_device_get_timestamp(&device->vk, default_cpu_time_domain, &end);
+      if (result != VK_SUCCESS)
+         return vk_error(device, result);
+   }
 
    *pMaxDeviation = vk_time_max_deviation(begin, end, max_clock_period);
 
@@ -2233,4 +2617,17 @@ anv_device_get_pat_entry(struct anv_device *device,
       return &device->info->pat.writeback_incoherent;
    else
       return &device->info->pat.writecombining;
+}
+
+struct intel_pagefault_buffer *
+anv_device_alloc_get_vm_faults(struct anv_device *device)
+{
+   if (!device->physical->can_get_vm_faults)
+      return NULL;
+   switch (device->info->kmd_type) {
+   case INTEL_KMD_TYPE_XE:
+      return anv_xe_device_alloc_get_vm_faults(device);
+   default:
+      return NULL;
+   }
 }

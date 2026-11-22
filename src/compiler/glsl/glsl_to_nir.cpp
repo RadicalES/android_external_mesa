@@ -189,6 +189,8 @@ glsl_to_nir(struct gl_shader *gl_shader,
    ralloc_free(gl_shader->ir);
    gl_shader->ir = NULL;
 
+   nir_lower_continue_constructs(shader);
+
    nir_validate_shader(shader, "after glsl to nir, before function inline");
    if (should_print_nir(shader)) {
       printf("glsl_to_nir\n");
@@ -288,6 +290,7 @@ nir_visitor::constant_copy(ir_constant *ir, void *mem_ctx)
       break;
 
    case GLSL_TYPE_INT:
+   case GLSL_TYPE_YUV_CSC_STANDARD_EXT:
       /* Only float base types can be matrices. */
       assert(cols == 1);
 
@@ -473,6 +476,7 @@ nir_visitor::visit(ir_variable *ir)
    var->data.implicit_sized_array = ir->data.implicit_sized_array;
    var->data.from_ssbo_unsized_array = ir->data.from_ssbo_unsized_array;
    var->data.per_primitive = ir->data.per_primitive;
+   var->data.yuv = ir->data.yuv;
 
    switch(ir->data.mode) {
    case ir_var_auto:
@@ -559,8 +563,14 @@ nir_visitor::visit(ir_variable *ir)
       mem_access |= ACCESS_NON_READABLE;
    if (ir->data.memory_coherent)
       mem_access |= ACCESS_COHERENT;
+   /* From the GLSL spec, section 4.10 (Memory Qualifiers):
+    *
+    *    "Since the external source reading or writing a volatile variable
+    *    may be another shader invocation, variables declared as volatile are
+    *    automatically treated as coherent."
+    */
    if (ir->data.memory_volatile)
-      mem_access |= ACCESS_VOLATILE;
+      mem_access |= ACCESS_VOLATILE | ACCESS_COHERENT;
    if (ir->data.memory_restrict)
       mem_access |= ACCESS_RESTRICT;
 
@@ -583,7 +593,7 @@ nir_visitor::visit(ir_variable *ir)
             if (field->memory_coherent)
                mem_access |= ACCESS_COHERENT;
             if (field->memory_volatile)
-               mem_access |= ACCESS_VOLATILE;
+               mem_access |= ACCESS_VOLATILE | ACCESS_COHERENT;
             if (field->memory_restrict)
                mem_access |= ACCESS_RESTRICT;
 
@@ -787,9 +797,13 @@ nir_visitor::visit(ir_function_signature *ir)
 void
 nir_visitor::visit(ir_loop *ir)
 {
-   nir_push_loop(&b);
+   nir_loop *loop = nir_push_loop(&b);
+   loop->do_while = ir->do_while;
+   nir_loop_add_continue_construct(loop);
    visit_exec_list(&ir->body_instructions, this);
-   nir_pop_loop(&b, NULL);
+   nir_push_continue(&b, loop);
+   visit_exec_list(&ir->continue_instructions, this);
+   nir_pop_loop(&b, loop);
 }
 
 void
@@ -924,7 +938,7 @@ deref_get_qualifier(nir_deref_instr *deref)
          if (field->memory_coherent)
             qualifiers |= ACCESS_COHERENT;
          if (field->memory_volatile)
-            qualifiers |= ACCESS_VOLATILE;
+            qualifiers |= ACCESS_VOLATILE | ACCESS_COHERENT;
          if (field->memory_restrict)
             qualifiers |= ACCESS_RESTRICT;
       }
@@ -1365,6 +1379,7 @@ nir_visitor::visit(ir_call *ir)
 
          /* Atomic result */
          assert(ir->return_deref);
+         instr->num_components = 1;
          if (glsl_type_is_integer_64(ir->return_deref->type)) {
             nir_def_init(&instr->instr, &instr->def,
                          ir->return_deref->type->vector_elements, 64);
@@ -1432,6 +1447,7 @@ nir_visitor::visit(ir_call *ir)
          if (op == nir_intrinsic_image_deref_atomic ||
              op == nir_intrinsic_image_deref_atomic_swap) {
             nir_intrinsic_set_atomic_op(instr, atomic_op);
+            instr->num_components = 1;
          }
 
          instr->src[0] = nir_src_for_ssa(&deref->def);
@@ -1888,9 +1904,10 @@ nir_visitor::visit(ir_assignment *ir)
    unsigned num_components = ir->lhs->type->vector_elements;
    unsigned write_mask = ir->write_mask;
 
-   b.fp_math_ctrl = ir->lhs->variable_referenced()->data.invariant ||
-                    ir->lhs->variable_referenced()->data.precise ?
-                       nir_fp_exact : nir_fp_fast_math;
+   bool exact = ir->lhs->variable_referenced()->data.invariant ||
+                  ir->lhs->variable_referenced()->data.precise;
+   b.fp_math_ctrl = exact ? nir_fp_exact | nir_fp_preserve_nan | nir_fp_preserve_inf
+                          : nir_fp_fast_math;
 
    if ((ir->rhs->as_dereference() || ir->rhs->as_constant()) &&
        (write_mask == BITFIELD_MASK(num_components) || write_mask == 0)) {
@@ -2133,6 +2150,7 @@ nir_visitor::visit(ir_expression *ir)
       types[i] = ir->operands[i]->type->base_type;
 
    glsl_base_type out_type = ir->type->base_type;
+   unsigned old_fp_math_ctrl = b.fp_math_ctrl;
 
    switch (ir->operation) {
    case ir_unop_bit_not: result = nir_inot(&b, srcs[0]); break;
@@ -2140,10 +2158,12 @@ nir_visitor::visit(ir_expression *ir)
       result = nir_inot(&b, srcs[0]);
       break;
    case ir_unop_neg:
+      b.fp_math_ctrl |= nir_fp_preserve_inf;
       result = type_is_float(types[0]) ? nir_fneg(&b, srcs[0])
                                        : nir_ineg(&b, srcs[0]);
       break;
    case ir_unop_abs:
+      b.fp_math_ctrl |= nir_fp_preserve_inf;
       result = type_is_float(types[0]) ? nir_fabs(&b, srcs[0])
                                        : nir_iabs(&b, srcs[0]);
       break;
@@ -2152,6 +2172,7 @@ nir_visitor::visit(ir_expression *ir)
       break;
    case ir_unop_saturate:
       assert(type_is_float(types[0]));
+      b.fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
       result = nir_fsat(&b, srcs[0]);
       break;
    case ir_unop_sign:
@@ -2265,6 +2286,10 @@ nir_visitor::visit(ir_expression *ir)
    case ir_unop_round_even: result = nir_fround_even(&b, srcs[0]); break;
    case ir_unop_sin:   result = nir_fsin(&b, srcs[0]); break;
    case ir_unop_cos:   result = nir_fcos(&b, srcs[0]); break;
+   case ir_unop_tanh:
+      result = b.shader->options->has_tanh ? nir_ftanh(&b, srcs[0]) :
+                                             nir_tanh_emulated(&b, srcs[0]);
+      break;
    case ir_unop_dFdx:        result = nir_ddx(&b, srcs[0]); break;
    case ir_unop_dFdy:        result = nir_ddy(&b, srcs[0]); break;
    case ir_unop_dFdx_fine:   result = nir_ddx_fine(&b, srcs[0]); break;
@@ -2348,6 +2373,12 @@ nir_visitor::visit(ir_expression *ir)
       return;
    }
 
+   case ir_unop_asin:
+      result = nir_asin(&b, srcs[0]);
+      break;
+   case ir_unop_acos:
+      result = nir_acos(&b, srcs[0]);
+      break;
    case ir_unop_atan:
       result = nir_atan(&b, srcs[0]);
       break;
@@ -2414,20 +2445,24 @@ nir_visitor::visit(ir_expression *ir)
                                        : nir_umod(&b, srcs[0], srcs[1]);
       break;
    case ir_binop_min:
-      if (type_is_float(out_type))
+      if (type_is_float(out_type)) {
+         b.fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
          result = nir_fmin(&b, srcs[0], srcs[1]);
-      else if (type_is_signed(out_type))
+      } else if (type_is_signed(out_type)) {
          result = nir_imin(&b, srcs[0], srcs[1]);
-      else
+      } else {
          result = nir_umin(&b, srcs[0], srcs[1]);
+      }
       break;
    case ir_binop_max:
-      if (type_is_float(out_type))
+      if (type_is_float(out_type)) {
+         b.fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
          result = nir_fmax(&b, srcs[0], srcs[1]);
-      else if (type_is_signed(out_type))
+      } else if (type_is_signed(out_type)) {
          result = nir_imax(&b, srcs[0], srcs[1]);
-      else
+      } else {
          result = nir_umax(&b, srcs[0], srcs[1]);
+      }
       break;
    case ir_binop_pow: result = nir_fpow(&b, srcs[0], srcs[1]); break;
    case ir_binop_bit_and: result = nir_iand(&b, srcs[0], srcs[1]); break;
@@ -2454,6 +2489,7 @@ nir_visitor::visit(ir_expression *ir)
    case ir_binop_carry:  result = nir_uadd_carry(&b, srcs[0], srcs[1]);  break;
    case ir_binop_borrow: result = nir_usub_borrow(&b, srcs[0], srcs[1]); break;
    case ir_binop_less:
+      b.fp_math_ctrl |= nir_fp_preserve_inf;
       if (type_is_float(types[0]))
          result = nir_flt(&b, srcs[0], srcs[1]);
       else if (type_is_signed(types[0]))
@@ -2462,6 +2498,7 @@ nir_visitor::visit(ir_expression *ir)
          result = nir_ult(&b, srcs[0], srcs[1]);
       break;
    case ir_binop_gequal:
+      b.fp_math_ctrl |= nir_fp_preserve_inf;
       if (type_is_float(types[0]))
          result = nir_fge(&b, srcs[0], srcs[1]);
       else if (type_is_signed(types[0]))
@@ -2470,19 +2507,24 @@ nir_visitor::visit(ir_expression *ir)
          result = nir_uge(&b, srcs[0], srcs[1]);
       break;
    case ir_binop_equal:
-      if (type_is_float(types[0]))
+      if (type_is_float(types[0])) {
+         b.fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
          result = nir_feq(&b, srcs[0], srcs[1]);
-      else
+      } else {
          result = nir_ieq(&b, srcs[0], srcs[1]);
+      }
       break;
    case ir_binop_nequal:
-      if (type_is_float(types[0]))
+      if (type_is_float(types[0])) {
+         b.fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
          result = nir_fneu(&b, srcs[0], srcs[1]);
-      else
+      } else {
          result = nir_ine(&b, srcs[0], srcs[1]);
+      }
       break;
    case ir_binop_all_equal:
       if (type_is_float(types[0])) {
+         b.fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
          switch (ir->operands[0]->type->vector_elements) {
             case 1: result = nir_feq(&b, srcs[0], srcs[1]); break;
             case 2: result = nir_ball_fequal2(&b, srcs[0], srcs[1]); break;
@@ -2504,6 +2546,7 @@ nir_visitor::visit(ir_expression *ir)
       break;
    case ir_binop_any_nequal:
       if (type_is_float(types[0])) {
+         b.fp_math_ctrl |= nir_fp_preserve_nan | nir_fp_preserve_inf;
          switch (ir->operands[0]->type->vector_elements) {
             case 1: result = nir_fneu(&b, srcs[0], srcs[1]); break;
             case 2: result = nir_bany_fnequal2(&b, srcs[0], srcs[1]); break;
@@ -2540,7 +2583,7 @@ nir_visitor::visit(ir_expression *ir)
 
    case ir_binop_ldexp: result = nir_ldexp(&b, srcs[0], srcs[1]); break;
    case ir_triop_fma:
-      result = nir_ffma(&b, srcs[0], srcs[1], srcs[2]);
+      result = nir_ffma_weak(&b, srcs[0], srcs[1], srcs[2]);
       break;
    case ir_triop_lrp:
       result = nir_flrp(&b, srcs[0], srcs[1], srcs[2]);
@@ -2579,6 +2622,8 @@ nir_visitor::visit(ir_expression *ir)
    default:
       UNREACHABLE("not reached");
    }
+
+   b.fp_math_ctrl = old_fp_math_ctrl;
 
    /* The bit-size of the NIR SSA value must match the bit-size of the
     * original GLSL IR expression.

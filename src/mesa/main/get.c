@@ -558,7 +558,6 @@ EXTRA_EXT(ARB_seamless_cube_map);
 EXTRA_EXT(ARB_sync);
 EXTRA_EXT(ARB_vertex_shader);
 EXTRA_EXT(EXT_transform_feedback);
-EXTRA_EXT(ARB_transform_feedback3);
 EXTRA_EXT(ARB_vertex_program);
 EXTRA_EXT2(ARB_vertex_program, ARB_fragment_program);
 EXTRA_EXT(ARB_color_buffer_float);
@@ -651,6 +650,12 @@ static const int extra_version_32_OES_geometry_shader[] = {
 static const int extra_gl40_ARB_sample_shading[] = {
    EXTRA_VERSION_40,
    EXT(ARB_sample_shading),
+   EXTRA_END
+};
+
+static const int extra_gl40_ARB_transform_feedback3[] = {
+   EXTRA_VERSION_40,
+   EXT(ARB_transform_feedback3),
    EXTRA_END
 };
 
@@ -1114,10 +1119,10 @@ find_custom_value(struct gl_context *ctx, const struct value_desc *d, union valu
                         ctx->TransformFeedback.CurrentBuffer->Name : 0;
       break;
    case GL_TRANSFORM_FEEDBACK_BUFFER_PAUSED:
-      v->value_int = ctx->TransformFeedback.CurrentObject->Paused;
+      v->value_bool = ctx->TransformFeedback.CurrentObject->Paused;
       break;
    case GL_TRANSFORM_FEEDBACK_BUFFER_ACTIVE:
-      v->value_int = ctx->TransformFeedback.CurrentObject->Active;
+      v->value_bool = ctx->TransformFeedback.CurrentObject->Active;
       break;
    case GL_TRANSFORM_FEEDBACK_BINDING:
       v->value_int = ctx->TransformFeedback.CurrentObject->Name;
@@ -1196,8 +1201,7 @@ find_custom_value(struct gl_context *ctx, const struct value_desc *d, union valu
       break;
    case GL_TEXTURE_BUFFER_DATA_STORE_BINDING_ARB:
       {
-         struct gl_buffer_object *buf =
-            ctx->Texture.Unit[ctx->Texture.CurrentUnit]
+         buf = ctx->Texture.Unit[ctx->Texture.CurrentUnit]
             .CurrentTex[TEXTURE_BUFFER_INDEX]->BufferObject;
          v->value_int = buf ? buf->Name : 0;
       }
@@ -1234,6 +1238,8 @@ find_custom_value(struct gl_context *ctx, const struct value_desc *d, union valu
    /* GL_KHR_DEBUG */
    case GL_DEBUG_OUTPUT:
    case GL_DEBUG_OUTPUT_SYNCHRONOUS:
+      v->value_bool = _mesa_get_debug_state_int(ctx, d->pname);
+      break;
    case GL_DEBUG_LOGGED_MESSAGES:
    case GL_DEBUG_NEXT_LOGGED_MESSAGE_LENGTH:
    case GL_DEBUG_GROUP_STACK_DEPTH:
@@ -1289,7 +1295,7 @@ find_custom_value(struct gl_context *ctx, const struct value_desc *d, union valu
    case GL_GPU_MEMORY_INFO_EVICTION_COUNT_NVX:
    case GL_GPU_MEMORY_INFO_EVICTED_MEMORY_NVX:
       {
-         struct pipe_memory_info info;
+         struct pipe_memory_info info = {0};
          struct pipe_screen *screen = ctx->pipe->screen;
 
          assert(screen->query_memory_info);

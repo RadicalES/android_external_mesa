@@ -1,7 +1,7 @@
 /*
 ************************************************************************************************************************
 *
-*  Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.
+*  Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
 *  SPDX-License-Identifier: MIT
 *
 ***********************************************************************************************************************/
@@ -300,6 +300,10 @@ public:
         delete this;
     }
 
+    ADDR_E_RETURNCODE GetFormatProperties(
+        const ADDR_FORMAT_PROPERTIES_IN&  in,
+        ADDR_FORMAT_PROPERTIES_OUT*       pOut) const;
+
     static Lib* GetLib(ADDR_HANDLE hLib);
     
     /// Returns which version of addrlib functions should be used.
@@ -329,10 +333,16 @@ public:
 
     ADDR_E_RETURNCODE GetMaxAlignments(ADDR_GET_MAX_ALIGNMENTS_OUTPUT* pOut) const;
 
+    const ADDR_MAX_IMAGE_DIMS* GetMaxDims() const;
+
     ADDR_E_RETURNCODE GetMaxMetaAlignments(ADDR_GET_MAX_ALIGNMENTS_OUTPUT* pOut) const;
 
     UINT_32 GetBpe(AddrFormat format) const;
 
+    void GetSwizzleModePreferenceRatio(
+        const ADDR2_GET_PREFERRED_SURF_SETTING_INPUT* pIn,
+        UINT_32*                                      pOutRatioLo,
+        UINT_32*                                      pOutRatioHi) const;
 
     static UINT_32 ComputeOffsetFromSwizzlePattern(
         const UINT_64* pPattern,
@@ -468,6 +478,8 @@ protected:
 
     UINT_32     m_maxBaseAlign;         ///< Max base alignment for data surface
     UINT_32     m_maxMetaBaseAlign;     ///< Max base alignment for metadata
+
+    ADDR_MAX_IMAGE_DIMS  m_maxDims;
 
 private:
     ElemLib*    m_pElemLib;             ///< Element Lib pointer

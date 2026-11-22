@@ -8,6 +8,9 @@ use crate::core::context::*;
 use crate::core::device::*;
 use crate::core::program::*;
 
+use mesa_rust::compiler::clc::spirv::CLCSpecConstantType;
+use mesa_rust_gen::clc_spec_constant_type;
+use mesa_rust_gen::clc_spirv_const_value;
 use mesa_rust_util::string::*;
 use rusticl_opencl_gen::*;
 use rusticl_proc_macros::cl_entrypoint;
@@ -70,7 +73,7 @@ unsafe impl CLInfo<cl_program_info> for cl_program {
                 // The spec _requires_ that we don't touch the buffer here.
                 _ => v.write_len_only::<&[u8]>(0),
             },
-            CL_PROGRAM_KERNEL_NAMES => v.write::<&str>(&prog.build_info().kernels().join(";")),
+            CL_PROGRAM_KERNEL_NAMES => v.write::<&CStr>(&prog.build_info().kernels().join(c";")),
             CL_PROGRAM_NUM_DEVICES => v.write::<cl_uint>(prog.devs.len() as cl_uint),
             CL_PROGRAM_NUM_KERNELS => v.write::<usize>(prog.build_info().kernels().len()),
             CL_PROGRAM_REFERENCE_COUNT => v.write::<cl_uint>(Program::refcnt(*self)?),
@@ -100,8 +103,8 @@ unsafe impl CLInfoObj<cl_program_build_info, cl_device_id> for cl_program {
         match q {
             CL_PROGRAM_BINARY_TYPE => v.write::<cl_program_binary_type>(prog.bin_type(dev)),
             CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE => v.write::<usize>(0),
-            CL_PROGRAM_BUILD_LOG => v.write::<&str>(&prog.log(dev)),
-            CL_PROGRAM_BUILD_OPTIONS => v.write::<&str>(&prog.options(dev)),
+            CL_PROGRAM_BUILD_LOG => v.write::<&CStr>(prog.build_info().log(dev)),
+            CL_PROGRAM_BUILD_OPTIONS => v.write::<&CStr>(prog.build_info().options(dev)),
             CL_PROGRAM_BUILD_STATUS => v.write::<cl_build_status>(prog.status(dev)),
             // CL_INVALID_VALUE if param_name is not one of the supported values
             _ => Err(CL_INVALID_VALUE),
@@ -331,11 +334,12 @@ fn build_program(
         return Err(CL_INVALID_OPERATION);
     }
 
-    let options = c_string_to_string(options);
+    // SAFETY: options is a valid C String or NULL.
+    let options = unsafe { CStr::from_ptr_or_empty(&options) };
+    let options = CompileOptions::new(options, CL_INVALID_BUILD_OPTIONS)?;
     program.build(devices, options, callback)
 
     //• CL_INVALID_BINARY if program is created with clCreateProgramWithBinary and devices listed in device_list do not have a valid program binary loaded.
-    //• CL_INVALID_BUILD_OPTIONS if the build options specified by options are invalid.
     //• CL_INVALID_OPERATION if program was not created with clCreateProgramWithSource, clCreateProgramWithIL or clCreateProgramWithBinary.
 }
 
@@ -384,6 +388,12 @@ fn compile_program(
                 return Err(CL_INVALID_OPERATION);
             }
 
+            // CL_INVALID_CONTEXT if the context associated with program and programs in
+            // input_headers are not the same.
+            if header.context != program.context {
+                return Err(CL_INVALID_CONTEXT);
+            }
+
             headers.push(HeaderProgram {
                 // SAFETY: The OpenCL spec requires that there be a
                 // one-to-one correspondence between input_headers and
@@ -413,10 +423,10 @@ fn compile_program(
         return Err(CL_INVALID_OPERATION);
     }
 
-    let options = c_string_to_string(options);
+    // SAFETY: options is a valid C String or NULL.
+    let options = unsafe { CStr::from_ptr_or_empty(&options) };
+    let options = CompileOptions::new(options, CL_INVALID_COMPILER_OPTIONS)?;
     program.compile(devices, options, headers, callback)
-
-    // • CL_INVALID_COMPILER_OPTIONS if the compiler options specified by options are invalid.
 }
 
 pub fn link_program(
@@ -448,6 +458,15 @@ pub fn link_program(
         return Err(CL_INVALID_DEVICE);
     }
 
+    // CL_INVALID_CONTEXT if the context associated with programs in input_programs is not the same
+    // as context.
+    if input_programs
+        .iter()
+        .any(|program| program.context != context)
+    {
+        return Err(CL_INVALID_CONTEXT);
+    }
+
     // CL_INVALID_OPERATION if the compilation or build of a program executable for any of the
     // devices listed in device_list by a previous call to clCompileProgram or clBuildProgram for
     // program has not completed.
@@ -458,18 +477,32 @@ pub fn link_program(
         return Err(CL_INVALID_OPERATION);
     }
 
-    let (res, code) = Program::link(
-        context,
-        devices,
-        input_programs,
-        c_string_to_string(options),
-        callback,
-    )?;
+    // CL_INVALID_OPERATION if the rules for devices containing compiled binaries
+    // or libraries as described in input_programs argument above are not followed.
+    // For each device, either ALL or NONE of the input programs must contain a
+    // compiled binary or library. Mixed cases are invalid.
+    for device in &devices {
+        let mut has_binary = input_programs.iter().map(|program| {
+            matches!(
+                program.bin_type(device),
+                CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT | CL_PROGRAM_BINARY_TYPE_LIBRARY
+            )
+        });
+        let all_equal = match has_binary.next() {
+            Some(maybe_binary) => has_binary.all(|v| maybe_binary == v),
+            None => true,
+        };
+        if !all_equal {
+            return Err(CL_INVALID_OPERATION);
+        }
+    }
+
+    // SAFETY: options is a valid C String or NULL.
+    let options = unsafe { CStr::from_ptr_or_empty(&options) };
+
+    let (res, code) = Program::link(context, devices, input_programs, options, callback)?;
 
     Ok((res.into_cl(), code))
-
-    //• CL_INVALID_LINKER_OPTIONS if the linker options specified by options are invalid.
-    //• CL_INVALID_OPERATION if the rules for devices containing compiled binaries or libraries as described in input_programs argument above are not followed.
 }
 
 #[cl_entrypoint(clSetProgramSpecializationConstant)]
@@ -488,7 +521,12 @@ fn set_program_specialization_constant(
         return Err(CL_INVALID_PROGRAM);
     }
 
-    if spec_size != program.get_spec_constant_size(spec_id).into() {
+    // CL_INVALID_SPEC_ID if spec_id is not a valid specialization constant identifier.
+    let actual_spec_size = program
+        .get_spec_constant_size(spec_id)
+        .ok_or(CL_INVALID_SPEC_ID)?;
+
+    if spec_size != actual_spec_size.size().into() {
         // CL_INVALID_VALUE if spec_size does not match the size of the specialization constant in
         // the module,
         return Err(CL_INVALID_VALUE);
@@ -499,10 +537,49 @@ fn set_program_specialization_constant(
         return Err(CL_INVALID_VALUE);
     }
 
+    // SAFETY: The application promises that this is valid data over spec_size.
+    let spec_value: &[u8] = unsafe { slice::from_raw_parts(spec_value.cast(), spec_size) };
+
+    let val = match actual_spec_size {
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_BOOL => clc_spirv_const_value {
+            b: spec_value[0] != 0,
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_INT8 => clc_spirv_const_value {
+            i8_: i8::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_INT16 => clc_spirv_const_value {
+            i16_: i16::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_INT32 => clc_spirv_const_value {
+            i32_: i32::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_INT64 => clc_spirv_const_value {
+            i64_: i64::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_UINT8 => clc_spirv_const_value {
+            u8_: u8::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_HALF
+        | clc_spec_constant_type::CLC_SPEC_CONSTANT_UINT16 => clc_spirv_const_value {
+            u16_: u16::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_UINT32 => clc_spirv_const_value {
+            u32_: u32::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_UINT64 => clc_spirv_const_value {
+            u64_: u64::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_FLOAT => clc_spirv_const_value {
+            f32_: f32::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_DOUBLE => clc_spirv_const_value {
+            f64_: f64::from_ne_bytes(spec_value.try_into().unwrap()),
+        },
+        clc_spec_constant_type::CLC_SPEC_CONSTANT_UNKNOWN => return Err(CL_INVALID_VALUE),
+    };
+
     // SAFETY: according to API spec
-    program.set_spec_constant(spec_id, unsafe {
-        slice::from_raw_parts(spec_value.cast(), spec_size)
-    });
+    program.set_spec_constant(spec_id, val);
 
     Ok(())
 }

@@ -682,7 +682,7 @@ read_uniform_remap_list(struct blob_reader *metadata,
 
       unsigned start = blob_read_uint32(metadata);
       unsigned end = blob_read_uint32(metadata);
-      util_range_insert_remap(start, end, range_remap, uniform);
+      util_range_insert_remap(start, end, range_remap, uniform, false);
    }
 
    util_range_switch_to_sorted_array(range_remap);
@@ -1188,6 +1188,7 @@ write_shader_metadata(struct blob *metadata, gl_linked_shader *shader)
                     sizeof(glprog->sh.SamplerTargets));
    blob_write_uint32(metadata, glprog->ShadowSamplers);
    blob_write_uint32(metadata, glprog->ExternalSamplersUsed);
+   blob_write_uint32(metadata, glprog->Y2YSamplersUsed);
    blob_write_uint32(metadata, glprog->sh.ShaderStorageBlocksWriteAccess);
 
    blob_write_bytes(metadata, glprog->sh.image_access,
@@ -1240,6 +1241,7 @@ read_shader_metadata(struct blob_reader *metadata,
                    sizeof(glprog->sh.SamplerTargets));
    glprog->ShadowSamplers = blob_read_uint32(metadata);
    glprog->ExternalSamplersUsed = blob_read_uint32(metadata);
+   glprog->Y2YSamplersUsed = blob_read_uint32(metadata);
    glprog->sh.ShaderStorageBlocksWriteAccess = blob_read_uint32(metadata);
 
    blob_copy_bytes(metadata, (uint8_t *) glprog->sh.image_access,
@@ -1332,7 +1334,7 @@ extern "C" void
 serialize_glsl_program(struct blob *blob, struct gl_context *ctx,
                        struct gl_shader_program *prog)
 {
-   blob_write_bytes(blob, prog->data->sha1, sizeof(prog->data->sha1));
+   blob_write_bytes(blob, prog->data->blake3, sizeof(prog->data->blake3));
 
    write_uniforms(blob, prog);
 
@@ -1391,7 +1393,7 @@ deserialize_glsl_program(struct blob_reader *blob, struct gl_context *ctx,
 
    assert(prog->data->UniformStorage == NULL);
 
-   blob_copy_bytes(blob, prog->data->sha1, sizeof(prog->data->sha1));
+   blob_copy_bytes(blob, prog->data->blake3, sizeof(prog->data->blake3));
 
    read_uniforms(blob, prog);
 

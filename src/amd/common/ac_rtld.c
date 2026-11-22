@@ -9,8 +9,8 @@
 #include "ac_binary.h"
 #include "ac_gpu_info.h"
 #include "util/compiler.h"
-#include "util/u_dynarray.h"
 #include "util/u_math.h"
+#include "sid.h"
 
 #include <gelf.h>
 #include <libelf.h>
@@ -105,7 +105,7 @@ bool ac_rtld_open(struct ac_rtld_binary *binary, struct ac_rtld_open_info i)
    memset(binary, 0, sizeof(*binary));
    memcpy(&binary->options, &i.options, sizeof(binary->options));
    binary->wave_size = i.wave_size;
-   binary->gfx_level = i.info->gfx_level;
+   binary->gfx_level = i.gfx_level;
    binary->num_parts = i.num_parts;
    binary->parts = calloc(sizeof(*binary->parts), i.num_parts);
    if (!binary->parts)
@@ -277,7 +277,8 @@ bool ac_rtld_get_section_by_name(struct ac_rtld_binary *binary, const char *name
    return get_section_by_name(&binary->parts[0], name, data, nbytes);
 }
 
-bool ac_rtld_read_config(const struct radeon_info *info, struct ac_rtld_binary *binary,
+bool ac_rtld_read_config(const struct ac_compiler_info *compiler_info,
+                         struct ac_rtld_binary *binary,
                          struct ac_shader_config *config)
 {
    for (unsigned i = 0; i < binary->num_parts; ++i) {
@@ -290,7 +291,20 @@ bool ac_rtld_read_config(const struct radeon_info *info, struct ac_rtld_binary *
 
       /* TODO: be precise about scratch use? */
       struct ac_shader_config c = {0};
-      ac_parse_shader_binary_config(config_data, config_nbytes, binary->wave_size, info, &c);
+      ac_parse_llvm_binary_config(config_data, config_nbytes, binary->wave_size, compiler_info, &c);
+
+      if (!binary->options.exact_float_mode) {
+         /* Enable 64-bit and 16-bit denormals, because there is no performance
+          * cost.
+          *
+          * Don't enable denormals for 32-bit floats, because:
+          * - denormals disable output modifiers
+          * - denormals break v_mad_f32
+          * - GFX6 & GFX7 would be very slow
+          */
+         c.float_mode &= ~V_00B028_FP_32_DENORMS;
+         c.float_mode |= V_00B028_FP_16_64_DENORMS;
+      }
 
       config->num_sgprs = MAX2(config->num_sgprs, c.num_sgprs);
       config->num_vgprs = MAX2(config->num_vgprs, c.num_vgprs);
@@ -307,6 +321,10 @@ bool ac_rtld_read_config(const struct radeon_info *info, struct ac_rtld_binary *
       assert(config->spi_ps_input_ena == 0 && config->spi_ps_input_addr == 0);
       config->spi_ps_input_ena = c.spi_ps_input_ena;
       config->spi_ps_input_addr = c.spi_ps_input_addr;
+
+      config->mem_ordered |= c.mem_ordered;
+
+      config->lds_size = MAX2(config->lds_size, c.lds_size);
 
       /* TODO: Should we combine these somehow? It's currently only
        * used for radeonsi's compute, where multiple parts aren't used. */

@@ -10,7 +10,12 @@
 #ifndef TU_FORMATS_H
 #define TU_FORMATS_H
 
-#include "tu_common.h"
+#include <stdbool.h>
+
+#include "util/format/u_format.h"
+#include "vulkan/vulkan_core.h"
+
+#include "common/fd6_hw.h"
 
 struct tu_native_format
 {
@@ -26,5 +31,8 @@ struct tu_native_format tu6_format_texture(enum pipe_format format, enum a6xx_ti
 
 bool tu6_mutable_format_list_ubwc_compatible(const struct fd_dev_info *info,
                                              const VkImageFormatListCreateInfo *fmt_list);
+
+bool tu_format_linear_filtering_supported(struct tu_physical_device *physical_device,
+                                          VkFormat vk_format);
 
 #endif /* TU_FORMATS_H */

@@ -22,6 +22,8 @@ enum tu_gmem_layout
    TU_GMEM_LAYOUT_COUNT,
 };
 
+constexpr uint32_t TU_GMEM_LAYOUT_DIVISOR_MAX = 6; /* 1x (no divisor), 2 (1/2), 3 (1/3) */
+
 struct tu_subpass_barrier {
    VkPipelineStageFlags2 src_stage_mask;
    VkPipelineStageFlags2 dst_stage_mask;
@@ -30,6 +32,8 @@ struct tu_subpass_barrier {
    VkAccessFlags2 dst_access_mask;
    VkAccessFlags3KHR dst_access_mask2;
    bool incoherent_ccu_color, incoherent_ccu_depth;
+   bool non_fb_local;
+   bool read_only_input_attachments;
 };
 
 struct tu_subpass_attachment
@@ -103,6 +107,9 @@ struct tu_render_pass_attachment
     * determine which views to apply loadOp/storeOp to.
     */
    uint32_t used_views;
+   /* All views where this attachment is used as a resolve attachment.
+    */
+   uint32_t resolve_views;
    /* The internal MSRTSS attachment to clear when the user says to clear
     * this attachment. Clear values must be remapped to this attachment.
     */
@@ -156,6 +163,9 @@ struct tu_render_pass
    bool has_fdm;
    bool allow_ib2_skipping;
    bool has_layered_fdm;
+   bool has_msrtss;
+
+   bool warn_fdm_force_disabled;
 
    struct tu_subpass_barrier end_barrier;
    struct tu_subpass subpasses[0];

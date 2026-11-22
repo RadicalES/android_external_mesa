@@ -11,7 +11,7 @@ set -e
 
 set -o xtrace
 
-uncollapsed_section_start debian_setup "Base Debian system setup"
+section_start debian_setup "Base Debian system setup"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -52,6 +52,7 @@ EPHEMERAL=(
     libgbm-dev
     libinput-dev
     libgles2-mesa-dev
+    "libllvmspirvlib-${LLVM_VERSION}-dev"
     liblz4-dev
     libpciaccess-dev
     libpixman-1-dev
@@ -89,7 +90,6 @@ EPHEMERAL=(
     python3-setuptools
     python3-venv
     python3-wheel
-    wayland-protocols
     xz-utils
 )
 
@@ -124,7 +124,11 @@ DEPS=(
     libtirpc3t64
     libubsan1
     libvulkan1
+    libwayland-bin
     libwayland-client0
+    libwayland-cursor0
+    libwayland-dev
+    libwayland-egl1
     libwayland-server0
     libxcb-composite0
     libxcb-dri2-0
@@ -138,6 +142,7 @@ DEPS=(
     libxkbcommon0
     libxrandr2
     libxrender1
+    "llvm-spirv-${LLVM_VERSION}"
     ntpsec-ntpdig
     libxshmfence1
     ocl-icd-libopencl1
@@ -157,6 +162,7 @@ DEPS=(
     sysvinit-core
     vulkan-tools
     waffle-utils
+    wayland-protocols
     xinit
     xserver-common
     xserver-xorg-video-amdgpu
@@ -201,17 +207,9 @@ section_end debian_setup
 
 . .gitlab-ci/container/build-mold.sh
 
-############### Build LLVM-SPIRV translator
-
-. .gitlab-ci/container/build-llvm-spirv.sh
-
 ############### Build libclc
 
 . .gitlab-ci/container/build-libclc.sh
-
-############### Build Wayland
-
-. .gitlab-ci/container/build-wayland.sh
 
 ############### Build Weston
 
@@ -232,9 +230,13 @@ if [ "$DEBIAN_ARCH" != "armhf" ]; then
   . .gitlab-ci/container/build-crosvm.sh
 fi
 
-############### Build dEQP runner
+############### Build dEQP runner and gpu-trace-perf
 
 . .gitlab-ci/container/build-deqp-runner.sh
+
+############### Build gpu-trace-perf
+
+. .gitlab-ci/container/build-gpu-trace-perf.sh
 
 ############### Build apitrace
 
@@ -242,7 +244,7 @@ fi
 
 ############### Uninstall the build software
 
-uncollapsed_section_switch debian_cleanup "Cleaning up base Debian system"
+section_switch debian_cleanup "Cleaning up base Debian system"
 
 apt-get purge -y "${EPHEMERAL[@]}"
 

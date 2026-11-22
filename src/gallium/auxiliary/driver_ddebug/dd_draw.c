@@ -40,83 +40,7 @@
 #include "util/os_time.h"
 #include <inttypes.h>
 #include "util/detect.h"
-
-void
-dd_get_debug_filename_and_mkdir(char *buf, size_t buflen, bool verbose)
-{
-   static unsigned index;
-   char dir[256];
-   const char *proc_name = util_get_process_name();
-
-   if (!proc_name) {
-      fprintf(stderr, "dd: can't get the process name\n");
-      proc_name = "unknown";
-   }
-
-   snprintf(dir, sizeof(dir), "%s/"DD_DIR, debug_get_option("HOME", "."));
-
-   if (os_mkdir(dir, 0774) && errno != EEXIST)
-      fprintf(stderr, "dd: can't create a directory (%i)\n", errno);
-
-   snprintf(buf, buflen, "%s/%s_%u_%08u", dir, proc_name, (unsigned int)getpid(),
-            (unsigned int)p_atomic_inc_return(&index) - 1);
-
-   if (verbose)
-      fprintf(stderr, "dd: dumping to file %s\n", buf);
-}
-
-FILE *
-dd_get_debug_file(bool verbose)
-{
-   char name[512];
-   FILE *f;
-
-   dd_get_debug_filename_and_mkdir(name, sizeof(name), verbose);
-   f = fopen(name, "w");
-   if (!f) {
-      fprintf(stderr, "dd: can't open file %s\n", name);
-      return NULL;
-   }
-
-   return f;
-}
-
-void
-dd_parse_apitrace_marker(const char *string, int len, unsigned *call_number)
-{
-   unsigned num;
-   char *s;
-
-   if (len <= 0)
-      return;
-
-   /* Make it zero-terminated. */
-   s = alloca(len + 1);
-   memcpy(s, string, len);
-   s[len] = 0;
-
-   /* Parse the number. */
-   errno = 0;
-   num = strtol(s, NULL, 10);
-   if (errno)
-      return;
-
-   *call_number = num;
-}
-
-void
-dd_write_header(FILE *f, struct pipe_screen *screen, unsigned apitrace_call_number)
-{
-   char cmd_line[4096];
-   if (util_get_command_line(cmd_line, sizeof(cmd_line)))
-      fprintf(f, "Command: %s\n", cmd_line);
-   fprintf(f, "Driver vendor: %s\n", screen->get_vendor(screen));
-   fprintf(f, "Device vendor: %s\n", screen->get_device_vendor(screen));
-   fprintf(f, "Device name: %s\n\n", screen->get_name(screen));
-
-   if (apitrace_call_number)
-      fprintf(f, "Last apitrace call: %u\n\n", apitrace_call_number);
-}
+#include "c99_alloca.h"
 
 FILE *
 dd_get_file_stream(struct dd_screen *dscreen, unsigned apitrace_call_number)
@@ -419,6 +343,9 @@ dd_dump_draw_vbo(struct dd_draw_state *dstate, struct pipe_draw_info *info,
 
    PRINT_NAMED(uint, "min_samples", dstate->min_samples);
    PRINT_NAMED(hex, "sample_mask", dstate->sample_mask);
+   fprintf(f, COLOR_STATE "sample_coverage" COLOR_RESET " = %f%s\n",
+           dstate->sample_coverage,
+           dstate->sample_coverage_invert ? " (inverted)" : "");
    fprintf(f, "\n");
 
    DUMP(framebuffer_state, &dstate->framebuffer_state);
@@ -982,6 +909,8 @@ dd_copy_draw_state(struct dd_draw_state *dst, struct dd_draw_state *src)
    dst->stencil_ref = src->stencil_ref;
    dst->sample_mask = src->sample_mask;
    dst->min_samples = src->min_samples;
+   dst->sample_coverage = src->sample_coverage;
+   dst->sample_coverage_invert = src->sample_coverage_invert;
    dst->clip_state = src->clip_state;
    util_copy_framebuffer_state(&dst->framebuffer_state, &src->framebuffer_state);
    memcpy(dst->scissors, src->scissors, sizeof(src->scissors));
@@ -1601,7 +1530,9 @@ dd_context_flush_resource(struct pipe_context *_pipe,
 }
 
 static void
-dd_context_clear(struct pipe_context *_pipe, unsigned buffers, const struct pipe_scissor_state *scissor_state,
+dd_context_clear(struct pipe_context *_pipe, unsigned buffers,
+                 uint32_t color_clear_mask, uint8_t stencil_clear_mask,
+                 const struct pipe_scissor_state *scissor_state,
                  const union pipe_color_union *color, double depth,
                  unsigned stencil)
 {
@@ -1611,6 +1542,8 @@ dd_context_clear(struct pipe_context *_pipe, unsigned buffers, const struct pipe
 
    record->call.type = CALL_CLEAR;
    record->call.info.clear.buffers = buffers;
+   record->call.info.clear.color_clear_mask = color_clear_mask;
+   record->call.info.clear.stencil_clear_mask = stencil_clear_mask;
    if (scissor_state)
       record->call.info.clear.scissor_state = *scissor_state;
    record->call.info.clear.color = *color;
@@ -1618,7 +1551,7 @@ dd_context_clear(struct pipe_context *_pipe, unsigned buffers, const struct pipe
    record->call.info.clear.stencil = stencil;
 
    dd_before_draw(dctx, record);
-   pipe->clear(pipe, buffers, scissor_state, color, depth, stencil);
+   pipe->clear(pipe, buffers, color_clear_mask, stencil_clear_mask, scissor_state, color, depth, stencil);
    dd_after_draw(dctx, record);
 }
 

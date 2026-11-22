@@ -32,7 +32,7 @@ descriptor=[
   [ "STENCIL_FUNC", "LOC_CUSTOM, TYPE_ENUM16, NO_OFFSET, NO_EXTRA" ],
   [ "STENCIL_PASS_DEPTH_FAIL", "LOC_CUSTOM, TYPE_ENUM16, NO_OFFSET, NO_EXTRA" ],
   [ "STENCIL_PASS_DEPTH_PASS", "LOC_CUSTOM, TYPE_ENUM16, NO_OFFSET, NO_EXTRA" ],
-  [ "STENCIL_REF", "LOC_CUSTOM, TYPE_UINT, NO_OFFSET, NO_EXTRA" ],
+  [ "STENCIL_REF", "LOC_CUSTOM, TYPE_UINT, NO_OFFSET, extra_new_buffers" ],
   [ "STENCIL_TEST", "CONTEXT_BOOL(Stencil.Enabled), NO_EXTRA" ],
   [ "STENCIL_VALUE_MASK", "LOC_CUSTOM, TYPE_UINT, NO_OFFSET, NO_EXTRA" ],
   [ "STENCIL_WRITEMASK", "LOC_CUSTOM, TYPE_UINT, NO_OFFSET, NO_EXTRA" ],
@@ -326,7 +326,7 @@ descriptor=[
   [ "STENCIL_BACK_FUNC", "CONTEXT_ENUM16(Stencil.Function[1]), NO_EXTRA" ],
   [ "STENCIL_BACK_VALUE_MASK", "CONTEXT_UINT(Stencil.ValueMask[1]), NO_EXTRA" ],
   [ "STENCIL_BACK_WRITEMASK", "CONTEXT_UINT(Stencil.WriteMask[1]), NO_EXTRA" ],
-  [ "STENCIL_BACK_REF", "LOC_CUSTOM, TYPE_UINT, NO_OFFSET, NO_EXTRA" ],
+  [ "STENCIL_BACK_REF", "LOC_CUSTOM, TYPE_UINT, NO_OFFSET, extra_new_buffers" ],
   [ "STENCIL_BACK_FAIL", "CONTEXT_ENUM16(Stencil.FailFunc[1]), NO_EXTRA" ],
   [ "STENCIL_BACK_PASS_DEPTH_FAIL", "CONTEXT_ENUM16(Stencil.ZFailFunc[1]), NO_EXTRA" ],
   [ "STENCIL_BACK_PASS_DEPTH_PASS", "CONTEXT_ENUM16(Stencil.ZPassFunc[1]), NO_EXTRA" ],
@@ -1026,7 +1026,7 @@ descriptor=[
   [ "RGBA_INTEGER_MODE_EXT", "LOC_CUSTOM, TYPE_INT, 0, extra_EXT_texture_integer_and_new_buffers" ],
 
 # GL_ARB_transform_feedback3
-  [ "MAX_TRANSFORM_FEEDBACK_BUFFERS", "CONTEXT_INT(Const.MaxTransformFeedbackBuffers), extra_ARB_transform_feedback3" ],
+  [ "MAX_TRANSFORM_FEEDBACK_BUFFERS", "CONTEXT_INT(Const.MaxTransformFeedbackBuffers), extra_gl40_ARB_transform_feedback3" ],
   [ "MAX_VERTEX_STREAMS", "CONTEXT_INT(Const.MaxVertexStreams), extra_ARB_transform_feedback3_ARB_gpu_shader5" ],
 
 # GL_ARB_color_buffer_float

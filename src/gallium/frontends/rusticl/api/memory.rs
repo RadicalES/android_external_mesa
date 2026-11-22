@@ -4,6 +4,7 @@
 #![allow(non_upper_case_globals)]
 
 use crate::api::event::create_and_queue;
+use crate::api::event::create_and_queue_with_cleanup;
 use crate::api::icd::*;
 use crate::api::types::*;
 use crate::api::util::*;
@@ -13,7 +14,9 @@ use crate::core::event::EventSig;
 use crate::core::format::*;
 use crate::core::gl::*;
 use crate::core::memory::*;
+use crate::core::platform::Platform;
 use crate::core::queue::*;
+use crate::rusticl_warn_once;
 
 use mesa_rust_gen::pipe_fd_type;
 use mesa_rust_util::properties::Properties;
@@ -48,8 +51,17 @@ fn validate_mem_flags(flags: cl_mem_flags, validation: MemFlagValidationType) ->
             | CL_MEM_WRITE_ONLY
             | CL_MEM_READ_ONLY
             | CL_MEM_KERNEL_READ_AND_WRITE
-            | CL_MEM_IMMUTABLE_EXT,
+            | CL_MEM_IMMUTABLE_EXT
+            | CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL,
     );
+
+    if Platform::features().intel {
+        valid_flags |= cl_bitfield::from(
+            CL_MEM_FORCE_HOST_MEMORY_INTEL
+                | CL_MEM_COMPRESSED_HINT_INTEL
+                | CL_MEM_UNCOMPRESSED_HINT_INTEL,
+        );
+    }
 
     if validation != MemFlagValidationType::Imported {
         valid_flags |= cl_bitfield::from(
@@ -64,6 +76,12 @@ fn validate_mem_flags(flags: cl_mem_flags, validation: MemFlagValidationType) ->
 
     if flags & !valid_flags != 0 {
         return Err(CL_INVALID_VALUE);
+    }
+
+    if flags & cl_bitfield::from(CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL) != 0 {
+        rusticl_warn_once!(
+            "Use of CL_MEM_ALLOW_UNRESTRICTED_SIZE_INTEL detected. This flag is ignored and applications shouldn't use them with rusticl."
+        );
     }
 
     Ok(())
@@ -319,6 +337,9 @@ unsafe impl CLInfo<cl_mem_info> for cl_mem {
             }),
             CL_MEM_SIZE => v.write::<usize>(mem.size),
             CL_MEM_TYPE => v.write::<cl_mem_object_type>(mem.mem_type),
+            CL_MEM_USES_COMPRESSION_INTEL if Platform::features().intel => {
+                v.write::<cl_bool>(CL_FALSE)
+            }
             CL_MEM_USES_SVM_POINTER | CL_MEM_USES_SVM_POINTER_ARM => {
                 v.write::<cl_bool>(mem.is_svm().into())
             }
@@ -444,10 +465,19 @@ fn create_sub_buffer(
         _ => return Err(CL_INVALID_VALUE),
     };
 
-    Ok(MemBase::new_sub_buffer(b, flags, offset, size).into_cl())
+    // CL_MISALIGNED_SUB_BUFFER_OFFSET if there are no devices in context associated with buffer for
+    // which offset is aligned to CL_DEVICE_MEM_BASE_ADDR_ALIGN.
+    let is_aligned_for_any_dev = b
+        .context
+        .devs
+        .iter()
+        .any(|&dev| offset % dev.mem_base_addr_align_bytes() == 0);
 
-    // TODO
-    // CL_MISALIGNED_SUB_BUFFER_OFFSET if there are no devices in context associated with buffer for which the origin field of the cl_buffer_region structure passed in buffer_create_info is aligned to the CL_DEVICE_MEM_BASE_ADDR_ALIGN value.
+    if !is_aligned_for_any_dev {
+        return Err(CL_MISALIGNED_SUB_BUFFER_OFFSET);
+    }
+
+    Ok(MemBase::new_sub_buffer(b, flags, offset, size).into_cl())
 }
 
 #[cl_entrypoint(clSetMemObjectDestructorCallback)]
@@ -833,10 +863,10 @@ unsafe impl CLInfo<cl_image_info> for cl_mem {
             CL_IMAGE_NUM_MIP_LEVELS => v.write::<cl_uint>(mem.image_desc.num_mip_levels),
             CL_IMAGE_NUM_SAMPLES => v.write::<cl_uint>(mem.image_desc.num_samples),
             CL_IMAGE_ROW_PITCH => v.write::<usize>(mem.image_desc.image_row_pitch),
-            CL_IMAGE_SLICE_PITCH => v.write::<usize>(if mem.image_desc.dims() == 1 {
-                0
-            } else {
-                mem.image_desc.image_slice_pitch
+            CL_IMAGE_SLICE_PITCH => v.write::<usize>(match mem.image_desc.image_type {
+                // For a 1D image, 1D image buffer and 2D image object return 0.
+                CL_MEM_OBJECT_IMAGE1D | CL_MEM_OBJECT_IMAGE1D_BUFFER | CL_MEM_OBJECT_IMAGE2D => 0,
+                _ => mem.image_desc.image_slice_pitch,
             }),
             CL_IMAGE_WIDTH => v.write::<usize>(mem.image_desc.image_width),
             _ => Err(CL_INVALID_VALUE),
@@ -1193,7 +1223,7 @@ fn enqueue_read_buffer(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| b.read(ctx, offset, ptr, cb)),
+        Some(Box::new(move |_, ctx| b.read(ctx, offset, ptr, cb))),
     )
 
     // TODO
@@ -1247,7 +1277,7 @@ fn enqueue_write_buffer(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| b.write(ctx, offset, ptr, cb)),
+        Some(Box::new(move |_, ctx| b.write(ctx, offset, ptr, cb))),
     )
 
     // TODO
@@ -1309,7 +1339,9 @@ fn enqueue_copy_buffer(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| src.copy_to_buffer(ctx, &dst, src_offset, dst_offset, size)),
+        Some(Box::new(move |_, ctx| {
+            src.copy_to_buffer(ctx, &dst, src_offset, dst_offset, size)
+        })),
     )
 
     // TODO
@@ -1417,7 +1449,7 @@ fn enqueue_read_buffer_rect(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             buf.read_rect(
                 ptr,
                 ctx,
@@ -1429,7 +1461,7 @@ fn enqueue_read_buffer_rect(
                 host_row_pitch,
                 host_slice_pitch,
             )
-        }),
+        })),
     )
 
     // TODO
@@ -1540,7 +1572,7 @@ fn enqueue_write_buffer_rect(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             buf.write_rect(
                 ptr,
                 ctx,
@@ -1552,7 +1584,7 @@ fn enqueue_write_buffer_rect(
                 buffer_row_pitch,
                 buffer_slice_pitch,
             )
-        }),
+        })),
     )
 
     // TODO
@@ -1683,7 +1715,7 @@ fn enqueue_copy_buffer_rect(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             src.copy_rect(
                 &dst,
                 ctx,
@@ -1695,7 +1727,7 @@ fn enqueue_copy_buffer_rect(
                 dst_row_pitch,
                 dst_slice_pitch,
             )
-        }),
+        })),
     )
 
     // TODO
@@ -1751,13 +1783,14 @@ fn enqueue_fill_buffer(
     // `slice::from_raw_parts()`. The caller is responsible for providing a
     // pointer to appropriately-sized, initialized memory.
     let pattern = unsafe { cl_slice::from_raw_parts(pattern.cast(), pattern_size)? }.to_vec();
+    let dev = q.device;
     create_and_queue(
         q,
         CL_COMMAND_FILL_BUFFER,
         evs,
         event,
         false,
-        Box::new(move |_, ctx| b.fill(ctx, &pattern, offset, size)),
+        Some(b.fill(dev, pattern, offset, size)?),
     )
 
     // TODO
@@ -1802,13 +1835,13 @@ fn enqueue_map_buffer(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             if map_flags != CL_MAP_WRITE_INVALIDATE_REGION.into() {
                 b.sync_map(ctx, ptr)
             } else {
                 Ok(())
             }
-        }),
+        })),
     )?;
 
     Ok(ptr.as_ptr())
@@ -1895,7 +1928,9 @@ fn enqueue_read_image(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| i.read(ptr, ctx, &r, &o, row_pitch, slice_pitch)),
+        Some(Box::new(move |_, ctx| {
+            i.read(ptr, ctx, &r, &o, row_pitch, slice_pitch)
+        })),
     )
 
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for image are not supported by device associated with queue.
@@ -1984,7 +2019,9 @@ fn enqueue_write_image(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| i.write(ptr, ctx, &r, row_pitch, slice_pitch, &o)),
+        Some(Box::new(move |_, ctx| {
+            i.write(ptr, ctx, &r, row_pitch, slice_pitch, &o)
+        })),
     )
 
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for image are not supported by device associated with queue.
@@ -2056,9 +2093,9 @@ fn enqueue_copy_image(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             src_image.copy_to_image(ctx, &dst_image, src_origin, dst_origin, &region)
-        }),
+        })),
     )
 
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for src_image or dst_image are not supported by device associated with queue.
@@ -2124,13 +2161,14 @@ fn enqueue_fill_image(
         unsafe { fill_color.cast::<[u32; 4]>().read() }
     };
 
+    let dev = q.device;
     create_and_queue(
         q,
         CL_COMMAND_FILL_BUFFER,
         evs,
         event,
         false,
-        Box::new(move |_, ctx| i.fill(ctx, fill_color, &origin, &region)),
+        Some(i.fill(dev, fill_color, origin, region)?),
     )
 
     //• CL_INVALID_IMAGE_SIZE if image dimensions (image width, height, specified or compute row and/or slice pitch) for image are not supported by device associated with queue.
@@ -2191,7 +2229,9 @@ fn enqueue_copy_buffer_to_image(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| src.copy_to_image(ctx, &dst, src_offset, dst_origin, &region)),
+        Some(Box::new(move |_, ctx| {
+            src.copy_to_image(ctx, &dst, src_offset, dst_origin, &region)
+        })),
     )
 
     //• CL_INVALID_MEM_OBJECT if src_buffer is not a valid buffer object or dst_image is not a valid image object or if dst_image is a 1D image buffer object created from src_buffer.
@@ -2257,7 +2297,9 @@ fn enqueue_copy_image_to_buffer(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| src.copy_to_buffer(ctx, &dst, src_origin, dst_offset, &region)),
+        Some(Box::new(move |_, ctx| {
+            src.copy_to_buffer(ctx, &dst, src_origin, dst_offset, &region)
+        })),
     )
 
     //• CL_INVALID_MEM_OBJECT if src_image is not a valid image object or dst_buffer is not a valid buffer object or if src_image is a 1D image buffer object created from dst_buffer.
@@ -2341,13 +2383,13 @@ fn enqueue_map_image(
         evs,
         event,
         block,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             if map_flags != CL_MAP_WRITE_INVALIDATE_REGION.into() {
                 i.sync_map(ctx, ptr)
             } else {
                 Ok(())
             }
-        }),
+        })),
     )?;
 
     Ok(ptr.as_ptr())
@@ -2412,13 +2454,13 @@ fn enqueue_unmap_mem_object(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             if needs_sync {
                 m.sync_unmap(ctx, mapped_ptr)
             } else {
                 Ok(())
             }
-        }),
+        })),
     )
 }
 
@@ -2458,14 +2500,7 @@ fn enqueue_migrate_mem_objects(
     }
 
     // we should do something, but it's legal to not do anything at all
-    create_and_queue(
-        q,
-        CL_COMMAND_MIGRATE_MEM_OBJECTS,
-        evs,
-        event,
-        false,
-        Box::new(|_, _| Ok(())),
-    )
+    create_and_queue(q, CL_COMMAND_MIGRATE_MEM_OBJECTS, evs, event, false, None)
 
     //• CL_MEM_OBJECT_ALLOCATION_FAILURE if there is a failure to allocate memory for the specified set of memory objects in mem_objects.
 }
@@ -2576,13 +2611,14 @@ fn enqueue_svm_free_impl(
     // imposed by the OpenCL specification. It is the caller's duty to uphold them.
     let cb_opt = unsafe { SVMFreeCb::new(pfn_free_func, user_data) }.ok();
 
-    create_and_queue(
+    create_and_queue_with_cleanup(
         Arc::clone(&q),
         cmd_type,
         evs,
         event,
         false,
-        Box::new(move |cl_ctx, _| {
+        None,
+        Some(Box::new(move |cl_ctx| {
             if let Some(cb) = cb_opt {
                 cb.call(&q, &mut svm_pointers);
             } else {
@@ -2590,9 +2626,7 @@ fn enqueue_svm_free_impl(
                     cl_ctx.remove_svm_ptr(ptr);
                 }
             }
-
-            Ok(())
-        }),
+        })),
     )
 }
 
@@ -2686,7 +2720,9 @@ fn enqueue_svm_memcpy_impl(
         evs,
         event,
         block,
-        Box::new(move |cl_ctx, ctx| cl_ctx.copy_svm(ctx, src_ptr, dst_ptr, size)),
+        Some(Box::new(move |cl_ctx, ctx| {
+            cl_ctx.copy_svm(ctx, src_ptr, dst_ptr, size)
+        })),
     )
 }
 
@@ -2830,7 +2866,7 @@ fn enqueue_svm_mem_fill_impl(
             let pattern = unsafe { pattern_ptr.read_unaligned() };
             let svm_ptr = svm_ptr as usize;
 
-            Box::new(move |cl_ctx, ctx| cl_ctx.clear_svm(ctx, svm_ptr, size, pattern.0))
+            q.context.clear_svm(q.device, svm_ptr, size, pattern.0)?
         }};
     }
 
@@ -2851,7 +2887,7 @@ fn enqueue_svm_mem_fill_impl(
         }
     };
 
-    create_and_queue(q, cmd_type, evs, event, false, work)
+    create_and_queue(q, cmd_type, evs, event, false, Some(work))
 }
 
 #[cl_entrypoint(clEnqueueSVMMemFill)]
@@ -2942,7 +2978,9 @@ fn enqueue_svm_map_impl(
         evs,
         event,
         block,
-        Box::new(move |cl_ctx, ctx| cl_ctx.copy_svm_to_host(ctx, svm_ptr, flags)),
+        Some(Box::new(move |cl_ctx, ctx| {
+            cl_ctx.copy_svm_to_host(ctx, svm_ptr, flags)
+        })),
     )
 }
 
@@ -3016,13 +3054,9 @@ fn enqueue_svm_unmap_impl(
     }
 
     create_and_queue(
-        q,
-        cmd_type,
-        evs,
-        event,
-        false,
+        q, cmd_type, evs, event, false,
         // TODO: we _could_ migrate the content somewhere, but it's really pointless to do
-        Box::new(move |_, _| Ok(())),
+        None,
     )
 }
 
@@ -3127,9 +3161,9 @@ fn enqueue_svm_migrate_mem(
         evs,
         event,
         false,
-        Box::new(move |cl_ctx, ctx| {
+        Some(Box::new(move |cl_ctx, ctx| {
             cl_ctx.migrate_svm(ctx, svm_pointers, sizes, to_device, content_undefined)
-        }),
+        })),
     )
 }
 
@@ -3328,14 +3362,14 @@ fn enqueue_acquire_gl_objects(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| {
+        Some(Box::new(move |_, ctx| {
             if let Some(fence_fd) = fence_fd {
                 ctx.import_fence(&fence_fd, pipe_fd_type::PIPE_FD_TYPE_NATIVE_SYNC)
                     .ok_or(CL_OUT_OF_RESOURCES)?
                     .gpu_wait(ctx)
             }
             copy_cube_to_slice(ctx, &objs)
-        }),
+        })),
     )
 }
 
@@ -3369,7 +3403,7 @@ fn enqueue_release_gl_objects(
         evs,
         event,
         false,
-        Box::new(move |_, ctx| copy_slice_to_cube(ctx, &objs)),
+        Some(Box::new(move |_, ctx| copy_slice_to_cube(ctx, &objs))),
     )
 }
 

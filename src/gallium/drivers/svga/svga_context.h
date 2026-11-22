@@ -85,8 +85,9 @@ enum svga_hud {
 #define CONST0_UPLOAD_ALIGNMENT 256
 #define SVGA_MAX_UAVIEWS        SVGA3D_DX11_1_MAX_UAVIEWS
 #define SVGA_MAX_IMAGES         SVGA3D_DX11_MAX_UAVIEWS
-#define SVGA_MAX_SHADER_BUFFERS SVGA3D_DX11_MAX_UAVIEWS
+#define SVGA_MAX_SHADER_BUFFERS 16
 #define SVGA_MAX_ATOMIC_BUFFERS SVGA3D_DX11_MAX_UAVIEWS
+
 
 enum svga_surface_state
 {
@@ -331,7 +332,6 @@ struct svga_state
     */
    int nr_fbs;
 
-   struct pipe_poly_stipple poly_stipple;
    struct pipe_scissor_state scissor[SVGA3D_DX_MAX_VIEWPORTS];
    struct pipe_blend_color blend_color;
    struct pipe_stencil_ref stencil_ref;
@@ -365,7 +365,7 @@ struct svga_state
 
    /* HW atomic buffers */
    unsigned num_atomic_buffers;
-   struct svga_shader_buffer atomic_buffers[SVGA_MAX_SHADER_BUFFERS];
+   struct svga_shader_buffer atomic_buffers[SVGA_MAX_ATOMIC_BUFFERS];
 
    struct {
       /* Determine the layout of the grid (in block units) to be used. */
@@ -502,7 +502,7 @@ struct svga_hw_draw_state
 
    /* HW Atomic Buffers */
    unsigned num_atomic_buffers;
-   struct svga_shader_buffer atomic_buffers[SVGA_MAX_SHADER_BUFFERS];
+   struct svga_shader_buffer atomic_buffers[SVGA_MAX_ATOMIC_BUFFERS];
 
    /* UAV state */
    unsigned num_uavs;
@@ -761,12 +761,6 @@ struct svga_context
     */
    struct svga_blend_state *noop_blend;
 
-   struct {
-      struct pipe_resource *texture;
-      struct svga_pipe_sampler_view *sampler_view;
-      void *sampler;
-   } polygon_stipple;
-
    /** Depth stencil state created to disable depth stencil test */
    struct svga_depth_stencil_state *depthstencil_disable;
 
@@ -806,7 +800,7 @@ struct svga_context
 #define SVGA_NEW_FS_CONST_BUFFER     ((uint64_t) 0x200)
 #define SVGA_NEW_VS_CONST_BUFFER     ((uint64_t) 0x400)
 #define SVGA_NEW_FRAME_BUFFER        ((uint64_t) 0x800)
-#define SVGA_NEW_STIPPLE             ((uint64_t) 0x1000)
+
 #define SVGA_NEW_SCISSOR             ((uint64_t) 0x2000)
 #define SVGA_NEW_BLEND_COLOR         ((uint64_t) 0x4000)
 #define SVGA_NEW_CLIP                ((uint64_t) 0x8000)

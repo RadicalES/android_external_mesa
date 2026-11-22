@@ -342,7 +342,8 @@ static void pvr_finalise_po_alloc(const struct pvr_device *device,
 
    /* The number of output registers must be a power of two. */
    hw_render->output_regs_count =
-      util_next_power_of_two(ctx->alloc.output_regs_count);
+      (ctx->alloc.output_regs_count) ?
+      util_next_power_of_two(ctx->alloc.output_regs_count) : 0;
 
    assert(ctx->alloc.tile_buffers_count <= ctx->pass->max_tilebuffer_count);
    hw_render->tile_buffers_count = ctx->alloc.tile_buffers_count;
@@ -1759,16 +1760,6 @@ pvr_is_subpass_space_available(const struct pvr_device_info *dev_info,
                                                   &sp_dsts->color[i]);
          if (result != VK_SUCCESS)
             goto err_free_alloc;
-
-         /* Avoid merging subpasses which result in tile buffers having to be
-          * used. The benefit of merging must be weighed against the cost of
-          * writing/reading to tile buffers.
-          */
-         if (ctx->hw_render &&
-             sp_dsts->color[i].type != USC_MRT_RESOURCE_TYPE_OUTPUT_REG) {
-            result = vk_error(NULL, VK_ERROR_TOO_MANY_OBJECTS);
-            goto err_free_alloc;
-         }
       } else {
          sp_dsts->color[i].type = USC_MRT_RESOURCE_TYPE_INVALID;
       }
@@ -1913,6 +1904,13 @@ pvr_can_combine_with_render(const struct pvr_device_info *dev_info,
                                            new_alloc,
                                            sp_dsts);
    if (result != VK_SUCCESS)
+      return false;
+
+   /* Avoid merging subpasses which result in tile buffers having to be
+    * used. The benefit of merging must be weighed against the cost of
+    * writing/reading to tile buffers.
+    */
+   if (ctx->hw_render && new_alloc->tile_buffers_count > 0)
       return false;
 
    return true;
@@ -2250,7 +2248,7 @@ pvr_dereference_color_output_list(struct pvr_renderpass_context *ctx,
 static void
 pvr_dereference_surface_list(struct pvr_renderpass_context *ctx,
                              uint32_t subpass_num,
-                             struct pvr_render_input_attachment *attachments,
+                             struct pvr_render_attachment *attachments,
                              uint32_t count)
 {
    for (uint32_t i = 0U; i < count; i++) {
@@ -2293,6 +2291,10 @@ static VkResult pvr_schedule_subpass(const struct pvr_device *device,
                                 subpass_num,
                                 subpass->input_attachments,
                                 subpass->input_count);
+   pvr_dereference_surface_list(ctx,
+                                subpass_num,
+                                subpass->preserve_attachments,
+                                subpass->preserve_count);
    if (subpass->depth_stencil_attachment != VK_ATTACHMENT_UNUSED) {
       struct pvr_render_int_attachment *int_depth_attach =
          &ctx->int_attach[subpass->depth_stencil_attachment];
@@ -2402,8 +2404,8 @@ static VkResult pvr_schedule_subpass(const struct pvr_device *device,
    return VK_SUCCESS;
 }
 
-static uint32_t pvr_count_uses_in_input_attachment_list(
-   struct pvr_render_input_attachment *attachments,
+static uint32_t pvr_count_uses_in_attachment_list(
+   struct pvr_render_attachment *attachments,
    uint32_t size,
    uint32_t attach_idx)
 {
@@ -2594,9 +2596,15 @@ VkResult pvr_arch_create_renderpass_hwsetup(
       for (uint32_t j = 0U; j < pass->subpass_count; j++) {
          struct pvr_render_subpass *subpass = &pass->subpasses[j];
          const uint32_t input_attachment_uses =
-            pvr_count_uses_in_input_attachment_list(subpass->input_attachments,
-                                                    subpass->input_count,
-                                                    i);
+            pvr_count_uses_in_attachment_list(subpass->input_attachments,
+                                              subpass->input_count,
+                                              i);
+
+         const uint32_t preserve_attachment_uses =
+            pvr_count_uses_in_attachment_list(subpass->preserve_attachments,
+                                              subpass->preserve_count,
+                                              i);
+
          uint32_t resolve_output_uses;
          uint32_t color_output_uses;
          uint32_t total_output_uses;
@@ -2606,13 +2614,13 @@ VkResult pvr_arch_create_renderpass_hwsetup(
                                              &color_output_uses,
                                              &resolve_output_uses);
 
-         total_output_uses = color_output_uses + resolve_output_uses;
+         total_output_uses = color_output_uses + resolve_output_uses +
+                             input_attachment_uses + preserve_attachment_uses;
 
-         if (total_output_uses != 0U || input_attachment_uses != 0U)
+         if (total_output_uses != 0U)
             int_attach->last_read = j;
 
-         int_attach->remaining_count +=
-            total_output_uses + input_attachment_uses;
+         int_attach->remaining_count += total_output_uses;
 
          if ((uint32_t)subpass->depth_stencil_attachment == i)
             int_attach->remaining_count++;

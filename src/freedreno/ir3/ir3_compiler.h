@@ -95,8 +95,8 @@ struct ir3_compiler {
     */
    bool unminify_coords;
 
-   /* on a3xx do txf_ms w/ isaml and scaled coords: */
-   bool txf_ms_with_isaml;
+   /* on a3xx do txf_ms w/ isam and scaled coords: */
+   bool txf_ms_with_isam;
 
    /* on a4xx, for array textures we need to add 0.5 to the array
     * index coordinate:
@@ -107,11 +107,10 @@ struct ir3_compiler {
     */
    bool samgq_workaround;
 
-   /* on a650, vertex shader <-> tess control io uses LDL/STL */
-   bool tess_use_shared;
-
    /* Whether full and half regs are merged. */
    bool mergedregs;
+
+   const struct fd_dev_info *info;
 
    /* The maximum number of constants, in vec4's, across the entire graphics
     * pipeline.
@@ -145,21 +144,6 @@ struct ir3_compiler {
     */
    uint32_t const_upload_unit;
 
-   /* The base number of threads per wave. Some stages may be able to double
-    * this.
-    */
-   uint32_t threadsize_base;
-
-   /* On at least a6xx, waves are always launched in pairs. In calculations
-    * about occupancy, we pretend that each wave pair is actually one wave,
-    * which simplifies many of the calculations, but means we have to
-    * multiply threadsize_base by this number.
-    */
-   uint32_t wave_granularity;
-
-   /* The maximum number of simultaneous waves per core. */
-   uint32_t max_waves;
-
    /* This is theoretical maximum number of vec4 registers that one wave of
     * the base threadsize could use. To get the actual size of the register
     * file in bytes one would need to compute:
@@ -177,11 +161,11 @@ struct ir3_compiler {
     */
    uint32_t reg_size_vec4;
 
-   /* The size of local memory in bytes */
-   uint32_t local_mem_size;
-
-   /* The number of total branch stack entries, divided by wave_granularity. */
+   /* The number of total branch stack entries. */
    uint32_t branchstack_size;
+
+   /* The maximum number of branch stack entries per wave. */
+   uint32_t max_branchstack;
 
    /* The byte increment of MEMSIZEPERITEM, the private memory per-fiber allocation. */
    uint32_t pvtmem_per_fiber_align;
@@ -194,27 +178,6 @@ struct ir3_compiler {
 
    /* Whether SSBOs have descriptors for sampling with ISAM */
    bool has_isam_ssbo;
-
-   /* Whether isam.v is supported to sample multiple components from SSBOs */
-   bool has_isam_v;
-
-   /* Whether isam/stib/ldib have immediate offsets. */
-   bool has_ssbo_imm_offsets;
-
-   /* True if getfiberid, getlast.w8, brcst.active, and quad_shuffle
-    * instructions are supported which are necessary to support
-    * subgroup quad and arithmetic operations.
-    */
-   bool has_getfiberid;
-
-   /* Whether half register shared->non-shared moves are broken. */
-   bool mov_half_shared_quirk;
-
-   /* Is lock/unlock sequence needed for CS? */
-   bool cs_lock_unlock_quirk;
-
-   /* Whether movs is supported for subgroupBroadcast. */
-   bool has_movs;
 
    /* True if the shfl instruction is supported. Needed for subgroup rotate and
     * (more efficient) shuffle.
@@ -235,17 +198,9 @@ struct ir3_compiler {
 
    /* True if predt/predf/prede are supported. */
    bool has_predication;
-   bool predtf_nop_quirk;
-   bool prede_nop_quirk;
-
-   bool has_salu_int_narrowing_quirk;
 
    /* MAX_COMPUTE_VARIABLE_GROUP_INVOCATIONS_ARB */
    uint32_t max_variable_workgroup_size;
-
-   bool has_dp2acc;
-   bool has_dp4acc;
-   bool has_compliant_dp4acc;
 
    /* Type to use for 1b nir bools: */
    type_t bool_type;
@@ -273,54 +228,13 @@ struct ir3_compiler {
     */
    uint64_t geom_shared_consts_size_quirk;
 
-   bool has_fs_tex_prefetch;
-
-   bool stsc_duplication_quirk;
-
-   bool load_shader_consts_via_preamble;
-   bool load_inline_uniforms_via_preamble_ldgk;
-
-   /* True if there is a scalar ALU capable of executing a subset of
-    * cat2-cat4 instructions with a shared register destination. This also
-    * implies expanded MOV/COV capability when writing to shared registers,
-    * as MOV/COV is now executed on the scalar ALU except when reading from a
-    * normal register, as well as the ability for ldc to write to a shared
-    * register.
-    */
-   bool has_scalar_alu;
-
-   /* True if cat2 instructions can write predicate registers from the scalar
-    * ALU.
-    */
-   bool has_scalar_predicates;
-
-   bool fs_must_have_non_zero_constlen_quirk;
-
-   /* On all generations that support scalar ALU, there is also a copy of the
-    * scalar ALU and some other HW units in HLSQ that can execute preambles
-    * before work is dispatched to the SPs, called "early preamble". We detect
-    * whether the shader can use early preamble in ir3.
-    */
-   bool has_early_preamble;
-
    /* True if (rptN) is supported for bary.f. */
    bool has_rpt_bary_f;
 
    /* True if alias.tex is supported. */
    bool has_alias_tex;
 
-   /* True if alias.rt is supported. */
-   bool has_alias_rt;
-
-   bool reading_shading_rate_requires_smask_quirk;
-
-   bool shading_rate_matches_vk;
-
    bool cat3_rel_offset_0_quirk;
-
-   bool has_sel_b_fneg;
-
-   bool has_eolm_eogm;
 
    struct {
       /* The number of cycles needed for the result of one ALU operation to be
@@ -343,6 +257,8 @@ struct ir3_compiler {
    } delay_slots;
 };
 
+#define IR3_QUIRK(compiler, name) FD_QUIRK((compiler)->info, name)
+
 void ir3_compiler_destroy(struct ir3_compiler *compiler);
 struct ir3_compiler *ir3_compiler_create(struct fd_device *dev,
                                          const struct fd_dev_id *dev_id,
@@ -352,10 +268,6 @@ struct ir3_compiler *ir3_compiler_create(struct fd_device *dev,
 void ir3_disk_cache_init(struct ir3_compiler *compiler);
 void ir3_disk_cache_init_shader_key(struct ir3_compiler *compiler,
                                     struct ir3_shader *shader);
-struct ir3_shader_variant *ir3_retrieve_variant(struct blob_reader *blob,
-                                                struct ir3_compiler *compiler,
-                                                void *mem_ctx);
-void ir3_store_variant(struct blob *blob, const struct ir3_shader_variant *v);
 bool ir3_disk_cache_retrieve(struct ir3_shader *shader,
                              struct ir3_shader_variant *v);
 void ir3_disk_cache_store(struct ir3_shader *shader,
@@ -397,12 +309,13 @@ enum ir3_shader_debug {
    IR3_DBG_NODESCPREFETCH = BITFIELD_BIT(18),
    IR3_DBG_EXPANDRPT = BITFIELD_BIT(19),
    IR3_DBG_ASM_ROUNDTRIP = BITFIELD_BIT(20),
+   IR3_DBG_THREAD64 = BITFIELD_BIT(21),
 
    /* MESA_DEBUG-only options: */
-   IR3_DBG_SCHEDMSGS = BITFIELD_BIT(21),
-   IR3_DBG_RAMSGS = BITFIELD_BIT(22),
-   IR3_DBG_NOALIASTEX = BITFIELD_BIT(23),
-   IR3_DBG_NOALIASRT = BITFIELD_BIT(24),
+   IR3_DBG_SCHEDMSGS = BITFIELD_BIT(22),
+   IR3_DBG_RAMSGS = BITFIELD_BIT(23),
+   IR3_DBG_NOALIASTEX = BITFIELD_BIT(24),
+   IR3_DBG_NOALIASRT = BITFIELD_BIT(25),
 };
 
 extern enum ir3_shader_debug ir3_shader_debug;
@@ -472,5 +385,24 @@ bool ir3_shader_bisect_select(struct ir3_shader_variant *v);
 bool ir3_shader_bisect_disasm_select(struct ir3_shader_variant *v);
 
 ENDC;
+
+#ifdef __cplusplus
+struct ir3_blob_write : mesa::blob_write {
+   using mesa::blob_write::blob_write;
+
+   void variant(const struct ir3_shader_variant *&v);
+};
+
+struct ir3_blob_read : mesa::blob_read {
+   struct ir3_compiler *const compiler;
+
+   ir3_blob_read(struct blob_reader *r, struct ir3_compiler *c)
+       : mesa::blob_read(r), compiler(c)
+   {
+   }
+
+   void variant(const struct ir3_shader_variant *&v_out);
+};
+#endif /* __cplusplus */
 
 #endif /* IR3_COMPILER_H_ */

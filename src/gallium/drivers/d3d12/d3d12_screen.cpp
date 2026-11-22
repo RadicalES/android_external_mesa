@@ -46,20 +46,18 @@
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 #include "util/u_dl.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 
 #include "frontend/sw_winsys.h"
 
 #include "git_sha1.h"
 
-#ifndef _GAMING_XBOX
-#include <directx/d3d12sdklayers.h>
-#endif
-
 #if defined(_WIN32) && defined(_WIN64) && !defined(_GAMING_XBOX)
 #include <filesystem>
 #include <shlobj.h>
 #endif
+
+#include <vector>
 
 #include <dxguids/dxguids.h>
 static GUID OpenGLOn12CreatorID = { 0x6bb3cd34, 0x0d19, 0x45ab, { 0x97, 0xed, 0xd7, 0x20, 0xba, 0x3d, 0xfc, 0x80 } };
@@ -337,7 +335,6 @@ d3d12_init_screen_caps(struct d3d12_screen *screen)
    caps->seamless_cube_map = true;
    caps->texture_query_lod = true;
    caps->vs_instanceid = true;
-   caps->tgsi_tex_txf_lz = true;
    caps->occlusion_query = true;
    caps->viewport_transform_lowered = true;
    caps->psiz_clamped = true;
@@ -348,6 +345,11 @@ d3d12_init_screen_caps(struct d3d12_screen *screen)
    caps->vertex_element_instance_divisor = true;
    caps->image_store_formatted = true;
    caps->glsl_tess_levels_as_inputs = true;
+
+   /* The VAO fast path gives each attribute its own vertex buffer view starting
+    * at that attribute's offset, leaving a partial trailing stride that AMD's
+    * driver treats as out of bounds (mesa issue #15924). */
+   caps->allow_dynamic_vao_fastpath = screen->vendor_id != HW_VENDOR_AMD;
 
    caps->max_stream_output_buffers = D3D12_SO_BUFFER_SLOT_COUNT;
 
@@ -437,6 +439,7 @@ d3d12_init_screen_caps(struct d3d12_screen *screen)
    caps->max_texture_anisotropy = D3D12_MAX_MAXANISOTROPY;
 
    caps->max_texture_lod_bias = 15.99f;
+   caps->packed_uniforms = true;
 }
 
 static bool
@@ -598,6 +601,9 @@ d3d12_is_format_supported(struct pipe_screen *pscreen,
 void
 d3d12_deinit_screen(struct d3d12_screen *screen)
 {
+   while (d3d12_screen_reclaim_one(screen))
+      ;
+
 #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
    if (screen->max_feature_level >= D3D_FEATURE_LEVEL_11_0) {
       if (screen->rtv_pool) {
@@ -651,6 +657,10 @@ d3d12_deinit_screen(struct d3d12_screen *screen)
       screen->dev10->Release();
       screen->dev10 = nullptr;
    }
+   if (screen->dev15) {
+      screen->dev15->Release();
+      screen->dev15 = nullptr;
+   }
    if (screen->dev) {
       screen->dev->Release();
       screen->dev = nullptr;
@@ -662,6 +672,7 @@ d3d12_destroy_screen(struct d3d12_screen *screen)
 {
    slab_destroy_parent(&screen->transfer_pool);
    mtx_destroy(&screen->submit_mutex);
+   mtx_destroy(&screen->pending_free_lock);
    mtx_destroy(&screen->descriptor_pool_mutex);
 
 #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
@@ -1218,7 +1229,107 @@ static void* d3d12_fence_get_win32_handle(struct pipe_screen *pscreen,
 
    return (void*) shared_handle;
 }
+
+static void *d3d12_fence_get_win32_event([[maybe_unused]] struct pipe_screen *pscreen,
+                                         struct pipe_fence_handle *fence_handle)
+{
+   struct d3d12_fence* fence = (struct d3d12_fence*) fence_handle;
+
+   if (fence->type != PIPE_FD_TYPE_NATIVE_SYNC)
+      return NULL;
+
+   /* Create a new manual-reset event rather than duplicating the fence's
+    * auto-reset event.  Duplicated handles share the same kernel object, so
+    * a wait on any handle consumes the single auto-reset signal — causing
+    * other waiters to hang.
+    * A dedicated manual-reset event with its own SetEventOnCompletion avoids
+    * this by giving each caller an independent signal. */
+   HANDLE event = CreateEvent(NULL, TRUE /* bManualReset */, FALSE, NULL);
+   if (!event)
+      return NULL;
+
+   if (FAILED(fence->cmdqueue_fence->SetEventOnCompletion(fence->value, event))) {
+      CloseHandle(event);
+      return NULL;
+   }
+
+   return event;
+}
 #endif
+
+static int d3d12_fence_wait_multiple(struct pipe_screen *screen,
+                                     struct pipe_fence_handle **fences,
+                                     unsigned num_fences,
+                                     bool wait_all)
+{
+   if (num_fences == 0)
+      return -1;
+
+   assert(screen);
+   assert(fences);
+
+   if (wait_all) {
+      bool all_completed = true;
+      for (unsigned i = 0; i < num_fences; ++i) {
+         struct d3d12_fence *f = (struct d3d12_fence *)fences[i];
+         const uint64_t completed = f->cmdqueue_fence->GetCompletedValue();
+         if (completed == UINT64_MAX) {
+            debug_printf("[d3d12_fence_wait_multiple] Fence %u reports device removal (GetCompletedValue == UINT64_MAX)\n", i);
+            return -1;
+         }
+         if (completed < f->value) {
+            all_completed = false;
+            break;
+         }
+      }
+      if (all_completed) {
+         return 0;
+      }
+   } else {
+      for (unsigned i = 0; i < num_fences; ++i) {
+         struct d3d12_fence *f = (struct d3d12_fence *)fences[i];
+         const uint64_t completed = f->cmdqueue_fence->GetCompletedValue();
+         if (completed == UINT64_MAX) {
+            debug_printf("[d3d12_fence_wait_multiple] Fence %u reports device removal (GetCompletedValue == UINT64_MAX)\n", i);
+            return -1;
+         }
+         if (completed >= f->value) {
+            return i;
+         }
+      }
+   }
+
+   std::vector<ID3D12Fence *> d3d12_fences(num_fences);
+   std::vector<uint64_t> fence_values(num_fences);
+   for (unsigned i = 0; i < num_fences; ++i) {
+      struct d3d12_fence *fence = (struct d3d12_fence *)fences[i];
+      d3d12_fences[i] = fence->cmdqueue_fence;
+      fence_values[i] = fence->value;
+   }
+
+   HRESULT hr = d3d12_screen(screen)->dev->SetEventOnMultipleFenceCompletion(
+      d3d12_fences.data(),
+      fence_values.data(),
+      num_fences,
+      wait_all ? D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL : D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY,
+      nullptr);
+
+   if (FAILED(hr)) {
+      debug_printf("[d3d12_fence_wait_multiple] SetEventOnMultipleFenceCompletion failed with HR %x\n", (unsigned) hr);
+      assert(false);
+      return -1;
+   }
+
+   for (unsigned i = 0; i < num_fences; ++i) {
+      if (d3d12_fences[i]->GetCompletedValue() >= fence_values[i]) {
+         return i;
+      }
+   }
+
+   debug_printf("[d3d12_fence_wait_multiple] No fence has completed\n");
+   assert(false); // SetEventOnMultipleFenceCompletion indicated completion, but no fence has completed
+   return -1;
+}
 
 static void
 d3d12_query_memory_info(struct pipe_screen *pscreen, struct pipe_memory_info *info)
@@ -1270,6 +1381,8 @@ d3d12_init_screen_base(struct d3d12_screen *screen, struct sw_winsys *winsys, LU
       screen->adapter_luid = *adapter_luid;
    mtx_init(&screen->descriptor_pool_mutex, mtx_plain);
    mtx_init(&screen->submit_mutex, mtx_plain);
+   mtx_init(&screen->pending_free_lock, mtx_plain);
+   list_inithead(&screen->pending_free_list);
 
    list_inithead(&screen->context_list);
    screen->context_id_count = 16;
@@ -1300,10 +1413,12 @@ d3d12_init_screen_base(struct d3d12_screen *screen, struct sw_winsys *winsys, LU
    screen->base.get_driver_uuid = d3d12_get_driver_uuid;
    screen->base.get_device_node_mask = d3d12_get_node_mask;
    screen->base.create_fence_win32 = d3d12_create_fence_win32;
+   screen->base.fence_wait_multiple = d3d12_fence_wait_multiple;
    screen->base.interop_query_device_info = d3d12_interop_query_device_info;
    screen->base.interop_export_object = d3d12_interop_export_object;
 #ifdef _WIN32
    screen->base.fence_get_win32_handle = d3d12_fence_get_win32_handle;
+   screen->base.fence_get_win32_event = d3d12_fence_get_win32_event;
 #endif
    screen->base.query_memory_info = d3d12_query_memory_info;
 
@@ -1635,6 +1750,9 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
    if (FAILED(screen->dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&screen->fence))))
       return false;
 
+   screen->dev->QueryInterface(&screen->dev15);
+
+   // Uses screen->dev15 so QI must be before this
    if (!d3d12_init_residency(screen))
       return false;
 
@@ -1704,9 +1822,11 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
 
       screen->have_load_at_vertex = can_attribute_at_vertex(screen);
       screen->support_shader_images = can_shader_image_load_all_formats(screen);
-      static constexpr uint64_t known_good_warp_version = 10ull << 48 | 22000ull << 16;
+      static constexpr uint64_t known_good_warp_version_build = 22000ull;
       bool warp_with_broken_int64 =
-         (screen->vendor_id == HW_VENDOR_MICROSOFT && screen->driver_version < known_good_warp_version);
+         (screen->vendor_id == HW_VENDOR_MICROSOFT &&
+            (screen->driver_version >> 48) > 1 && (screen->driver_version >> 48) <= 10 &&
+            ((screen->driver_version >> 16) & 0xffff) < known_good_warp_version_build);
       unsigned supported_int_sizes = 32 | (screen->opts1.Int64ShaderOps && !warp_with_broken_int64 ? 64 : 0);
       unsigned supported_float_sizes = 32 | (screen->opts.DoublePrecisionFloatShaderOps ? 64 : 0);
       dxil_get_nir_compiler_options(&screen->nir_options,
@@ -1726,26 +1846,26 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
 #endif
 
    const char *mesa_version = "Mesa " PACKAGE_VERSION MESA_GIT_SHA1;
-   struct mesa_sha1 sha1_ctx;
-   uint8_t sha1[SHA1_DIGEST_LENGTH];
-   STATIC_ASSERT(PIPE_UUID_SIZE <= sizeof(sha1));
+   blake3_hasher blake3_ctx;
+   uint8_t blake3[BLAKE3_KEY_LEN];
+   STATIC_ASSERT(PIPE_UUID_SIZE <= sizeof(blake3));
 
    /* The driver UUID is used for determining sharability of images and memory
     * between two instances in separate processes.  People who want to
     * share memory need to also check the device UUID or LUID so all this
     * needs to be is the build-id.
     */
-   _mesa_sha1_compute(mesa_version, strlen(mesa_version), sha1);
-   memcpy(screen->driver_uuid, sha1, PIPE_UUID_SIZE);
+   _mesa_blake3_compute(mesa_version, strlen(mesa_version), blake3);
+   memcpy(screen->driver_uuid, blake3, PIPE_UUID_SIZE);
 
    /* The device UUID uniquely identifies the given device within the machine. */
-   _mesa_sha1_init(&sha1_ctx);
-   _mesa_sha1_update(&sha1_ctx, &screen->vendor_id, sizeof(screen->vendor_id));
-   _mesa_sha1_update(&sha1_ctx, &screen->device_id, sizeof(screen->device_id));
-   _mesa_sha1_update(&sha1_ctx, &screen->subsys_id, sizeof(screen->subsys_id));
-   _mesa_sha1_update(&sha1_ctx, &screen->revision, sizeof(screen->revision));
-   _mesa_sha1_final(&sha1_ctx, sha1);
-   memcpy(screen->device_uuid, sha1, PIPE_UUID_SIZE);
+   _mesa_blake3_init(&blake3_ctx);
+   _mesa_blake3_update(&blake3_ctx, &screen->vendor_id, sizeof(screen->vendor_id));
+   _mesa_blake3_update(&blake3_ctx, &screen->device_id, sizeof(screen->device_id));
+   _mesa_blake3_update(&blake3_ctx, &screen->subsys_id, sizeof(screen->subsys_id));
+   _mesa_blake3_update(&blake3_ctx, &screen->revision, sizeof(screen->revision));
+   _mesa_blake3_final(&blake3_ctx, blake3);
+   memcpy(screen->device_uuid, blake3, PIPE_UUID_SIZE);
 
    d3d12_init_shader_caps(screen);
    d3d12_init_compute_caps(screen);

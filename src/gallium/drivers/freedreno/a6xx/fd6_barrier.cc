@@ -29,14 +29,31 @@ fd6_emit_flushes(struct fd_context *ctx, fd_cs &cs, unsigned flushes)
    if (flushes & FD6_INVALIDATE_CCU_DEPTH)
       fd6_event_write<CHIP>(ctx, cs, FD_CCU_INVALIDATE_DEPTH);
 
-   if ((CHIP >= A7XX) && (flushes & FD6_INVALIDATE_CCHE))
-      fd_pkt7(cs, CP_CCHE_INVALIDATE, 0);
-
    if (flushes & FD6_FLUSH_CACHE)
       fd6_event_write<CHIP>(ctx, cs, FD_CACHE_CLEAN);
 
    if (flushes & FD6_INVALIDATE_CACHE)
       fd6_event_write<CHIP>(ctx, cs, FD_CACHE_INVALIDATE);
+
+   if ((CHIP >= A7XX) && (flushes & FD6_BLIT_CLEAN_CACHE))
+      fd6_event_write<CHIP>(ctx, cs, FD_CCU_CLEAN_BLIT_CACHE);
+
+   /* Possibly only needed on gen8+: */
+   if (CHIP >= A7XX) {
+      if (CHIP == A8XX)
+         fd6_event_write<CHIP>(ctx, cs, FD_DUMMY_EVENT);
+      fd6_event_write<CHIP>(ctx, cs, FD_SUBPASS_FENCE);
+      if (CHIP == A8XX)
+         fd6_event_write<CHIP>(ctx, cs, FD_DUMMY_EVENT);
+   }
+
+   if ((CHIP >= A7XX) && (flushes & FD6_INVALIDATE_CCHE)) {
+      /* CP_CCHE_INVALIDATE is just a plain register write underneath, so
+       * it needs WFI before it, in order to invalidate at the right point.
+       */
+      fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
+      fd_pkt7(cs, CP_CCHE_INVALIDATE, 0);
+   }
 
    if (flushes & FD6_WAIT_MEM_WRITES)
       fd_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
@@ -55,6 +72,11 @@ add_flushes(struct pipe_context *pctx, unsigned flushes)
 {
    struct fd_context *ctx = fd_context(pctx);
    struct fd_batch *batch = NULL;
+
+   DBG("flushes=0x%x", flushes);
+
+   if (!flushes)
+      return;
 
    /* If there is an active compute/nondraw batch, that is the one
     * we want to add the flushes to.  Ie. last op was a launch_grid,
@@ -80,6 +102,8 @@ fd6_texture_barrier(struct pipe_context *pctx, unsigned flags)
    in_dt
 {
    unsigned flushes = 0;
+
+   DBG("flags=0x%x", flags);
 
    if (flags & PIPE_TEXTURE_BARRIER_SAMPLER) {
       /* If we are sampling from the fb, we could get away with treating
@@ -109,11 +133,14 @@ fd6_texture_barrier(struct pipe_context *pctx, unsigned flags)
    add_flushes(pctx, flushes);
 }
 
+template <chip CHIP>
 static void
 fd6_memory_barrier(struct pipe_context *pctx, unsigned flags)
    in_dt
 {
    unsigned flushes = 0;
+
+   DBG("flags=0x%x", flags);
 
    if (flags & (PIPE_BARRIER_SHADER_BUFFER |
                 PIPE_BARRIER_CONSTANT_BUFFER |
@@ -138,8 +165,12 @@ fd6_memory_barrier(struct pipe_context *pctx, unsigned flags)
       * pending for these opcodes. This may result in a few extra WAIT_FOR_ME's
       * with these opcodes, but the alternative would add unnecessary WAIT_FOR_ME's
       * before draw opcodes that don't need it.
+      *
+      * a8xx removes this implicit wait, so CP_WAIT_FOR_ME should be emitted
+      * without delay, which also matches proprietary driver.
       */
-      if (fd_context(pctx)->screen->info->props.indirect_draw_wfm_quirk) {
+      if ((CHIP >= A8XX) ||
+          fd_context(pctx)->screen->info->props.indirect_draw_wfm_quirk) {
          flushes |= FD6_WAIT_FOR_ME;
       }
    }
@@ -151,9 +182,11 @@ fd6_memory_barrier(struct pipe_context *pctx, unsigned flags)
    add_flushes(pctx, flushes);
 }
 
+template <chip CHIP>
 void
 fd6_barrier_init(struct pipe_context *pctx)
 {
    pctx->texture_barrier = fd6_texture_barrier;
-   pctx->memory_barrier = fd6_memory_barrier;
+   pctx->memory_barrier = fd6_memory_barrier<CHIP>;
 }
+FD_GENX(fd6_barrier_init);

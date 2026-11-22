@@ -329,14 +329,14 @@ nvk_CreateDescriptorSetLayout(VkDevice device,
 
    layout->non_variable_descriptor_buffer_size = buffer_size;
    layout->max_buffer_size = buffer_size + max_variable_descriptor_size;
-   layout->dynamic_buffer_count = dynamic_buffer_count;
+   layout->vk.dynamic_descriptor_count = dynamic_buffer_count;
 
    struct mesa_blake3 blake3_ctx;
    _mesa_blake3_init(&blake3_ctx);
 
 #define BLAKE3_UPDATE_VALUE(x) _mesa_blake3_update(&blake3_ctx, &(x), sizeof(x));
    BLAKE3_UPDATE_VALUE(layout->non_variable_descriptor_buffer_size);
-   BLAKE3_UPDATE_VALUE(layout->dynamic_buffer_count);
+   BLAKE3_UPDATE_VALUE(layout->vk.dynamic_descriptor_count);
    BLAKE3_UPDATE_VALUE(layout->binding_count);
 
    for (uint32_t b = 0; b < num_bindings; b++) {
@@ -513,10 +513,10 @@ nvk_GetDescriptorSetLayoutSupport(VkDevice device,
    pSupport->supported = dynamic_buffer_count <= NVK_MAX_DYNAMIC_BUFFERS &&
                          buffer_size <= max_buffer_size;
 
-   vk_foreach_struct(ext, pSupport->pNext) {
-      switch (ext->sType) {
+   vk_foreach_struct(sType, ext, pSupport->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT: {
-         VkDescriptorSetVariableDescriptorCountLayoutSupport *vs = (void *)ext;
+         VkDescriptorSetVariableDescriptorCountLayoutSupport *vs = ext;
          uint32_t max_var_count;
 
          if (variable_stride > 0) {
@@ -536,7 +536,7 @@ nvk_GetDescriptorSetLayoutSupport(VkDevice device,
       }
 
       default:
-         vk_debug_ignored_stype(ext->sType);
+         vk_debug_ignored_stype(sType);
          break;
       }
    }

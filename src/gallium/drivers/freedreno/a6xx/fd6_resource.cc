@@ -183,6 +183,13 @@ fd6_check_valid_format(struct fd_resource *rsc, enum pipe_format format)
    if (orig_format == format)
       return FORMAT_OK;
 
+   if (util_format_is_yuv(orig_format)) {
+      if (rsc->layout.plane == 0 && format == PIPE_FORMAT_R8_UNORM)
+         return FORMAT_OK;
+      if (rsc->layout.plane == 1 && is_r8g8(format))
+         return FORMAT_OK;
+   }
+
    if (rsc->layout.tile_mode && (is_r8g8(orig_format) != is_r8g8(format)))
       return DEMOTE_TO_LINEAR;
 
@@ -245,6 +252,15 @@ setup_lrz(struct fd_resource *rsc)
                         FD_BO_NOMAP, "lrz");
 }
 
+static uint32_t
+fd6_layout_multiplanar_resource(struct fd_resource *y_rsc,
+                                struct fd_resource *uv_rsc)
+{
+   struct pipe_resource *uv_prsc = &uv_rsc->b.b;
+   return (uint32_t)fdl6_layout_multiplanar_image(&y_rsc->layout, &uv_rsc->layout,
+                                                  uv_prsc->last_level + 1);
+}
+
 template <chip CHIP>
 static uint32_t
 fd6_layout_resource(struct fd_resource *rsc, enum fd_layout_type type)
@@ -262,7 +278,7 @@ fd6_layout_resource(struct fd_resource *rsc, enum fd_layout_type type)
    if (ubwc && !ok_ubwc_format(prsc->screen, prsc->format, prsc->nr_samples))
       ubwc = false;
 
-   struct fdl_image_params params = fd_image_params(prsc, ubwc, tile_mode);
+   struct fdl_image_params params = fd_image_params(prsc, ubwc, tile_mode, 0);
 
    fdl6_layout_image(&rsc->layout, screen->info, &params, NULL);
 
@@ -289,7 +305,8 @@ layout_resource_for_handle(struct fd_resource *rsc, struct winsys_handle *handle
       return false;
    }
 
-   struct fdl_image_params params = fd_image_params(prsc, ubwc, tile_mode);
+   struct fdl_image_params params = fd_image_params(prsc, ubwc,
+					tile_mode, handle->plane);
 
    if (!fdl6_layout_image(&rsc->layout, screen->info, &params, &l)) {
       if (FD_DBG(LAYOUT))
@@ -342,6 +359,8 @@ fd6_is_format_supported(struct pipe_screen *pscreen,
                         enum pipe_format fmt,
                         uint64_t modifier)
 {
+   struct fd_screen *screen = fd_screen(pscreen);
+
    switch (modifier) {
    case DRM_FORMAT_MOD_LINEAR:
       return true;
@@ -351,7 +370,7 @@ fd6_is_format_supported(struct pipe_screen *pscreen,
        */
       return ok_ubwc_format(pscreen, fmt, 0);
    case DRM_FORMAT_MOD_QCOM_TILED3:
-      return fd6_tile_mode_for_format(fmt) == TILE6_3;
+      return fd6_tile_mode_for_format(screen->info, fmt) == TILE6_3;
    default:
       return false;
    }
@@ -364,6 +383,7 @@ fd6_resource_screen_init(struct pipe_screen *pscreen)
    struct fd_screen *screen = fd_screen(pscreen);
 
    screen->layout_resource = fd6_layout_resource<CHIP>;
+   screen->layout_multiplanar_resource = fd6_layout_multiplanar_resource;
    screen->layout_resource_for_handle = fd6_layout_resource_for_handle;
    screen->is_format_supported = fd6_is_format_supported;
 }

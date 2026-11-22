@@ -12,6 +12,7 @@
 #define VN_INSTANCE_H
 
 #include "vn_common.h"
+#include "vn_drirc.h"
 
 #include "vn_renderer_util.h"
 
@@ -31,9 +32,7 @@
 struct vn_instance {
    struct vn_instance_base base;
 
-   struct driOptionCache dri_options;
-   struct driOptionCache available_dri_options;
-   bool enable_wsi_multi_plane_modifiers;
+   struct vn_drirc drirc;
 
    struct vn_renderer *renderer;
 
@@ -47,6 +46,7 @@ struct vn_instance {
 
    struct {
       struct vn_ring *ring;
+      simple_mtx_t tls_rings_mutex;
       struct list_head tls_rings;
 
       struct vn_watchdog watchdog;
@@ -62,8 +62,6 @@ struct vn_instance {
     */
    uint32_t renderer_api_version;
    uint32_t renderer_version;
-
-   bool engine_is_zink;
 
    struct {
       mtx_t mutex;

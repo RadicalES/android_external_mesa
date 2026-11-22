@@ -5,12 +5,14 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "gfx/si_gfx.h"
 #include "si_build_pm4.h"
 #include "si_pipe.h"
 #include "sid.h"
 #include "util/os_time.h"
 #include "util/u_log.h"
 #include "util/u_upload_mgr.h"
+#include "ac_cmdbuf_cp.h"
 #include "ac_debug.h"
 #include "si_utrace.h"
 
@@ -78,7 +80,7 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
    struct radeon_cmdbuf *cs = &ctx->gfx_cs;
    struct radeon_winsys *ws = ctx->ws;
    struct si_screen *sscreen = ctx->screen;
-   const unsigned wait_ps_cs = SI_BARRIER_SYNC_PS | SI_BARRIER_SYNC_CS;
+   const unsigned wait_ps_cs = AC_BARRIER_SYNC_PS | AC_BARRIER_SYNC_CS;
    unsigned wait_flags = 0;
 
    if (ctx->gfx_flush_in_progress)
@@ -97,9 +99,9 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
    if (sscreen->info.is_amdgpu && sscreen->info.drm_minor >= 39)
       flags |= RADEON_FLUSH_START_NEXT_GFX_IB_NOW;
 
-   if (ctx->gfx_level == GFX6) {
-      /* The kernel flushes L2 before shaders are finished. */
-      wait_flags |= wait_ps_cs;
+   if (ctx->gfx_level <= GFX7) {
+      /* Random hangs without waiting for shaders and flushing cache */
+      wait_flags |= wait_ps_cs | AC_BARRIER_INV_L2;
    } else if (!(flags & RADEON_FLUSH_START_NEXT_GFX_IB_NOW) ||
               ((flags & RADEON_FLUSH_TOGGLE_SECURE_SUBMISSION) &&
                 !ws->cs_is_secure(cs))) {
@@ -112,7 +114,7 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
    /* Drop this flush if it's a no-op. */
    if (!radeon_emitted(cs, ctx->initial_gfx_cs_size) &&
        (!wait_flags || !ctx->gfx_last_ib_is_busy) &&
-       !(flags & RADEON_FLUSH_TOGGLE_SECURE_SUBMISSION)) {
+       !(flags & (RADEON_FLUSH_TOGGLE_SECURE_SUBMISSION | RADEON_FLUSH_FORCE))) {
       tc_driver_internal_flush_notify(ctx->tc);
       return;
    }
@@ -146,7 +148,7 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
           * and make this process guilty of hanging.
           */
          if (ctx->gfx_level >= GFX12)
-            wait_flags |= SI_BARRIER_SYNC_VS;
+            wait_flags |= AC_BARRIER_SYNC_VS;
       }
    }
 
@@ -158,7 +160,7 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
    /* If we use s_sendmsg to set tess factors to all 0 or all 1 instead of writing to the tess
     * factor buffer, we need this at the end of command buffers:
     */
-   if ((ctx->gfx_level == GFX11 || ctx->gfx_level == GFX11_5) && ctx->has_tessellation) {
+   if ((ctx->gfx_level >= GFX11 && ctx->gfx_level < GFX12) && ctx->has_tessellation) {
       radeon_begin(cs);
       radeon_event_write(V_028A90_SQ_NON_EVENT);
       radeon_end();
@@ -197,6 +199,9 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
       submission_id = ctx->ds_queue.submission_id;
    }
 
+   if (unlikely(ctx->sqtt.data))
+      si_sqtt_describe_flush(ctx);
+
    /* Flush the CS. */
    ws->cs_flush(cs, flags, &ctx->last_gfx_fence);
 
@@ -219,10 +224,6 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
       si_check_vm_faults(ctx, &ctx->current_saved_cs->gfx);
    }
 
-   if (unlikely(ctx->sqtt && (flags & PIPE_FLUSH_END_OF_FRAME))) {
-      si_handle_sqtt(ctx, &ctx->gfx_cs);
-   }
-
    if (ctx->current_saved_cs)
       si_saved_cs_reference(&ctx->current_saved_cs, NULL);
 
@@ -231,6 +232,10 @@ void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_h
 
    si_begin_new_gfx_cs(ctx, false);
    ctx->gfx_flush_in_progress = false;
+
+   if (unlikely(ctx->sqtt.data)) {
+      si_handle_sqtt(ctx, &ctx->gfx_cs, flags & PIPE_FLUSH_END_OF_FRAME);
+   }
 
 #if SHADER_DEBUG_LOG
    if (debug_get_bool_option("shaderlog", false))
@@ -332,6 +337,10 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
 
    u_trace_init(&ctx->trace, &ctx->ds.trace_context);
 
+   /* Reset timestamp command tracking */
+   ctx->last_timestamp_cmd = NULL;
+   ctx->last_timestamp_cmd_cdw = UINT32_MAX;
+
    if (unlikely(radeon_uses_secure_bos(ctx->ws))) {
       is_secure = ctx->ws->cs_is_secure(&ctx->gfx_cs);
 
@@ -362,24 +371,26 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
     * users (e.g. BO evictions and SDMA/UVD/VCE IBs) can modify our
     * buffers.
     *
-    * Gfx10+ automatically invalidates I$, SMEM$, VMEM$, and GL1$ at the beginning of IBs,
-    * so we only need to flush the GL2 cache.
+    * Gfx10+ is supposed to invalidate I$, SMEM$, VMEM$, and GL1$ at the beginning of IBs
+    * automatically, but stale descriptors and constants are still read after IB starts on
+    * gfx10.3 and gfx12 (see !44189, !44933, #15812), so invalidate them here on all gfx
+    * levels, along with GL2.
     *
     * Note that the cache flush done by the kernel at the end of GFX IBs
     * isn't useful here, because that flush can finish after the following
     * IB starts drawing.
     *
     * TODO: Do we also need to invalidate CB & DB caches?
+    * TODO: figure out why the automatic invalidation isn't enough on gfx10+
     */
-   new_barrier_flags = SI_BARRIER_INV_L2;
-   if (ctx->gfx_level < GFX10)
-      new_barrier_flags |= SI_BARRIER_INV_ICACHE | SI_BARRIER_INV_SMEM | SI_BARRIER_INV_VMEM;
+   new_barrier_flags = AC_BARRIER_INV_L2 | AC_BARRIER_INV_ICACHE | AC_BARRIER_INV_SMEM |
+                       AC_BARRIER_INV_VMEM;
 
    /* Disable pipeline stats if there are no active queries. */
    if (ctx->num_hw_pipestat_streamout_queries)
-      new_barrier_flags |= SI_BARRIER_EVENT_PIPELINESTAT_START;
+      new_barrier_flags |= AC_BARRIER_PIPELINESTAT_START;
    else
-      new_barrier_flags |= SI_BARRIER_EVENT_PIPELINESTAT_STOP;
+      new_barrier_flags |= AC_BARRIER_PIPELINESTAT_STOP;
 
    ctx->pipeline_stats_enabled = -1; /* indicate that the current hw state is unknown */
 
@@ -387,10 +398,10 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
     * When switching NGG->legacy, we need to flush VGT for certain hw generations.
     */
    if (ctx->screen->info.has_vgt_flush_ngg_legacy_bug && !ctx->ngg)
-      new_barrier_flags |= SI_BARRIER_EVENT_VGT_FLUSH;
+      new_barrier_flags |= AC_BARRIER_VGT_FLUSH;
 
    si_clear_and_set_barrier_flags(ctx,
-                            SI_BARRIER_EVENT_PIPELINESTAT_START | SI_BARRIER_EVENT_PIPELINESTAT_STOP,
+                            AC_BARRIER_PIPELINESTAT_START | AC_BARRIER_PIPELINESTAT_STOP,
                             new_barrier_flags);
    si_mark_atom_dirty(ctx, &ctx->atoms.s.spi_ge_ring_state);
 
@@ -433,6 +444,9 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
       ctx->initial_gfx_cs_size = ctx->gfx_cs.current.cdw;
       return;
    }
+
+   if (unlikely(ctx->sqtt.data))
+      si_sqtt_describe_begin(ctx, &ctx->gfx_cs);
 
    if (ctx->has_tessellation) {
       radeon_add_to_buffer_list(ctx, &ctx->gfx_cs,
@@ -573,7 +587,7 @@ void si_trace_emit(struct si_context *sctx)
    struct radeon_cmdbuf *cs = &sctx->gfx_cs;
    uint32_t trace_id = ++sctx->current_saved_cs->trace_id;
 
-   si_cp_write_data(sctx, sctx->current_saved_cs->trace_buf, 0, 4, V_370_MEM, V_370_ME, &trace_id);
+   si_cp_write_data(sctx, sctx->current_saved_cs->trace_buf, 0, 4, V_371_MEMORY, V_371_MICRO_ENGINE, &trace_id);
 
    ac_emit_cp_nop(&cs->current, AC_ENCODE_TRACE_POINT(trace_id));
 

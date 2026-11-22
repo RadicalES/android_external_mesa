@@ -52,11 +52,39 @@ lower_sysvals_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void * data)
    SYSVAL_TO_VARYING(front_face, FACE, bool);
    SYSVAL_TO_VARYING(layer_id, LAYER, uint);
    SYSVAL_TO_VARYING(view_index, VIEW_INDEX, uint);
+   SYSVAL_TO_VARYING(primitive_id, PRIMITIVE_ID, uint);
 
 #undef SYSVAL_TO_VARYING
 
    default:
       return false;
+   }
+
+   b->cursor = nir_before_instr(&intrin->instr);
+
+   if (b->shader->info.io_lowered) {
+      nir_alu_type nir_type = nir_get_nir_type_for_glsl_type(type);
+      unsigned num_components = glsl_get_vector_elements(type);
+      nir_def *def;
+
+      if (glsl_type_is_float(type)) {
+         nir_def *baryc =
+            nir_load_barycentric_pixel(b, 32,
+                                       .interp_mode = INTERP_MODE_SMOOTH);
+
+         def = nir_load_interpolated_input(b, num_components, 32, baryc,
+                                           nir_imm_int(b, 0),
+                                           .dest_type = nir_type,
+                                           .io_semantics.location = slot);
+      } else {
+         def = nir_load_input(b, num_components, 32,
+                              nir_imm_int(b, 0),
+                              .dest_type = nir_type,
+                              .io_semantics.location = slot);
+      }
+
+      nir_def_replace(&intrin->def, def);
+      return true;
    }
 
    nir_variable *var =
@@ -66,7 +94,6 @@ lower_sysvals_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void * data)
        glsl_type_is_integer(type))
       var->data.interpolation = INTERP_MODE_FLAT;
 
-   b->cursor = nir_before_instr(&intrin->instr);
    nir_def *val = nir_load_var(b, var);
    nir_def_replace(&intrin->def, val);
 
@@ -95,6 +122,7 @@ nir_lower_sysvals_to_varyings(nir_shader *shader,
          SYSVAL_TO_VARYING(front_face, FRONT_FACE, FACE);
          SYSVAL_TO_VARYING(layer_id, LAYER_ID, LAYER);
          SYSVAL_TO_VARYING(view_index, VIEW_INDEX, VIEW_INDEX);
+         SYSVAL_TO_VARYING(primitive_id, PRIMITIVE_ID, PRIMITIVE_ID);
 
 #undef SYSVAL_TO_VARYING
 

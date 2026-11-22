@@ -1,24 +1,6 @@
 /*
  * Copyright © 2020 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "brw_nir_rt.h"
@@ -71,8 +53,7 @@ brw_nir_lower_shader_returns(nir_shader *shader)
 
    nir_builder b = nir_builder_create(impl);
 
-   set_foreach(&impl->end_block->predecessors, block_entry) {
-      struct nir_block *block = (void *)block_entry->key;
+   nir_foreach_pred(block, impl->end_block) {
       b.cursor = nir_after_block_before_jump(block);
 
       switch (shader->info.stage) {
@@ -81,7 +62,7 @@ brw_nir_lower_shader_returns(nir_shader *shader)
           * it ends, we retire the bindless stack ID and no further shaders
           * will be executed.
           */
-         assert(impl->end_block->predecessors.entries == 1);
+         assert(nir_block_num_preds(impl->end_block) == 1);
          brw_nir_btd_retire(&b);
          break;
 
@@ -104,7 +85,7 @@ brw_nir_lower_shader_returns(nir_shader *shader)
           * action at the end.  They simply return back to the previous shader
           * in the call stack.
           */
-         assert(impl->end_block->predecessors.entries == 1);
+         assert(nir_block_num_preds(impl->end_block) == 1);
          brw_nir_btd_return(&b);
          break;
 
@@ -151,7 +132,7 @@ store_resume_addr(nir_builder *b, nir_intrinsic_instr *call)
 static bool
 lower_shader_trace_ray(nir_builder *b, nir_intrinsic_instr *call, void *data)
 {
-   const struct brw_nir_lower_shader_calls_state *state = data;
+   const struct brw_nir_lower_rt_state *state = data;
    const struct intel_device_info *devinfo = state->devinfo;
    struct brw_bs_prog_key *key = state->key;
 
@@ -251,11 +232,12 @@ lower_shader_trace_ray(nir_builder *b, nir_intrinsic_instr *call, void *data)
 
    brw_nir_rt_store_mem_ray(b, &ray_defs, BRW_RT_BVH_LEVEL_WORLD, devinfo);
 
-   nir_trace_ray_intel(b,
-                       nir_load_btd_global_arg_addr_intel(b),
-                       nir_imm_int(b, BRW_RT_BVH_LEVEL_WORLD),
-                       nir_imm_int(b, GEN_RT_TRACE_RAY_INITAL),
-                       .synchronous = false);
+   brw_nir_trace_ray(b,
+                     nir_load_btd_global_arg_addr_intel(b),
+                     nir_imm_int(b, BRW_RT_BVH_LEVEL_WORLD),
+                     nir_imm_int(b, GEN_RT_TRACE_RAY_INITIAL),
+                     false, state->key->base.use_efficient_64bit,
+                     state->devinfo);
    return true;
 }
 
@@ -282,10 +264,10 @@ lower_shader_call_instr(struct nir_builder *b, nir_intrinsic_instr *call,
 
 bool
 brw_nir_lower_shader_calls(nir_shader *shader,
-                           struct brw_nir_lower_shader_calls_state *state)
+                           struct brw_nir_lower_rt_state *state)
 {
    bool a = nir_shader_intrinsics_pass(shader, lower_shader_trace_ray,
-                                       nir_metadata_none, state);
+                                       nir_metadata_control_flow, state);
    bool b = nir_shader_intrinsics_pass(shader, lower_shader_call_instr,
                                          nir_metadata_control_flow,
                                          NULL);
@@ -316,6 +298,7 @@ brw_nir_lower_shader_calls(nir_shader *shader,
  */
 nir_shader *
 brw_nir_create_trivial_return_shader(const struct brw_compiler *compiler,
+                                     const struct brw_bs_prog_key *key,
                                      void *mem_ctx)
 {
    const nir_shader_compiler_options *nir_options =
@@ -356,6 +339,7 @@ brw_nir_create_trivial_return_shader(const struct brw_compiler *compiler,
  */
 nir_shader *
 brw_nir_create_null_ahs_shader(const struct brw_compiler *compiler,
+                               const struct brw_bs_prog_key *key,
                                void *mem_ctx)
 {
    const nir_shader_compiler_options *nir_options =
@@ -378,8 +362,9 @@ brw_nir_create_null_ahs_shader(const struct brw_compiler *compiler,
    brw_nir_rt_load_mem_hit(b, &hit_in, false, compiler->devinfo);
    nir_def *ray_level = hit_in.bvh_level;
    nir_def *ray_op = nir_imm_int(b, GEN_RT_TRACE_RAY_COMMIT);
-   nir_trace_ray_intel(b,
-                       nir_load_btd_global_arg_addr_intel(b),
-                       ray_level, ray_op);
+   brw_nir_trace_ray(b,
+                     nir_load_btd_global_arg_addr_intel(b),
+                     ray_level, ray_op, false,
+                     key->base.use_efficient_64bit, compiler->devinfo);
    return nir;
 }

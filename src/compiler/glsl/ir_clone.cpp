@@ -140,6 +140,11 @@ ir_loop::clone(linear_ctx *linalloc, struct hash_table *ht) const
    ir_foreach_in_list(ir_instruction, ir, &this->body_instructions) {
       new_loop->body_instructions.push_tail(ir->clone(linalloc, ht));
    }
+   ir_foreach_in_list(ir_instruction, ir, &this->continue_instructions) {
+      new_loop->continue_instructions.push_tail(ir->clone(linalloc, ht));
+   }
+
+   new_loop->do_while = this->do_while;
 
    return new_loop;
 }
@@ -343,6 +348,7 @@ ir_constant::clone(linear_ctx *linalloc, struct hash_table *ht) const
    case GLSL_TYPE_FLOAT_E5M2:
    case GLSL_TYPE_DOUBLE:
    case GLSL_TYPE_BOOL:
+   case GLSL_TYPE_YUV_CSC_STANDARD_EXT:
    case GLSL_TYPE_UINT64:
    case GLSL_TYPE_INT64:
    case GLSL_TYPE_UINT16:

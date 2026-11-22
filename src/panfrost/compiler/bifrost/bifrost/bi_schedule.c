@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "bi_debug.h"
 #include "bi_builder.h"
 #include "compiler.h"
 
@@ -2016,7 +2017,8 @@ bi_schedule_block(bi_context *ctx, bi_block *block)
    if (!list_is_empty(&block->clauses)) {
       bi_clause *last_clause =
          list_last_entry(&block->clauses, bi_clause, link);
-      if (bi_reconverge_branches(block))
+      if (bi_reconverge_branches(block) ||
+          block->needs_reconvergence_on_exit)
          last_clause->flow_control = BIFROST_FLOW_NBTB_UNCONDITIONAL;
    }
 

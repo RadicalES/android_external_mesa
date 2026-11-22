@@ -11,8 +11,11 @@ libpanfrost_bifrost_files = files(
   'bi_layout.c',
   'bi_liveness.c',
   'bi_lower_divergent_indirects.c',
+  'bi_lower_mkvec_swz.c',
+  'bi_lower_spill.c',
   'bi_lower_swizzle.c',
   'bi_print.c',
+  'bi_print_common.c',
   'bi_opt_control_flow.c',
   'bi_opt_constant_fold.c',
   'bi_opt_copy_prop.c',
@@ -26,14 +29,19 @@ libpanfrost_bifrost_files = files(
   'bi_ra.c',
   'bi_ra_ssa.c',
   'bi_spill_ssa.c',
+  'bi_reindex_ssa.c',
+  'bi_repair_ssa.c',
   'bi_validate.c',
   'bi_dominance.c',
+  'bi_debug.c',
   'bir.c',
   'bifrost_compile.c',
+  'bifrost_nir.c',
   'bifrost/bi_opt_message_preload.c',
   'bifrost/bi_pack.c',
   'bifrost/bi_schedule.c',
   'bifrost/bi_scoreboard.c',
+  'valhall/va_gather_hsr_info.c',
   'valhall/va_insert_flow.c',
   'valhall/va_lower_constants.c',
   'valhall/va_lower_isel.c',
@@ -44,15 +52,6 @@ libpanfrost_bifrost_files = files(
   'valhall/va_pack.c',
   'valhall/va_perf.c',
   'valhall/va_validate.c',
-)
-
-bifrost_gen_disasm_c = custom_target(
-  'bifrost_gen_disasm.c',
-  input : ['gen_disasm.py', 'bifrost/ISA.xml'],
-  output : 'bifrost_gen_disasm.c',
-  command : [prog_python, '@INPUT@'],
-  capture : true,
-  depend_files : files('bifrost_isa.py'),
 )
 
 bi_opcodes_c = custom_target(
@@ -130,23 +129,37 @@ bifrost_nir_algebraic_c = custom_target(
   depend_files : nir_algebraic_depends,
 )
 
-libpanfrost_bifrost_disasm = static_library(
-  'panfrost_bifrost_disasm',
-  ['bifrost/disassemble.c', 'bi_print_common.c', bifrost_gen_disasm_c],
-  include_directories : [inc_include, inc_src],
-  dependencies: [idep_nir],
-  c_args : [no_override_init_args],
-  gnu_symbol_visibility : 'hidden',
-  build_by_default : false,
-)
+libpanfrost_disasm = []
+if with_panfrost_disassemble
+  bifrost_gen_disasm_c = custom_target(
+    'bifrost_gen_disasm.c',
+    input : ['gen_disasm.py', 'bifrost/ISA.xml'],
+    output : 'bifrost_gen_disasm.c',
+    command : [prog_python, '@INPUT@'],
+    capture : true,
+    depend_files : files('bifrost_isa.py'),
+  )
+
+  libpanfrost_bifrost_disasm = static_library(
+    'panfrost_bifrost_disasm',
+    ['bifrost/disassemble.c', bifrost_gen_disasm_c],
+    include_directories : [inc_include, inc_src],
+    dependencies: [idep_nir],
+    c_args : [no_override_init_args, soong_compat_c_args],
+    gnu_symbol_visibility : 'hidden',
+    build_by_default : false,
+  )
+
+  libpanfrost_disasm += [libpanfrost_bifrost_disasm, libpanfrost_valhall_disasm]
+endif
 
 libpanfrost_bifrost = static_library(
   'panfrost_bifrost',
   [libpanfrost_bifrost_files, bi_opcodes_c, bi_swizzles_c, bi_printer_c, bi_packer_c, bifrost_nir_algebraic_c, valhall_c ],
   include_directories : [inc_include, inc_src, inc_valhall],
   dependencies: [idep_nir, idep_bi_opcodes_h, idep_bi_builder_h, idep_valhall_enums_h, libpanfrost_model_dep],
-  link_with: [libpanfrost_bifrost_disasm, libpanfrost_valhall_disasm],
-  c_args : [no_override_init_args],
+  link_with: libpanfrost_disasm,
+  c_args : [libpanfrost_compiler_c_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )

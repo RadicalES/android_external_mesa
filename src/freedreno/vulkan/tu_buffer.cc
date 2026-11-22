@@ -24,8 +24,8 @@ tu_CreateBuffer(VkDevice _device,
    VK_FROM_HANDLE(tu_device, device, _device);
    struct tu_buffer *buffer;
 
-   buffer = (struct tu_buffer *) vk_buffer_create(
-      &device->vk, pCreateInfo, pAllocator, sizeof(*buffer));
+   buffer = static_cast<struct tu_buffer *>(vk_buffer_create(
+      &device->vk, pCreateInfo, pAllocator, sizeof(*buffer)));
    if (buffer == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -38,6 +38,8 @@ tu_CreateBuffer(VkDevice _device,
          flags |= TU_SPARSE_VMA_MAP_ZERO;
       if (pCreateInfo->flags & VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT)
          flags |= TU_SPARSE_VMA_REPLAYABLE;
+      if (pCreateInfo->flags & VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
+         flags |= TU_SPARSE_VMA_REPLAYABLE;
 
       const VkBufferOpaqueCaptureAddressCreateInfo *replay_info =
          vk_find_struct_const(pCreateInfo->pNext,
@@ -47,10 +49,22 @@ tu_CreateBuffer(VkDevice _device,
          flags |= TU_SPARSE_VMA_REPLAYABLE;
       }
 
+      const VkOpaqueCaptureDescriptorDataCreateInfoEXT *descriptor_replay_info =
+         vk_find_struct_const(pCreateInfo->pNext, OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT);
+      if (descriptor_replay_info && descriptor_replay_info->opaqueCaptureDescriptorData) {
+         client_address = *static_cast<const uint64_t *>(descriptor_replay_info->opaqueCaptureDescriptorData);
+         flags |= TU_SPARSE_VMA_REPLAYABLE;
+      }
+
+      const VkBufferDeviceAddressAlignmentAllocateInfoVALVE *align_info =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              BUFFER_DEVICE_ADDRESS_ALIGNMENT_ALLOCATE_INFO_VALVE);
+      uint64_t alignment = align_info ? align_info->alignment : 0;
+
       VkResult result =
          tu_sparse_vma_init(device, &buffer->vk.base, &buffer->vma,
                             &buffer->vk.device_address, flags,
-                            pCreateInfo->size, client_address);
+                            pCreateInfo->size, alignment, client_address);
 
       if (result != VK_SUCCESS) {
          vk_buffer_destroy(&device->vk, pAllocator, &buffer->vk);
@@ -124,11 +138,11 @@ tu_GetDeviceBufferMemoryRequirements(
       .memoryTypeBits = (1 << device->physical_device->memory.non_lazy_type_count) - 1,
    };
 
-   vk_foreach_struct(ext, pMemoryRequirements->pNext) {
-      switch (ext->sType) {
+   vk_foreach_struct(sType, ext, pMemoryRequirements->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
          VkMemoryDedicatedRequirements *req =
-            (VkMemoryDedicatedRequirements *) ext;
+            static_cast<VkMemoryDedicatedRequirements *>(ext);
          req->requiresDedicatedAllocation = false;
          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
          break;
@@ -230,4 +244,23 @@ uint64_t tu_GetBufferOpaqueCaptureAddress(
       return buffer->vk.device_address;
 
    return 0;
+}
+
+VkResult VKAPI_CALL
+tu_GetBufferOpaqueCaptureDescriptorDataEXT(VkDevice device,
+                                                  const VkBufferCaptureDescriptorDataInfoEXT *pInfo,
+                                                  void *pData)
+{
+   VK_FROM_HANDLE(tu_buffer, buffer, pInfo->buffer);
+
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
+      /* Save the buffer iova so that when replaying sparse buffers have a
+       * consistent iova and therefore consistent descriptor contents.
+       */
+      memcpy(pData, &buffer->vk.device_address, sizeof(buffer->vk.device_address));
+   } else {
+      memset(pData, 0, sizeof(buffer->vk.device_address));
+   }
+
+   return VK_SUCCESS;
 }

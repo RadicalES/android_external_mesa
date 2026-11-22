@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "vk_common_entrypoints.h"
+#include "wsi_common_entrypoints.h"
+
 #include "tu_device.h"
 #include "tu_entrypoints.h"
 #include "tu_queue.h"
 #include "tu_rmv.h"
-#include "vk_common_entrypoints.h"
-#include "wsi_common_entrypoints.h"
 
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_rmv_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
@@ -78,7 +79,7 @@ VkResult tu_rmv_SetDebugUtilsObjectNameEXT(VkDevice _device,
       return VK_SUCCESS;
    }
 
-   tu_rmv_log_resource_name(device, (const void *) pNameInfo->objectHandle,
+   tu_rmv_log_resource_name(device, reinterpret_cast<const void *>(pNameInfo->objectHandle),
                             pNameInfo->pObjectName);
    return VK_SUCCESS;
 }
