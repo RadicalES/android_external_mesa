@@ -22,7 +22,17 @@ calc_entries_per_slice(struct rkt_operation *operation)
          : DIV_ROUND_UP(last_c_atomics * operation->input_width,
                         atomics_per_entry);
 
-   return int_c_entries + frac_c_entries;
+   /*
+    * A row seems to take CBUF_CON1.DATA_ENTRIES half entries (see
+    * fill_task()), which is more than the above when three channel atomics
+    * trail a group of four, as the 40x40x40 case suggested.
+    */
+   unsigned half_entries =
+      total_c_atomics % 4 == 3
+         ? operation->input_width * DIV_ROUND_UP(total_c_atomics, 4)
+         : DIV_ROUND_UP(operation->input_width * total_c_atomics, 4);
+
+   return MAX2(int_c_entries + frac_c_entries, DIV_ROUND_UP(half_entries, 2));
 }
 
 static unsigned
@@ -37,8 +47,11 @@ static unsigned
 calc_weights_banks(struct rkt_operation *operation)
 {
    unsigned bpe = sizeof(uint8_t);
+   unsigned weight_channels =
+      rkt_weight_channels_padded(operation->input_channels,
+                                 operation->depthwise);
    unsigned bytes = operation->weights_width * operation->weights_height *
-                    operation->input_channels * bpe;
+                    weight_channels * bpe;
    unsigned entries;
    unsigned banks;
 
@@ -125,15 +138,18 @@ fill_task(struct rkt_ml_subgraph *subgraph,
    task->output_surface_stride = output_line_stride * task->output_height;
    task->output_surface_stride /= FEATURE_ATOMIC_SIZE;
 
+   unsigned input_atomics =
+      DIV_ROUND_UP(task->input_channels_real, FEATURE_ATOMIC_SIZE);
+
    if (task->input_channels_real == 1)
       task->input_data_entries = task->input_width * task->input_height;
-   else if (task->input_width == 40 && task->input_channels_real == 40)
-      task->input_data_entries = 40;
+   else if (input_atomics % 4 == 3)
+      /* Three trailing channel atomics seem to take a whole entry per pixel */
+      task->input_data_entries =
+         task->input_width * DIV_ROUND_UP(input_atomics, 4);
    else
-      task->input_data_entries = DIV_ROUND_UP(
-         task->input_width * 2 *
-            DIV_ROUND_UP(task->input_channels_real, FEATURE_ATOMIC_SIZE),
-         8);
+      task->input_data_entries =
+         DIV_ROUND_UP(task->input_width * input_atomics, 4);
 
    task->weights_width = operation->weights_width;
    task->weights_height = operation->weights_height;
@@ -148,6 +164,28 @@ fill_task(struct rkt_ml_subgraph *subgraph,
    task->surfaces_per_row = task->output_width * task->output_height * 2;
    if (operation->depthwise)
       task->surfaces_per_row *= 2;
+}
+
+/*
+ * Whether rkt_split_tasks() can split the input into tasks that fit in the
+ * CBUF. Each task holds whole rows, and needs at least weights_height of them
+ * to produce an output row, so a convolution whose rows are too wide can't be
+ * split.
+ */
+bool
+rkt_task_input_fits(struct rkt_operation *operation)
+{
+   unsigned weights_banks = calc_weights_banks(operation);
+   /* As in rkt_split_tasks() */
+   unsigned input_banks =
+      weights_banks + 1 < CBUF_BANKS ? CBUF_BANKS - weights_banks : 7;
+
+   if (calc_input_banks(operation) <= input_banks)
+      return true;
+
+   return (CBUF_ENTRIES_PER_BANK * input_banks) /
+             calc_entries_per_slice(operation) >=
+          operation->weights_height;
 }
 
 void

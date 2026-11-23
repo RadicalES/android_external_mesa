@@ -19,6 +19,64 @@
 #define WEIGHT_ATOMIC_SIZE    32
 #define ATOMIC_K_SIZE         16
 
+static inline unsigned
+rkt_weight_channels_padded(unsigned channels, bool depthwise)
+{
+   unsigned padded = align(MAX2(channels, FEATURE_ATOMIC_SIZE),
+                           FEATURE_ATOMIC_SIZE);
+
+   if (depthwise &&
+       padded % (2 * WEIGHT_ATOMIC_SIZE) == 3 * FEATURE_ATOMIC_SIZE)
+      padded += FEATURE_ATOMIC_SIZE;
+
+   return padded;
+}
+
+/* The hardware computes in int8: uint8 values and zero points get 0x80
+ * subtracted where they are read, which keeps the real values. */
+static inline uint8_t
+rkt_sign_offset(bool is_signed)
+{
+   return is_signed ? 0 : 0x80;
+}
+
+static inline int
+rkt_zero_point(const struct pipe_tensor *tensor)
+{
+   return tensor->zero_point - rkt_sign_offset(tensor->is_signed);
+}
+
+/*
+ * BS and BN correspond to the X1 and X2 units of NVDLA's SDP, which can read
+ * the operands of their multipliers per channel from memory:
+ * http://nvdla.org/hw/v1/ias/unit_description.html#single-point-data-processor
+ *
+ * With per-channel weight scales, each channel's scale relative to the largest
+ * one, r = 2^-k * m with m in (0.5, 1], is applied by the multipliers of BS
+ * and BN, which read their int16 operands from the biases buffer:
+ *
+ *  - BS: m in units of 2^-BS_MUL_SHIFT. BS reads groups of BS_GROUP output
+ *    channels: BS_GROUP int32 biases followed by BS_GROUP int16 multipliers.
+ *  - BN: the exact power of two 2^-k, in units of 2^-BN_MUL_SHIFT, one int16
+ *    per channel starting at rkt_bn_muls_offset().
+ *
+ * The shift is shared by all channels, so a single multiplier would lose the
+ * precision of small ratios: in units of 2^-BS_MUL_SHIFT, 0.001 becomes 16 and
+ * keeps 4 bits, while 0.512 * 2^-9 is 8389 in BS and exact in BN.
+ */
+#define BS_GROUP      8
+#define BS_MUL_SHIFT  14
+#define BN_MUL_SHIFT  14
+#define BN_MULS_ALIGN 64
+
+static inline unsigned
+rkt_bn_muls_offset(unsigned output_channels)
+{
+   return align(DIV_ROUND_UP(output_channels, BS_GROUP) * BS_GROUP *
+                   (sizeof(int32_t) + sizeof(int16_t)),
+                BN_MULS_ALIGN);
+}
+
 struct split_task {
    unsigned num;
 
@@ -40,7 +98,7 @@ struct split_task {
    unsigned input_height;
    unsigned input_channels;
    unsigned input_channels_real;
-   unsigned input_zero_point;
+   int8_t input_zero_point;
    float input_scale;
    unsigned input_data_entries;
    int input_line_stride;
@@ -51,7 +109,7 @@ struct split_task {
    unsigned output_height;
    unsigned output_channels;
    unsigned output_channels_real;
-   unsigned output_zero_point;
+   int8_t output_zero_point;
    float output_scale;
    int output_surface_stride;
    unsigned output_offset;
@@ -59,7 +117,7 @@ struct split_task {
    unsigned weights_width;
    unsigned weights_height;
    unsigned weights_kernels;
-   unsigned weights_zero_point;
+   int8_t weights_zero_point;
    float weights_scale;
 
    unsigned input_banks;
@@ -78,6 +136,7 @@ struct rkt_operation {
    struct pipe_resource *biases;
 
    bool depthwise;
+   bool relu;
    bool reuse_weights_cbuf;
    unsigned truncate_bits;
    unsigned padding_top;
@@ -94,20 +153,21 @@ struct rkt_operation {
    unsigned input_width;
    unsigned input_height;
    unsigned input_channels;
-   uint8_t input_zero_point;
+   int8_t input_zero_point;
    float input_scale;
 
    unsigned output_index;
    unsigned output_width;
    unsigned output_height;
    unsigned output_channels;
-   uint8_t output_zero_point;
+   int8_t output_zero_point;
    float output_scale;
 
    unsigned weights_width;
    unsigned weights_height;
-   uint8_t weights_zero_point;
-   float weights_scale;
+   int8_t weights_zero_point;
+   float weights_scale; /* the largest one, with per-channel scales */
+   bool per_channel;
 
    int add_tensor;
 

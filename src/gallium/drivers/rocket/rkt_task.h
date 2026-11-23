@@ -8,6 +8,8 @@
 
 #include "rkt_ml.h"
 
+bool rkt_task_input_fits(struct rkt_operation *operation);
+
 void rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
                      struct rkt_operation *operation);
 

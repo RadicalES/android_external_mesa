@@ -37,9 +37,10 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       util_dynarray_element(&operation->tasks, struct split_task, task_num);
    unsigned num_tasks =
       util_dynarray_num_elements(&operation->tasks, struct split_task);
-   unsigned output_zero_point = task->output_zero_point;
-   unsigned weights_zero_point = task->weights_zero_point;
-   unsigned offset = output_zero_point - 0x80;
+   unsigned weight_channels =
+      rkt_weight_channels_padded(operation->input_channels,
+                                 operation->depthwise);
+   int8_t offset = task->output_zero_point;
 
    uint32_t con0 = CNA_CBUF_CON0_WEIGHT_BANK(task->weights_banks) |
                    CNA_CBUF_CON0_DATA_BANK(task->input_banks);
@@ -86,9 +87,9 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_CNA_DATA_SIZE2, CNA_DATA_SIZE2_DATAOUT_WIDTH(task->output_width));
    EMIT(REG_CNA_DATA_SIZE3, CNA_DATA_SIZE3_DATAOUT_ATOMICS(task->atomic_count));
    EMIT(REG_CNA_WEIGHT_SIZE0, task->weights_width * task->weights_height *
-                                 task->input_channels * task->weights_kernels);
+                                 weight_channels * task->weights_kernels);
    EMIT(REG_CNA_WEIGHT_SIZE1,
-        task->weights_width * task->weights_height * task->input_channels);
+        task->weights_width * task->weights_height * weight_channels);
    EMIT(REG_CNA_WEIGHT_SIZE2,
         CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(task->weights_width) |
            CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(task->weights_height) |
@@ -175,17 +176,12 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_CNA_CVT_CON5, 0);
    }
 
-   int32_t pad_con1;
-   if (task->weights_width >= 3 && task->input_zero_point == 0x0)
-      pad_con1 = 0xffff8080;
-   else
-      pad_con1 = task->input_zero_point - 0x80;
+   /* As in 0xffff8080 and 0x0b0b, the pad value seems to be needed in both
+    * bytes of the low 16 bits, with their sign extended into the rest */
+   int32_t pad_con1 = (int16_t)((uint8_t)task->input_zero_point * 0x0101);
 
    if (operation->addition_input || operation->add_tensor != -1)
       pad_con1 = 0xffffff80;
-
-   if (operation->depthwise && task->input_zero_point == 0x8b)
-      pad_con1 = 0x0b0b;
 
    EMIT(REG_CNA_PAD_CON1, pad_con1);
 
@@ -209,7 +205,11 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       feat_mode_cfg |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
 
    EMIT(REG_DPU_FEATURE_MODE_CFG, feat_mode_cfg);
-   EMIT(REG_DPU_DATA_FORMAT, 0);
+   EMIT(REG_DPU_DATA_FORMAT,
+        operation->per_channel
+           ? DPU_DATA_FORMAT_BS_MUL_SHIFT_VALUE_NEG(BS_MUL_SHIFT) |
+                DPU_DATA_FORMAT_BN_MUL_SHIFT_VALUE_NEG(BN_MUL_SHIFT)
+           : 0);
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
@@ -224,11 +224,21 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_DATA_CUBE_CHANNEL,
         DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(task->output_channels_real - 1) |
            DPU_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
+   /*
+    * ReLU is applied when the output is converted to int8, which a fused
+    * addition comes before, so apply it in BS then.
+    * TODO: Activations with an upper bound, such as relu6, are still lost.
+    */
    EMIT(REG_DPU_BS_CFG, DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1) |
-                           DPU_BS_CFG_BS_RELU_BYPASS(1) |
-                           DPU_BS_CFG_BS_MUL_BYPASS(1));
+                           DPU_BS_CFG_BS_RELU_BYPASS(
+                              !(operation->relu && operation->add_tensor != -1)) |
+                           DPU_BS_CFG_BS_MUL_BYPASS(!operation->per_channel));
    EMIT(REG_DPU_BS_ALU_CFG, 0);
-   EMIT(REG_DPU_BS_MUL_CFG, 0);
+   EMIT(REG_DPU_BS_MUL_CFG,
+        operation->per_channel
+           ? DPU_BS_MUL_CFG_BS_MUL_SHIFT_VALUE(BS_MUL_SHIFT) |
+                DPU_BS_MUL_CFG_BS_MUL_SRC(1)
+           : 0);
    EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
 
    if (operation->depthwise) {
@@ -241,7 +251,7 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
                                  DPU_BS_OW_CFG_SIZE_E_0(1));
    }
 
-   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(0x80 - weights_zero_point));
+   EMIT(REG_DPU_BS_OW_OP, DPU_BS_OW_OP_OW_OP(-task->weights_zero_point));
 
    EMIT(REG_DPU_WDMA_SIZE_0,
         DPU_WDMA_SIZE_0_CHANNEL_WDMA(task->output_channels - 1));
@@ -249,10 +259,16 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
         DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
            DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
    EMIT(REG_DPU_BN_CFG,
-        DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
-           DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_BYPASS(1));
+        DPU_BN_CFG_BN_RELU_BYPASS(1) |
+           DPU_BN_CFG_BN_MUL_BYPASS(!operation->per_channel) |
+           DPU_BN_CFG_BN_ALU_BYPASS(1) |
+           DPU_BN_CFG_BN_BYPASS(!operation->per_channel));
    EMIT(REG_DPU_BN_ALU_CFG, 0);
-   EMIT(REG_DPU_BN_MUL_CFG, 0);
+   EMIT(REG_DPU_BN_MUL_CFG,
+        operation->per_channel
+           ? DPU_BN_MUL_CFG_BN_MUL_SHIFT_VALUE(BN_MUL_SHIFT) |
+                DPU_BN_MUL_CFG_BN_MUL_SRC(1)
+           : 0);
    EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
 
    if (operation->add_tensor != -1) {
@@ -364,11 +380,23 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
    }
 
-   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
+   /* Bit 0 fetches the BS ALU operands (biases), bit 2 the BS multipliers */
+   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG,
+        DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(operation->per_channel ? 0x5
+                                                                      : 0x1));
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
         rkt_resource(operation->biases)->phys_addr);
-   EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 0);
-   EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
+   /* Bit 2 fetches the BN multipliers */
+   if (operation->per_channel) {
+      EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG,
+           DPU_RDMA_RDMA_NRDMA_CFG_NRDMA_DATA_USE(0x4));
+      EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR,
+           rkt_resource(operation->biases)->phys_addr +
+              rkt_bn_muls_offset(task->output_channels_real));
+   } else {
+      EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 0);
+      EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
+   }
 
    unsigned ew_stride =
       MAX2(operation->output_width * operation->output_height, 12);

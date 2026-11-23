@@ -13,22 +13,23 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
                  const struct pipe_ml_operation *poperation)
 {
    struct pipe_context *pcontext = subgraph->context;
-   unsigned weights_width = poperation->conv.weight_tensor->dims[1];
-   unsigned weights_height = poperation->conv.weight_tensor->dims[2];
+   unsigned weights_width = poperation->conv.weight_tensor->dims[2];
+   unsigned weights_height = poperation->conv.weight_tensor->dims[1];
    unsigned input_channels = poperation->input_tensors[0]->dims[3];
    unsigned input_channels_real = poperation->input_tensors[0]->dims[3];
    unsigned output_channels = poperation->output_tensors[0]->dims[3];
    unsigned output_channels_real = poperation->output_tensors[0]->dims[3];
    unsigned weights_size;
-   uint8_t zero_point = poperation->conv.weight_tensor->zero_point;
+   int zero_point = rkt_zero_point(poperation->conv.weight_tensor);
+   uint8_t offset = rkt_sign_offset(poperation->conv.weight_tensor->is_signed);
    struct pipe_transfer *transfer_out;
    void *map = poperation->conv.weight_tensor->data;
-   uint8_t(*weights_in)[weights_width][weights_height][input_channels] = map;
+   uint8_t(*weights_in)[weights_height][weights_width][input_channels] = map;
    struct pipe_resource *rsc;
    uint8_t *weights_out;
 
    input_channels =
-      align(MAX2(input_channels, FEATURE_ATOMIC_SIZE), FEATURE_ATOMIC_SIZE);
+      rkt_weight_channels_padded(input_channels, rkt_is_depthwise(poperation));
 
    output_channels = align(output_channels, 2);
    if (rkt_is_depthwise(poperation))
@@ -53,8 +54,8 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
    for (int oc1 = 0; oc1 < DIV_ROUND_UP(output_channels, WEIGHT_ATOMIC_SIZE);
         oc1++) {
       for (int ic1 = 0; ic1 < input_channels_1; ic1++) {
-         for (int x = 0; x < weights_width; x++) {
-            for (int y = 0; y < weights_height; y++) {
+         for (int y = 0; y < weights_height; y++) {
+            for (int x = 0; x < weights_width; x++) {
                for (int oc2 = 0; oc2 < MIN2(output_channels, WEIGHT_ATOMIC_SIZE);
                     oc2++) {
                   for (int ic2 = 0; ic2 < input_channels_2; ic2++) {
@@ -67,14 +68,19 @@ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
                      if (oc >= output_channels_real)
                         weights_out[n++] = 0x0;
                      else if (ic >= input_channels_real) {
-                        if (ic2 < 16 || (input_channels_real % 32) > 16)
-                           weights_out[n++] =
-                              zero_point - 0x80; /* TODO: Why is the blob converting to
-                                                    signed? It should be unsigned. */
+                        /* Pad a tap only up to the aligned channel count.
+                         * This branch runs for a whole weight group, and for
+                         * depthwise input_channel_groups is
+                         * 2*WEIGHT_ATOMIC_SIZE, so a group can reach past
+                         * input_channels. The counter n lays the taps out one
+                         * after the other, and advances by exactly
+                         * input_channels, as padded above, per tap; emitting
+                         * more than that shifted every tap after the first.
+                         */
+                        if (ic < input_channels)
+                           weights_out[n++] = zero_point;
                      } else
-                        weights_out[n++] = weights_in[oc][x][y][ic] -
-                                           0x80; /* TODO: Why is the blob converting to
-                                                    signed? It should be unsigned. */
+                        weights_out[n++] = weights_in[oc][y][x][ic] - offset;
                   }
                }
             }
@@ -98,32 +104,78 @@ calculate_bias_correction(struct rkt_ml_subgraph *subgraph,
                           unsigned oc, void *map)
 {
    unsigned input_channels = poperation->input_tensors[0]->dims[3];
-   unsigned input_zero_point = poperation->input_tensors[0]->zero_point;
-   unsigned weights_width = poperation->conv.weight_tensor->dims[1];
-   unsigned weights_height = poperation->conv.weight_tensor->dims[2];
-   unsigned weight_zero_point = poperation->conv.weight_tensor->zero_point;
-   uint8_t(*weights)[weights_width][weights_height][input_channels] = map;
+   int input_zero_point = rkt_zero_point(poperation->input_tensors[0]);
+   unsigned weights_width = poperation->conv.weight_tensor->dims[2];
+   unsigned weights_height = poperation->conv.weight_tensor->dims[1];
+   int weight_zero_point = rkt_zero_point(poperation->conv.weight_tensor);
+   uint8_t offset = rkt_sign_offset(poperation->conv.weight_tensor->is_signed);
+   uint8_t(*weights)[weights_height][weights_width][input_channels] = map;
 
    int32_t correction = 0;
    if (rkt_is_depthwise(poperation)) {
-      for (unsigned x = 0; x < weights_width; x++) {
-         for (unsigned y = 0; y < weights_height; y++) {
-            correction += (weights[0][x][y][oc] - weight_zero_point) *
-                          (input_zero_point - 0x80);
+      for (unsigned y = 0; y < weights_height; y++) {
+         for (unsigned x = 0; x < weights_width; x++) {
+            correction +=
+               ((int8_t)(weights[0][y][x][oc] - offset) - weight_zero_point) *
+               input_zero_point;
          }
       }
    } else {
-      for (unsigned x = 0; x < weights_width; x++) {
-         for (unsigned y = 0; y < weights_height; y++) {
+      for (unsigned y = 0; y < weights_height; y++) {
+         for (unsigned x = 0; x < weights_width; x++) {
             for (unsigned ic = 0; ic < input_channels; ic++) {
-               correction += (weights[oc][x][y][ic] - weight_zero_point) *
-                             (input_zero_point - 0x80);
+               correction +=
+                  ((int8_t)(weights[oc][y][x][ic] - offset) - weight_zero_point) *
+                  input_zero_point;
             }
          }
       }
    }
 
    return correction;
+}
+
+float
+rkt_max_weights_scale(const struct pipe_ml_operation *poperation)
+{
+   const struct pipe_tensor *weight_tensor = poperation->conv.weight_tensor;
+   unsigned output_channels = poperation->output_tensors[0]->dims[3];
+   float scale = weight_tensor->scale;
+
+   if (weight_tensor->scales) {
+      for (unsigned oc = 0; oc < output_channels; oc++)
+         scale = MAX2(scale, weight_tensor->scales[oc]);
+   }
+
+   return scale;
+}
+
+static void
+pack_per_channel(void *map, const int32_t *biases,
+                 const struct pipe_ml_operation *poperation)
+{
+   const float *scales = poperation->conv.weight_tensor->scales;
+   unsigned output_channels = poperation->output_tensors[0]->dims[3];
+   float max_scale = rkt_max_weights_scale(poperation);
+
+   int16_t *bn_muls =
+      (int16_t *)((uint8_t *)map + rkt_bn_muls_offset(output_channels));
+
+   for (unsigned oc = 0; oc < output_channels; oc++) {
+      uint8_t *group = (uint8_t *)map + oc / BS_GROUP * BS_GROUP *
+                                           (sizeof(int32_t) + sizeof(int16_t));
+      int32_t *group_biases = (int32_t *)group;
+      int16_t *group_muls = (int16_t *)(group + BS_GROUP * sizeof(int32_t));
+      /* Channels whose weights are all 0 can have a scale of 0 */
+      float ratio = max_scale > 0 ? scales[oc] / max_scale : 0;
+      int k = ratio > 0 ? CLAMP((int)floorf(-log2f(ratio)), 0, BN_MUL_SHIFT)
+                        : BN_MUL_SHIFT;
+
+      group_biases[oc % BS_GROUP] = biases[oc];
+      group_muls[oc % BS_GROUP] =
+         MIN2(lroundf(ratio * (1 << k) * (1 << BS_MUL_SHIFT)), INT16_MAX);
+      bn_muls[oc] = 1 << (BN_MUL_SHIFT - k);
+   }
 }
 
 struct pipe_resource *
@@ -137,12 +189,22 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
    struct pipe_transfer *transfer_out;
    int32_t *biases_in = (int32_t *)poperation->conv.bias_tensor->data;
    void *weights = poperation->conv.weight_tensor->data;
+   bool per_channel = poperation->conv.weight_tensor->scales != NULL;
    struct pipe_resource *rsc;
    uint32_t *biases;
+   unsigned size;
+   void *map;
 
-   rsc = pipe_buffer_create(pcontext->screen, 0, PIPE_USAGE_DEFAULT,
-                            output_channels * sizeof(uint32_t));
-   biases = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
+   if (per_channel)
+      size = rkt_bn_muls_offset(output_channels) +
+             output_channels * sizeof(int16_t);
+   else
+      size = output_channels * sizeof(uint32_t);
+
+   rsc = pipe_buffer_create(pcontext->screen, 0, PIPE_USAGE_DEFAULT, size);
+   map = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
+   memset(map, 0, size);
+   biases = per_channel ? calloc(output_channels, sizeof(*biases)) : map;
 
    // DBG("weight_scale %x\n",
    // fui(poperation->conv.weight_tensor->scale));
@@ -204,10 +266,14 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
       }
    }
 
+   if (per_channel) {
+      pack_per_channel(map, (int32_t *)biases, poperation);
+      free(biases);
+   }
+
    if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
       static int task = 0;
-      rkt_dump_buffer((uint8_t *)biases, "biases", 0, task++, 0,
-                      output_channels * sizeof(uint32_t));
+      rkt_dump_buffer(map, "biases", 0, task++, 0, size);
    }
 
    pipe_buffer_unmap(pcontext, transfer_out);

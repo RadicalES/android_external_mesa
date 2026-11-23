@@ -182,6 +182,7 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->tasks = UTIL_DYNARRAY_INIT;
 
    operation->depthwise = rkt_is_depthwise(poperation);
+   operation->relu = poperation->conv.relu;
    operation->padding_top = poperation->conv.padding_top;
    operation->padding_bottom = poperation->conv.padding_bottom;
    operation->padding_left = poperation->conv.padding_left;
@@ -189,23 +190,25 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->stride = poperation->conv.stride_x;
 
    operation->input_index = poperation->input_tensors[0]->index;
-   operation->input_width = poperation->input_tensors[0]->dims[1];
-   operation->input_height = poperation->input_tensors[0]->dims[2];
+   operation->input_width = poperation->input_tensors[0]->dims[2];
+   operation->input_height = poperation->input_tensors[0]->dims[1];
    operation->input_channels = poperation->input_tensors[0]->dims[3];
-   operation->input_zero_point = poperation->input_tensors[0]->zero_point;
+   operation->input_zero_point = rkt_zero_point(poperation->input_tensors[0]);
    operation->input_scale = poperation->input_tensors[0]->scale;
 
    operation->output_index = poperation->output_tensors[0]->index;
-   operation->output_width = poperation->output_tensors[0]->dims[1];
-   operation->output_height = poperation->output_tensors[0]->dims[2];
+   operation->output_width = poperation->output_tensors[0]->dims[2];
+   operation->output_height = poperation->output_tensors[0]->dims[1];
    operation->output_channels = poperation->output_tensors[0]->dims[3];
-   operation->output_zero_point = poperation->output_tensors[0]->zero_point;
+   operation->output_zero_point = rkt_zero_point(poperation->output_tensors[0]);
    operation->output_scale = poperation->output_tensors[0]->scale;
 
-   operation->weights_width = poperation->conv.weight_tensor->dims[1];
-   operation->weights_height = poperation->conv.weight_tensor->dims[2];
-   operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
-   operation->weights_scale = poperation->conv.weight_tensor->scale;
+   operation->weights_width = poperation->conv.weight_tensor->dims[2];
+   operation->weights_height = poperation->conv.weight_tensor->dims[1];
+   operation->weights_zero_point =
+      rkt_zero_point(poperation->conv.weight_tensor);
+   operation->weights_scale = rkt_max_weights_scale(poperation);
+   operation->per_channel = poperation->conv.weight_tensor->scales != NULL;
 
    operation->weights = rkt_fill_weights(subgraph, poperation);
    operation->biases =
@@ -266,14 +269,86 @@ count_tensors(const struct pipe_ml_operation *poperations,
    return tensor_count + 1;
 }
 
+/* The dimensions as lower_convolution() sets them */
 static bool
-tensor_quantization_supported(struct pipe_tensor *tensor)
+input_fits(const struct pipe_ml_operation *poperation)
 {
-   /*
-    * Per-axis quantization not supported, for details see:
-    * https://ai.google.dev/edge/litert/models/quantization_spec#per-axis_vs_per-tensor
-    */
+   struct rkt_operation operation = {
+      .depthwise = rkt_is_depthwise(poperation),
+      .input_width = poperation->input_tensors[0]->dims[2],
+      .input_height = poperation->input_tensors[0]->dims[1],
+      .input_channels = poperation->input_tensors[0]->dims[3],
+      .output_channels = poperation->output_tensors[0]->dims[3],
+      .weights_width = poperation->conv.weight_tensor->dims[2],
+      .weights_height = poperation->conv.weight_tensor->dims[1],
+   };
+
+   return rkt_task_input_fits(&operation);
+}
+
+/* A single scale and zero point for the whole tensor */
+static bool
+per_tensor_quantization_supported(struct pipe_tensor *tensor)
+{
    return tensor->scales == NULL && tensor->zero_points == NULL;
+}
+
+/*
+ * A scale per channel, applied by the DPU, with a zero point shared by all of
+ * them:
+ * https://ai.google.dev/edge/litert/models/quantization_spec#per-axis_vs_per-tensor
+ */
+static bool
+per_channel_quantization_supported(struct pipe_tensor *tensor,
+                                   unsigned channels)
+{
+   if (!tensor->scales)
+      return false;
+
+   for (unsigned i = 0; i < channels; i++) {
+      if (tensor->zero_points && tensor->zero_points[i] != tensor->zero_point)
+         return false;
+   }
+
+   return true;
+}
+
+/* The weights and biases can have either */
+static bool
+coefs_quantization_supported(struct pipe_tensor *tensor, unsigned channels)
+{
+   return per_tensor_quantization_supported(tensor) ||
+          per_channel_quantization_supported(tensor, channels);
+}
+
+/*
+ * TODO: Depthwise convolutions with up to 16 channels give wrong results on
+ * larger inputs (e.g. 4 channels on 64x64), for reasons not understood yet.
+ */
+static bool
+depthwise_supported(const struct pipe_tensor *input_tensor)
+{
+   return input_tensor->dims[3] > FEATURE_ATOMIC_SIZE;
+}
+
+/*
+ * The kernel size takes 5 bits in CNA_WEIGHT_SIZE2, and a single input channel
+ * takes an entry per pixel in the 14 bits of CNA_CBUF_CON1.DATA_ENTRIES.
+ */
+static bool
+register_limits_supported(const struct pipe_ml_operation *operation)
+{
+   const struct pipe_tensor *input_tensor = operation->input_tensors[0];
+   const struct pipe_tensor *weight_tensor = operation->conv.weight_tensor;
+
+   if (weight_tensor->dims[1] > 31 || weight_tensor->dims[2] > 31)
+      return false;
+
+   if (input_tensor->dims[3] == 1 &&
+       input_tensor->dims[1] * input_tensor->dims[2] >= (1 << 14))
+      return false;
+
+   return true;
 }
 
 bool
@@ -288,21 +363,37 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
       struct pipe_tensor *weight_tensor = operation->conv.weight_tensor;
       struct pipe_tensor *bias_tensor = operation->conv.bias_tensor;
       struct pipe_tensor *output_tensor = operation->output_tensors[0];
+      unsigned output_channels = output_tensor->dims[3];
 
-      // Dilation and per-axis quantization not yet implemented
-      if (tensor_quantization_supported(input_tensor) &&
-          tensor_quantization_supported(weight_tensor) &&
-          tensor_quantization_supported(bias_tensor) &&
-          tensor_quantization_supported(output_tensor) &&
+      /* Dilation, non-8-bit tensors and missing biases not yet implemented.
+       * The driver also stores a single stride (operation->stride), so a
+       * convolution with stride_x != stride_y would be programmed with the
+       * wrong geometry; leave it on the CPU until both strides are plumbed
+       * through. */
+      if (bias_tensor &&
+          input_tensor->type_size == 1 && weight_tensor->type_size == 1 &&
+          output_tensor->type_size == 1 &&
+          per_tensor_quantization_supported(input_tensor) &&
+          coefs_quantization_supported(weight_tensor, output_channels) &&
+          coefs_quantization_supported(bias_tensor, output_channels) &&
+          per_tensor_quantization_supported(output_tensor) &&
+          operation->conv.stride_x == operation->conv.stride_y &&
           operation->conv.dilation_width_factor == 1 &&
-          operation->conv.dilation_height_factor == 1)
+          operation->conv.dilation_height_factor == 1 &&
+          register_limits_supported(operation) &&
+          (!rkt_is_depthwise(operation) || depthwise_supported(input_tensor)) &&
+          input_fits(operation))
          supported = true;
 
       break;
    }
    case PIPE_ML_OPERATION_TYPE_ADD:
       supported = operation->input_tensors[0]->data == NULL &&
-                  operation->input_tensors[1]->data == NULL;
+                  operation->input_tensors[1]->data == NULL &&
+                  /* TODO: Non-8-bit tensors */
+                  operation->input_tensors[0]->type_size == 1 &&
+                  operation->input_tensors[1]->type_size == 1 &&
+                  operation->output_tensors[0]->type_size == 1;
       break;
    case PIPE_ML_OPERATION_TYPE_POOLING: {
       struct pipe_tensor *input_tensor = operation->input_tensors[0];
@@ -313,8 +404,12 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
       /* Padding is excluded from the average, which a convolution can't do */
       supported = operation->pooling.type == PIPE_ML_POOLING_TYPE_AVG &&
                   input_tensor->dims[3] == output_tensor->dims[3] &&
-                  tensor_quantization_supported(input_tensor) &&
-                  tensor_quantization_supported(output_tensor) &&
+                  /* TODO: Non-8-bit tensors */
+                  input_tensor->type_size == 1 &&
+                  output_tensor->type_size == 1 &&
+                  depthwise_supported(input_tensor) &&
+                  per_tensor_quantization_supported(input_tensor) &&
+                  per_tensor_quantization_supported(output_tensor) &&
                   filter_width == filter_height &&
                   filter_width <= 31 &&
                   filter_width % 2 == 1 &&
@@ -372,9 +467,9 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
           * every tap holds the constant weight 1/(fw*fh) -- this is how the
           * vendor blob does it too, and it reuses the tested convolution path
           * (and completes on the DPU, so no PPU or kernel changes). The tap is
-          * stored as 16 in the hardware's signed weight domain (uint8 144 with
-          * zero_point 128) and the 1/(fw*fh*16) factor is folded into the
-          * weight scale; the DPU requantization then yields the average. */
+          * stored as 16 with a zero point of 0, and the 1/(fw*fh*16) factor
+          * is folded into the weight scale; the DPU requantization then
+          * yields the average. */
          const struct pipe_ml_operation *poperation = &poperations[i];
          unsigned fw = poperation->pooling.filter_width;
          unsigned fh = poperation->pooling.filter_height;
@@ -382,7 +477,7 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          const uint8_t weight_step = 16;
 
          uint8_t *weights = malloc(fw * fh * channels);
-         memset(weights, 0x80 + weight_step, fw * fh * channels);
+         memset(weights, weight_step, fw * fh * channels);
          int32_t *biases = calloc(channels, sizeof(int32_t));
 
          struct pipe_tensor weight_tensor = {0};
@@ -391,7 +486,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          weight_tensor.dims[1] = fh;
          weight_tensor.dims[2] = fw;
          weight_tensor.dims[3] = channels;
-         weight_tensor.zero_point = 0x80;
+         weight_tensor.zero_point = 0;
+         weight_tensor.is_signed = true;
          weight_tensor.scale = 1.0f / ((float)(fw * fh) * (float)weight_step);
 
          struct pipe_tensor bias_tensor = {0};
@@ -424,29 +520,41 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          break;
       }
       case PIPE_ML_OPERATION_TYPE_ADD: {
-         /* Fuse tensor addition into convolution*/
+         /*
+          * Additions are only supported fused into an operation that produces
+          * one of their inputs, the one that runs last, so that the other
+          * input is ready.
+          * TODO: Additions with no such operation, e.g. of two graph inputs.
+          */
+         struct pipe_tensor *add_tensor = poperations[i].input_tensors[1];
          struct rkt_operation *input_op_1 =
             find_producer(subgraph, poperations[i].input_tensors[1]->index);
          struct rkt_operation *input_op_2 =
             find_producer(subgraph, poperations[i].input_tensors[0]->index);
 
+         if (input_op_1 && (!input_op_2 || input_op_1 > input_op_2)) {
+            struct rkt_operation *tmp = input_op_1;
+            input_op_1 = input_op_2;
+            input_op_2 = tmp;
+            add_tensor = poperations[i].input_tensors[0];
+         }
+
          assert(input_op_2);
 
          if (input_op_1 == NULL) {
             /* Graph input */
-            input_op_2->add_tensor = poperations[i].input_tensors[1]->index;
+            input_op_2->add_tensor = add_tensor->index;
          } else {
             input_op_1->addition_input = true;
             input_op_2->add_tensor = input_op_1->output_index;
          }
 
          input_op_2->output_index = poperations[i].output_tensors[0]->index;
-         input_op_2->addition_offset =
-            0x80 - poperations[i].input_tensors[1]->zero_point;
-         input_op_2->addition_scale = poperations[i].input_tensors[1]->scale;
+         input_op_2->addition_offset = -rkt_zero_point(add_tensor);
+         input_op_2->addition_scale = add_tensor->scale;
          input_op_2->output_scale = poperations[i].output_tensors[0]->scale;
          input_op_2->output_zero_point =
-            poperations[i].output_tensors[0]->zero_point;
+            rkt_zero_point(poperations[i].output_tensors[0]);
 
          break;
       }
@@ -497,19 +605,20 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
          &rkt_get_tensor(subgraph, input_idxs[i])->base;
       unsigned input_channels = operation->input_channels;
       unsigned output_channels = operation->output_channels;
+      uint8_t offset = rkt_sign_offset(is_signed[i]);
 
       struct rkt_resource *input_tensor =
          rkt_get_tensor(subgraph, operation->input_index);
-      if (output_channels == 1 && input_channels == 1 &&
+      if (!is_signed[i] && output_channels == 1 && input_channels == 1 &&
           !operation->addition_input && (operation->add_tensor == -1)) {
          pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,
                           pipe_buffer_size(input));
       } else {
          unsigned input_width = operation->input_width;
          unsigned input_height = operation->input_height;
-         unsigned zero_point = operation->input_zero_point;
+         int zero_point = operation->input_zero_point;
          struct pipe_transfer *transfer_out;
-         uint8_t(*input_in)[input_height][input_channels] = inputs[i];
+         uint8_t(*input_in)[input_width][input_channels] = inputs[i];
          uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
                                         PIPE_MAP_WRITE, &transfer_out);
 
@@ -522,27 +631,28 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
           * unsigned to signed though.
           */
          if (input_channels == 1) {
+            /* Kept as uint8, which the CNA converts to int8 */
             unsigned n = 0;
-            for (int x = 0; x < input_width; x++) {
-               for (int y = 0; y < MAX2(input_height, FEATURE_ATOMIC_SIZE); y++) {
-                  if (y < input_height)
-                     map[n++] = input_in[x][y][0];
+            for (int y = 0; y < input_height; y++) {
+               for (int x = 0; x < MAX2(input_width, FEATURE_ATOMIC_SIZE); x++) {
+                  if (x < input_width)
+                     map[n++] = input_in[y][x][0] - offset + 0x80;
                   else
-                     map[n++] = zero_point;
+                     map[n++] = zero_point + 0x80;
                }
             }
          } else {
             unsigned n = 0;
             for (int u = 0; u < DIV_ROUND_UP(input_channels, FEATURE_ATOMIC_SIZE);
                  u++) {
-               for (int x = 0; x < input_width; x++) {
-                  for (int y = 0; y < input_height; y++) {
+               for (int y = 0; y < input_height; y++) {
+                  for (int x = 0; x < input_width; x++) {
                      for (int c = 0; c < FEATURE_ATOMIC_SIZE; c++) {
                         unsigned input_channel = c + u * FEATURE_ATOMIC_SIZE;
                         if (input_channel < input_channels)
-                           map[n++] = input_in[x][y][input_channel] - 0x80;
+                           map[n++] = input_in[y][x][input_channel] - offset;
                         else
-                           map[n++] = zero_point - 0x80;
+                           map[n++] = zero_point;
                      }
                   }
                }
@@ -663,6 +773,7 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
       struct rkt_operation *operation = find_producer(subgraph, output_idxs[i]);
       struct rkt_resource *output_tensor =
          rkt_get_tensor(subgraph, output_idxs[i]);
+      uint8_t offset = rkt_sign_offset(is_signed[i]);
       struct pipe_transfer *transfer = NULL;
       uint8_t *raw_output;
       uint8_t(*output_in)[operation->output_height][operation->output_width]
@@ -683,11 +794,11 @@ rkt_ml_subgraph_read_outputs(struct pipe_context *pcontext,
          rkt_dump_buffer(raw_output, "output", 0, 0, 0, output_tensor->bo_size);
 
       for (int oc = 0; oc < operation->output_channels; oc++) {
-         for (int x = 0; x < operation->output_width; x++) {
-            for (int y = 0; y < operation->output_height; y++) {
+         for (int y = 0; y < operation->output_height; y++) {
+            for (int x = 0; x < operation->output_width; x++) {
                unsigned c = oc % FEATURE_ATOMIC_SIZE;
                unsigned g = oc / FEATURE_ATOMIC_SIZE;
-               output_out[y][x][oc] = output_in[g][y][x][c] + 0x80;
+               output_out[y][x][oc] = output_in[g][y][x][c] + offset;
             }
          }
       }
