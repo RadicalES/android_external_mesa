@@ -297,8 +297,15 @@ rkt_split_tasks(struct rkt_ml_subgraph *subgraph,
    struct split_task *last_task = util_dynarray_element(
       &operation->tasks, struct split_task,
       util_dynarray_num_elements(&operation->tasks, struct split_task) - 1);
+   /* Also drop a last task holding only rows that no output row reads, as
+    * the leftover bottom rows of a valid convolution: it would produce no
+    * output and hangs the NPU.
+    */
    if (last_task->top_slice >= operation->input_height ||
-       last_task->bottom_slice >= (operation->input_height + pad_bottom)) {
+       last_task->bottom_slice >= (operation->input_height + pad_bottom) ||
+       MIN2(last_task->bottom_slice, operation->input_height - 1) -
+             last_task->top_slice + 1 + pad_bottom <
+          operation->weights_height) {
       (void)util_dynarray_pop_ptr(&operation->tasks, struct split_task);
    }
 
