@@ -524,7 +524,9 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
           * Additions are only supported fused into an operation that produces
           * one of their inputs, the one that runs last, so that the other
           * input is ready.
-          * TODO: Additions with no such operation, e.g. of two graph inputs.
+          * If there is no such operation (both inputs come from outside the
+          * subgraph), an identity convolution on the first input is inserted
+          * to fuse into.
           */
          struct pipe_tensor *add_tensor = poperations[i].input_tensors[1];
          struct rkt_operation *input_op_1 =
@@ -539,7 +541,67 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
             add_tensor = poperations[i].input_tensors[0];
          }
 
-         assert(input_op_2);
+         if (input_op_2 == NULL) {
+            /* A regular 1x1 convolution with diagonal weights, built like the
+             * average pooling above: a depthwise one with a fused addition
+             * hangs the NPU.
+             */
+            struct pipe_tensor *conv_in = poperations[i].input_tensors[0];
+            unsigned channels = conv_in->dims[3];
+            const uint8_t weight_step = 16;
+            uint8_t *weights = calloc(channels * channels, 1);
+            int32_t *biases = calloc(channels, sizeof(int32_t));
+            for (unsigned c = 0; c < channels; c++)
+               weights[c * channels + c] = weight_step;
+
+            struct pipe_tensor weight_tensor = {0};
+            weight_tensor.data = weights;
+            weight_tensor.dims[0] = channels;
+            weight_tensor.dims[1] = 1;
+            weight_tensor.dims[2] = 1;
+            weight_tensor.dims[3] = channels;
+            weight_tensor.zero_point = 0;
+            weight_tensor.is_signed = true;
+            weight_tensor.type_size = 1;
+            weight_tensor.scale = 1.0f / (float)weight_step;
+
+            struct pipe_tensor bias_tensor = {0};
+            bias_tensor.data = (uint8_t *)biases;
+            bias_tensor.dims[0] = channels;
+            bias_tensor.type_size = 4;
+            bias_tensor.scale = conv_in->scale * weight_tensor.scale;
+
+            struct pipe_ml_operation conv = poperations[i];
+            conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
+            conv.input_tensors = &conv_in;
+            conv.input_count = 1;
+            conv.conv.weight_tensor = &weight_tensor;
+            conv.conv.bias_tensor = &bias_tensor;
+            conv.conv.stride_x = 1;
+            conv.conv.stride_y = 1;
+            conv.conv.padding_top = 0;
+            conv.conv.padding_bottom = 0;
+            conv.conv.padding_left = 0;
+            conv.conv.padding_right = 0;
+            conv.conv.depthwise = false;
+            conv.conv.pointwise = true;
+            conv.conv.relu = false;
+            conv.conv.dilation_width_factor = 1;
+            conv.conv.dilation_height_factor = 1;
+
+            struct rkt_operation identity = {0};
+            identity.add_tensor = -1;
+            lower_convolution(subgraph, &conv, &identity);
+            util_dynarray_append(&subgraph->operations, identity);
+            input_op_2 = util_dynarray_top_ptr(&subgraph->operations,
+                                               struct rkt_operation);
+            add_tensor = poperations[i].input_tensors[1];
+            /* The append may have moved the array */
+            input_op_1 = find_producer(subgraph, add_tensor->index);
+
+            free(weights);
+            free(biases);
+         }
 
          if (input_op_1 == NULL) {
             /* Graph input */
@@ -574,6 +636,13 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          create_tensor(subgraph, operation->output_index,
                        calc_raw_output_size(operation));
       }
+
+      /* An addend that is a subgraph input has no other operation creating it */
+      if (operation->add_tensor != -1 &&
+          rkt_get_tensor(subgraph, operation->add_tensor) == NULL) {
+         create_tensor(subgraph, operation->add_tensor,
+                       calc_raw_output_size(operation));
+      }
    }
 
    /* Compile */
@@ -584,6 +653,58 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
    }
 
    return &subgraph->base;
+}
+
+static struct rkt_operation *
+find_addition_consumer(struct rkt_ml_subgraph *subgraph, unsigned tensor_index)
+{
+   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                          operation) {
+      if (operation->add_tensor == tensor_index)
+         return operation;
+   }
+
+   return NULL;
+}
+
+/* Converts a subgraph input that is only read as an addend into the feature
+ * layout, like the general case of the input conversion below. It has the
+ * shape of the output of the operation it is added to.
+ */
+static void
+upload_addend(struct pipe_context *pcontext, struct rkt_ml_subgraph *subgraph,
+              unsigned index, const void *data, bool is_signed)
+{
+   struct rkt_operation *operation = find_addition_consumer(subgraph, index);
+   assert(operation);
+   struct rkt_resource *tensor = rkt_get_tensor(subgraph, index);
+   unsigned width = operation->output_width;
+   unsigned height = operation->output_height;
+   unsigned channels = operation->output_channels;
+   uint8_t offset = rkt_sign_offset(is_signed);
+   /* addition_offset is minus the addend's zero point, in int8 */
+   uint8_t zero_point = -operation->addition_offset;
+   const uint8_t(*in)[width][channels] = data;
+   struct pipe_transfer *transfer;
+   uint8_t *map =
+      pipe_buffer_map(pcontext, &tensor->base, PIPE_MAP_WRITE, &transfer);
+   unsigned n = 0;
+
+   for (int u = 0; u < DIV_ROUND_UP(channels, FEATURE_ATOMIC_SIZE); u++) {
+      for (int y = 0; y < height; y++) {
+         for (int x = 0; x < width; x++) {
+            for (int c = 0; c < FEATURE_ATOMIC_SIZE; c++) {
+               unsigned channel = c + u * FEATURE_ATOMIC_SIZE;
+               if (channel < channels)
+                  map[n++] = in[y][x][channel] - offset;
+               else
+                  map[n++] = zero_point;
+            }
+         }
+      }
+   }
+
+   pipe_buffer_unmap(pcontext, transfer);
 }
 
 void
@@ -601,6 +722,11 @@ rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
    for (int i = 0; i < inputs_count; i++) {
       struct rkt_operation *operation =
          find_first_consumer(subgraph, input_idxs[i]);
+      if (operation == NULL) {
+         upload_addend(pcontext, subgraph, input_idxs[i], inputs[i],
+                       is_signed[i]);
+         continue;
+      }
       struct pipe_resource *input =
          &rkt_get_tensor(subgraph, input_idxs[i])->base;
       unsigned input_channels = operation->input_channels;
