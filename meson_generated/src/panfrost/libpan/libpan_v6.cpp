@@ -21,9 +21,15 @@ namespace {
       vtn_bindgen_dummy() {
          /* Format strings:
           *
+          * FATAL: GPU heap overflow, allocating size %u, at offset %u, heap size %u!
           */
-const uint32_t printf_0_blob[1] = {
-    0x00000000,
+const uint32_t printf_0_blob[25] = {
+    0x00000001, 0x00000003, 0x0000004a, 0x00000004,
+    0x00000004, 0x00000004, 0x41544146, 0x47203a4c,
+    0x68205550, 0x20706165, 0x7265766f, 0x776f6c66,
+    0x6c61202c, 0x61636f6c, 0x676e6974, 0x7a697320,
+    0x75252065, 0x7461202c, 0x66666f20, 0x20746573,
+    0x202c7525, 0x70616568, 0x7a697320, 0x75252065, 0x00000021,
 };
          u_printf_singleton_init_or_ref();
          u_printf_singleton_add_serialized((const void*)printf_0_blob, sizeof(printf_0_blob));

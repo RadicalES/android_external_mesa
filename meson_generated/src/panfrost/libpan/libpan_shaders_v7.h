@@ -10,6 +10,65 @@
 #pragma once
 #include "util/macros.h"
 
+struct panlib_fill_args {
+   uint64_t address;
+   uint32_t value;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_args, value) == 8, "");
+static_assert(sizeof(struct panlib_fill_args) == 12, "");
+
+struct panlib_fill_uint4_args {
+   uint64_t address;
+   uint32_t a;
+   uint32_t b;
+   uint32_t c;
+   uint32_t d;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_uint4_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, a) == 8, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, b) == 12, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, c) == 16, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, d) == 20, "");
+static_assert(sizeof(struct panlib_fill_uint4_args) == 24, "");
+
+struct panlib_fill_scalar_args {
+   uint64_t address;
+   uint32_t value;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_scalar_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_scalar_args, value) == 8, "");
+static_assert(sizeof(struct panlib_fill_scalar_args) == 12, "");
+
+struct panlib_fill_uint4_scalar_args {
+   uint64_t address;
+   uint32_t a;
+   uint32_t b;
+   uint32_t c;
+   uint32_t d;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, a) == 8, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, b) == 12, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, c) == 16, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, d) == 20, "");
+static_assert(sizeof(struct panlib_fill_uint4_scalar_args) == 24, "");
+
+struct panlib_copy_mem_args {
+   uint64_t dst;
+   uint64_t src;
+   uint64_t size;
+} PACKED;
+
+static_assert(offsetof(struct panlib_copy_mem_args, dst) == 0, "");
+static_assert(offsetof(struct panlib_copy_mem_args, src) == 8, "");
+static_assert(offsetof(struct panlib_copy_mem_args, size) == 16, "");
+static_assert(sizeof(struct panlib_copy_mem_args) == 24, "");
+
 struct panlib_copy_query_result_args {
    uint64_t pool_addr;
    uint64_t available_addr;
@@ -57,8 +116,8 @@ static_assert(sizeof(struct panlib_clear_query_result_args) == 36, "");
 
 struct panlib_draw_indirect_helper_args {
    uint64_t cmd;
+   uint64_t heap;
    uint64_t varying_bufs_descs;
-   uint64_t varying_bufs_info;
    uint64_t attrib_bufs_descs;
    uint64_t attrib_bufs_infos;
    uint32_t attrib_bufs_valid;
@@ -75,8 +134,8 @@ struct panlib_draw_indirect_helper_args {
 } PACKED;
 
 static_assert(offsetof(struct panlib_draw_indirect_helper_args, cmd) == 0, "");
-static_assert(offsetof(struct panlib_draw_indirect_helper_args, varying_bufs_descs) == 8, "");
-static_assert(offsetof(struct panlib_draw_indirect_helper_args, varying_bufs_info) == 16, "");
+static_assert(offsetof(struct panlib_draw_indirect_helper_args, heap) == 8, "");
+static_assert(offsetof(struct panlib_draw_indirect_helper_args, varying_bufs_descs) == 16, "");
 static_assert(offsetof(struct panlib_draw_indirect_helper_args, attrib_bufs_descs) == 24, "");
 static_assert(offsetof(struct panlib_draw_indirect_helper_args, attrib_bufs_infos) == 32, "");
 static_assert(offsetof(struct panlib_draw_indirect_helper_args, attrib_bufs_valid) == 40, "");
@@ -100,8 +159,8 @@ struct panlib_draw_indexed_indirect_helper_args {
    uint32_t primitive_vertex_count;
    uint32_t attrib_bufs_valid;
    uint32_t attribs_valid;
+   uint64_t heap;
    uint64_t varying_bufs_descs;
-   uint64_t varying_bufs_info;
    uint64_t attrib_bufs_descs;
    uint64_t attrib_bufs_infos;
    uint64_t attribs_descs;
@@ -121,8 +180,8 @@ static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, index_si
 static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, primitive_vertex_count) == 28, "");
 static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, attrib_bufs_valid) == 32, "");
 static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, attribs_valid) == 36, "");
-static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, varying_bufs_descs) == 40, "");
-static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, varying_bufs_info) == 48, "");
+static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, heap) == 40, "");
+static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, varying_bufs_descs) == 48, "");
 static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, attrib_bufs_descs) == 56, "");
 static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, attrib_bufs_infos) == 64, "");
 static_assert(offsetof(struct panlib_draw_indexed_indirect_helper_args, attribs_descs) == 72, "");
@@ -171,17 +230,22 @@ static_assert(offsetof(struct panlib_indirect_dispatch_args, num_wg_sysval_z) ==
 static_assert(sizeof(struct panlib_indirect_dispatch_args) == 56, "");
 
 enum libpan_shaders_program {
-    PANLIB_COPY_QUERY_RESULT = 0,
-    PANLIB_CLEAR_QUERY_RESULT = 1,
-    PANLIB_DRAW_INDIRECT_HELPER = 2,
-    PANLIB_DRAW_INDEXED_INDIRECT_HELPER = 3,
-    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_0 = 4,
-    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_1 = 5,
-    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_2 = 6,
-    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_3 = 7,
-    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_4 = 8,
-    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_5 = 9,
-    PANLIB_INDIRECT_DISPATCH = 10,
+    PANLIB_FILL = 0,
+    PANLIB_FILL_UINT4 = 1,
+    PANLIB_FILL_SCALAR = 2,
+    PANLIB_FILL_UINT4_SCALAR = 3,
+    PANLIB_COPY_MEM = 4,
+    PANLIB_COPY_QUERY_RESULT = 5,
+    PANLIB_CLEAR_QUERY_RESULT = 6,
+    PANLIB_DRAW_INDIRECT_HELPER = 7,
+    PANLIB_DRAW_INDEXED_INDIRECT_HELPER = 8,
+    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_0 = 9,
+    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_1 = 10,
+    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_2 = 11,
+    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_3 = 12,
+    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_4 = 13,
+    PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_5 = 14,
+    PANLIB_INDIRECT_DISPATCH = 15,
     LIBPAN_SHADERS_NUM_PROGRAMS,
 };
 
@@ -198,6 +262,56 @@ PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER(unsigned index_bytes_log2__3, unsigned pr
    return PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER_0 + idx;
 }
 
+
+#define panlib_fill_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill(_context, _grid, _barrier, address, value) do { \
+   struct panlib_fill_args _args = {address, value};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_uint4_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4(_context, _grid, _barrier, address, a, b, c, d) do { \
+   struct panlib_fill_uint4_args _args = {address, a, b, c, d};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_scalar_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_scalar_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_scalar(_context, _grid, _barrier, address, value) do { \
+   struct panlib_fill_scalar_args _args = {address, value};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4_scalar_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_uint4_scalar_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4_scalar(_context, _grid, _barrier, address, a, b, c, d) do { \
+   struct panlib_fill_uint4_scalar_args _args = {address, a, b, c, d};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_copy_mem_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_copy_mem_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_COPY_MEM, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_copy_mem(_context, _grid, _barrier, dst, src, size) do { \
+   struct panlib_copy_mem_args _args = {dst, src, size};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_COPY_MEM, &_args, sizeof(_args)); \
+} while(0);
 
 #define panlib_copy_query_result_struct(_context, _grid, _barrier, _data) do { \
    struct panlib_copy_query_result_args _args = _data;\
@@ -224,8 +338,8 @@ PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER(unsigned index_bytes_log2__3, unsigned pr
    MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_DRAW_INDIRECT_HELPER, &_args, sizeof(_args)); \
 } while(0);
 
-#define panlib_draw_indirect_helper(_context, _grid, _barrier, cmd, varying_bufs_descs, varying_bufs_info, attrib_bufs_descs, attrib_bufs_infos, attrib_bufs_valid, attribs_valid, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job, primitive_vertex_count) do { \
-   struct panlib_draw_indirect_helper_args _args = {cmd, varying_bufs_descs, varying_bufs_info, attrib_bufs_descs, attrib_bufs_infos, attrib_bufs_valid, attribs_valid, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job, primitive_vertex_count};\
+#define panlib_draw_indirect_helper(_context, _grid, _barrier, cmd, heap, varying_bufs_descs, attrib_bufs_descs, attrib_bufs_infos, attrib_bufs_valid, attribs_valid, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job, primitive_vertex_count) do { \
+   struct panlib_draw_indirect_helper_args _args = {cmd, heap, varying_bufs_descs, attrib_bufs_descs, attrib_bufs_infos, attrib_bufs_valid, attribs_valid, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job, primitive_vertex_count};\
    MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_DRAW_INDIRECT_HELPER, &_args, sizeof(_args)); \
 } while(0);
 
@@ -234,8 +348,8 @@ PANLIB_DRAW_INDEX_MINMAX_SEARCH_HELPER(unsigned index_bytes_log2__3, unsigned pr
    MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_DRAW_INDEXED_INDIRECT_HELPER, &_args, sizeof(_args)); \
 } while(0);
 
-#define panlib_draw_indexed_indirect_helper(_context, _grid, _barrier, cmd, index_buffer_ptr, index_min_max_res, index_size, primitive_vertex_count, attrib_bufs_valid, attribs_valid, varying_bufs_descs, varying_bufs_info, attrib_bufs_descs, attrib_bufs_infos, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job) do { \
-   struct panlib_draw_indexed_indirect_helper_args _args = {cmd, index_buffer_ptr, index_min_max_res, index_size, primitive_vertex_count, attrib_bufs_valid, attribs_valid, varying_bufs_descs, varying_bufs_info, attrib_bufs_descs, attrib_bufs_infos, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job};\
+#define panlib_draw_indexed_indirect_helper(_context, _grid, _barrier, cmd, index_buffer_ptr, index_min_max_res, index_size, primitive_vertex_count, attrib_bufs_valid, attribs_valid, heap, varying_bufs_descs, attrib_bufs_descs, attrib_bufs_infos, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job) do { \
+   struct panlib_draw_indexed_indirect_helper_args _args = {cmd, index_buffer_ptr, index_min_max_res, index_size, primitive_vertex_count, attrib_bufs_valid, attribs_valid, heap, varying_bufs_descs, attrib_bufs_descs, attrib_bufs_infos, attribs_descs, attribs_infos, first_vertex_sysval, first_instance_sysval, raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job};\
    MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_DRAW_INDEXED_INDIRECT_HELPER, &_args, sizeof(_args)); \
 } while(0);
 

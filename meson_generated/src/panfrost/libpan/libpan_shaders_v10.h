@@ -10,6 +10,72 @@
 #pragma once
 #include "util/macros.h"
 
+struct panlib_fill_args {
+   uint64_t address;
+   uint32_t value;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_args, value) == 8, "");
+static_assert(sizeof(struct panlib_fill_args) == 12, "");
+
+struct panlib_fill_uint4_args {
+   uint64_t address;
+   uint32_t a;
+   uint32_t b;
+   uint32_t c;
+   uint32_t d;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_uint4_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, a) == 8, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, b) == 12, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, c) == 16, "");
+static_assert(offsetof(struct panlib_fill_uint4_args, d) == 20, "");
+static_assert(sizeof(struct panlib_fill_uint4_args) == 24, "");
+
+struct panlib_fill_scalar_args {
+   uint64_t address;
+   uint32_t value;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_scalar_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_scalar_args, value) == 8, "");
+static_assert(sizeof(struct panlib_fill_scalar_args) == 12, "");
+
+struct panlib_fill_uint4_scalar_args {
+   uint64_t address;
+   uint32_t a;
+   uint32_t b;
+   uint32_t c;
+   uint32_t d;
+} PACKED;
+
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, address) == 0, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, a) == 8, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, b) == 12, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, c) == 16, "");
+static_assert(offsetof(struct panlib_fill_uint4_scalar_args, d) == 20, "");
+static_assert(sizeof(struct panlib_fill_uint4_scalar_args) == 24, "");
+
+struct panlib_copy_mem_args {
+   uint64_t dst;
+   uint64_t src;
+   uint64_t size;
+} PACKED;
+
+static_assert(offsetof(struct panlib_copy_mem_args, dst) == 0, "");
+static_assert(offsetof(struct panlib_copy_mem_args, src) == 8, "");
+static_assert(offsetof(struct panlib_copy_mem_args, size) == 16, "");
+static_assert(sizeof(struct panlib_copy_mem_args) == 24, "");
+
+struct panlib_copy_mem_indirect_args {
+   uint64_t cmd;
+} PACKED;
+
+static_assert(offsetof(struct panlib_copy_mem_indirect_args, cmd) == 0, "");
+static_assert(sizeof(struct panlib_copy_mem_indirect_args) == 8, "");
+
 struct panlib_copy_ts_query_result_args {
    uint64_t pool_addr;
    uint64_t available_addr;
@@ -71,51 +137,57 @@ static_assert(offsetof(struct panlib_update_prims_generated_query_indirect_args,
 static_assert(sizeof(struct panlib_update_prims_generated_query_indirect_args) == 36, "");
 
 enum libpan_shaders_program {
-    PANLIB_COPY_TS_QUERY_RESULT = 0,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_0 = 1,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_1 = 2,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_2 = 3,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_3 = 4,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_4 = 5,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_5 = 6,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_6 = 7,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_7 = 8,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_8 = 9,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_9 = 10,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_10 = 11,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_11 = 12,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_12 = 13,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_13 = 14,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_14 = 15,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_15 = 16,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_16 = 17,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_17 = 18,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_18 = 19,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_19 = 20,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_20 = 21,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_21 = 22,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_22 = 23,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_23 = 24,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_24 = 25,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_25 = 26,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_26 = 27,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_27 = 28,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_28 = 29,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_29 = 30,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_30 = 31,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_31 = 32,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_32 = 33,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_0 = 34,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_1 = 35,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_2 = 36,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_3 = 37,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_4 = 38,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_5 = 39,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_6 = 40,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_7 = 41,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_8 = 42,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_9 = 43,
-    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_10 = 44,
+    PANLIB_FILL = 0,
+    PANLIB_FILL_UINT4 = 1,
+    PANLIB_FILL_SCALAR = 2,
+    PANLIB_FILL_UINT4_SCALAR = 3,
+    PANLIB_COPY_MEM = 4,
+    PANLIB_COPY_MEM_INDIRECT = 5,
+    PANLIB_COPY_TS_QUERY_RESULT = 6,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_0 = 7,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_1 = 8,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_2 = 9,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_3 = 10,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_4 = 11,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_5 = 12,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_6 = 13,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_7 = 14,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_8 = 15,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_9 = 16,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_10 = 17,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_11 = 18,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_12 = 19,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_13 = 20,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_14 = 21,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_15 = 22,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_16 = 23,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_17 = 24,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_18 = 25,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_19 = 26,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_20 = 27,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_21 = 28,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_22 = 29,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_23 = 30,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_24 = 31,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_25 = 32,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_26 = 33,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_27 = 34,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_28 = 35,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_29 = 36,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_30 = 37,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_31 = 38,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_RESTART_32 = 39,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_0 = 40,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_1 = 41,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_2 = 42,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_3 = 43,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_4 = 44,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_5 = 45,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_6 = 46,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_7 = 47,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_8 = 48,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_9 = 49,
+    PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_10 = 50,
     LIBPAN_SHADERS_NUM_PROGRAMS,
 };
 
@@ -143,6 +215,66 @@ PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT(unsigned compact_prim__11)
    return PANLIB_UPDATE_PRIMS_GENERATED_QUERY_INDIRECT_0 + idx;
 }
 
+
+#define panlib_fill_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill(_context, _grid, _barrier, address, value) do { \
+   struct panlib_fill_args _args = {address, value};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_uint4_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4(_context, _grid, _barrier, address, a, b, c, d) do { \
+   struct panlib_fill_uint4_args _args = {address, a, b, c, d};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_scalar_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_scalar_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_scalar(_context, _grid, _barrier, address, value) do { \
+   struct panlib_fill_scalar_args _args = {address, value};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4_scalar_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_fill_uint4_scalar_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_fill_uint4_scalar(_context, _grid, _barrier, address, a, b, c, d) do { \
+   struct panlib_fill_uint4_scalar_args _args = {address, a, b, c, d};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_FILL_UINT4_SCALAR, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_copy_mem_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_copy_mem_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_COPY_MEM, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_copy_mem(_context, _grid, _barrier, dst, src, size) do { \
+   struct panlib_copy_mem_args _args = {dst, src, size};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_COPY_MEM, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_copy_mem_indirect_struct(_context, _grid, _barrier, _data) do { \
+   struct panlib_copy_mem_indirect_args _args = _data;\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_COPY_MEM_INDIRECT, &_args, sizeof(_args)); \
+} while(0);
+
+#define panlib_copy_mem_indirect(_context, _grid, _barrier, cmd) do { \
+   struct panlib_copy_mem_indirect_args _args = {cmd};\
+   MESA_DISPATCH_PRECOMP(_context, _grid, _barrier, PANLIB_COPY_MEM_INDIRECT, &_args, sizeof(_args)); \
+} while(0);
 
 #define panlib_copy_ts_query_result_struct(_context, _grid, _barrier, _data) do { \
    struct panlib_copy_ts_query_result_args _args = _data;\
