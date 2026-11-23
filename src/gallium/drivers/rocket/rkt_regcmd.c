@@ -180,8 +180,6 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
     * bytes of the low 16 bits, with their sign extended into the rest */
    int32_t pad_con1 = (int16_t)((uint8_t)task->input_zero_point * 0x0101);
 
-   if (operation->addition_input || operation->add_tensor != -1)
-      pad_con1 = 0xffffff80;
 
    EMIT(REG_CNA_PAD_CON1, pad_con1);
 
