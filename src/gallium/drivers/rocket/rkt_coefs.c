@@ -150,9 +150,10 @@ rkt_max_weights_scale(const struct pipe_ml_operation *poperation)
    return scale;
 }
 
+/* With a fused PReLU, BN is taken and BS applies the whole ratio */
 static void
 pack_per_channel(void *map, const int32_t *biases,
-                 const struct pipe_ml_operation *poperation)
+                 const struct pipe_ml_operation *poperation, bool prelu)
 {
    const float *scales = poperation->conv.weight_tensor->scales;
    unsigned output_channels = poperation->output_tensors[0]->dims[3];
@@ -168,8 +169,9 @@ pack_per_channel(void *map, const int32_t *biases,
       int16_t *group_muls = (int16_t *)(group + BS_GROUP * sizeof(int32_t));
       /* Channels whose weights are all 0 can have a scale of 0 */
       float ratio = max_scale > 0 ? scales[oc] / max_scale : 0;
-      int k = ratio > 0 ? CLAMP((int)floorf(-log2f(ratio)), 0, BN_MUL_SHIFT)
-                        : BN_MUL_SHIFT;
+      int k = prelu       ? 0
+              : ratio > 0 ? CLAMP((int)floorf(-log2f(ratio)), 0, BN_MUL_SHIFT)
+                          : BN_MUL_SHIFT;
 
       group_biases[oc % BS_GROUP] = biases[oc];
       group_muls[oc % BS_GROUP] =
@@ -178,10 +180,63 @@ pack_per_channel(void *map, const int32_t *biases,
    }
 }
 
+static float
+prelu_alpha_value(const struct pipe_tensor *alpha, unsigned channel)
+{
+   unsigned count = alpha->dims[0] * alpha->dims[1] * alpha->dims[2] *
+                    alpha->dims[3];
+   unsigned i = count == 1 ? 0 : channel;
+   int q = alpha->is_signed ? ((const int8_t *)alpha->data)[i]
+                            : ((const uint8_t *)alpha->data)[i];
+
+   return alpha->scale * (q - alpha->zero_point);
+}
+
+/*
+ * The operands of a fused PReLU: |alpha| for BN at the largest shift that keeps
+ * them in int16, and the signs for EW. The multipliers shift positive and
+ * negative results by different amounts, and in PReLU mode positive inputs
+ * skip the multiplication but are still shifted, so a negative alpha can't be
+ * applied in one stage: its results are positive, and would need the shift of
+ * 0 of the unmultiplied positive values.
+ */
+static unsigned
+pack_prelu(void *map, const struct pipe_tensor *alpha, unsigned output_channels,
+           bool per_channel, bool *sign)
+{
+   int16_t *muls = (int16_t *)((uint8_t *)map +
+                               rkt_bn_operands_offset(output_channels,
+                                                      per_channel));
+   int8_t *signs = (int8_t *)((uint8_t *)map +
+                              rkt_ew_operands_offset(output_channels,
+                                                     per_channel));
+   float max_alpha = 0;
+   unsigned shift = BN_MUL_SHIFT;
+
+   for (unsigned oc = 0; oc < output_channels; oc++)
+      max_alpha = MAX2(max_alpha, fabsf(prelu_alpha_value(alpha, oc)));
+
+   while (shift > 0 && lroundf(max_alpha * (1 << shift)) > INT16_MAX)
+      shift--;
+
+   *sign = false;
+   for (unsigned oc = 0; oc < output_channels; oc++) {
+      float value = prelu_alpha_value(alpha, oc);
+
+      muls[oc] = lroundf(fabsf(value) * (1 << shift));
+      signs[oc] = value < 0 ? -1 : 1;
+      *sign |= value < 0;
+   }
+
+   return shift;
+}
+
 struct pipe_resource *
 rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
                 const struct pipe_ml_operation *poperation,
-                unsigned *truncate_bits)
+                const struct pipe_tensor *prelu_alpha,
+                unsigned *truncate_bits, unsigned *prelu_shift,
+                bool *prelu_sign)
 {
    struct pipe_context *pcontext = subgraph->context;
    unsigned output_channels = poperation->output_tensors[0]->dims[3];
@@ -195,7 +250,10 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
    unsigned size;
    void *map;
 
-   if (per_channel)
+   if (prelu_alpha)
+      size = rkt_ew_operands_offset(output_channels, per_channel) +
+             output_channels;
+   else if (per_channel)
       size = rkt_bn_muls_offset(output_channels) +
              output_channels * sizeof(int16_t);
    else
@@ -267,9 +325,16 @@ rkt_fill_biases(struct rkt_ml_subgraph *subgraph,
    }
 
    if (per_channel) {
-      pack_per_channel(map, (int32_t *)biases, poperation);
+      pack_per_channel(map, (int32_t *)biases, poperation,
+                       prelu_alpha != NULL);
       free(biases);
    }
+
+   *prelu_shift = 0;
+   *prelu_sign = false;
+   if (prelu_alpha)
+      *prelu_shift = pack_prelu(map, prelu_alpha, output_channels, per_channel,
+                                prelu_sign);
 
    if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
       static int task = 0;

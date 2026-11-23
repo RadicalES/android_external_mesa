@@ -203,11 +203,15 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       feat_mode_cfg |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
 
    EMIT(REG_DPU_FEATURE_MODE_CFG, feat_mode_cfg);
-   EMIT(REG_DPU_DATA_FORMAT,
-        operation->per_channel
-           ? DPU_DATA_FORMAT_BS_MUL_SHIFT_VALUE_NEG(BS_MUL_SHIFT) |
-                DPU_DATA_FORMAT_BN_MUL_SHIFT_VALUE_NEG(BN_MUL_SHIFT)
-           : 0);
+   /* The multipliers shift negative results by these, positive ones by the
+    * shifts in their *_MUL_CFG */
+   uint32_t data_format = 0;
+   if (operation->per_channel)
+      data_format |= DPU_DATA_FORMAT_BS_MUL_SHIFT_VALUE_NEG(BS_MUL_SHIFT);
+   if (rkt_bn_used(operation))
+      data_format |=
+         DPU_DATA_FORMAT_BN_MUL_SHIFT_VALUE_NEG(rkt_bn_neg_shift(operation));
+   EMIT(REG_DPU_DATA_FORMAT, data_format);
    EMIT(REG_DPU_OFFSET_PEND, 0);
    EMIT(REG_DPU_DST_BASE_ADDR,
         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
@@ -258,13 +262,14 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
            DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
    EMIT(REG_DPU_BN_CFG,
         DPU_BN_CFG_BN_RELU_BYPASS(1) |
-           DPU_BN_CFG_BN_MUL_BYPASS(!operation->per_channel) |
+           DPU_BN_CFG_BN_MUL_PRELU(operation->prelu) |
+           DPU_BN_CFG_BN_MUL_BYPASS(!rkt_bn_used(operation)) |
            DPU_BN_CFG_BN_ALU_BYPASS(1) |
-           DPU_BN_CFG_BN_BYPASS(!operation->per_channel));
+           DPU_BN_CFG_BN_BYPASS(!rkt_bn_used(operation)));
    EMIT(REG_DPU_BN_ALU_CFG, 0);
    EMIT(REG_DPU_BN_MUL_CFG,
-        operation->per_channel
-           ? DPU_BN_MUL_CFG_BN_MUL_SHIFT_VALUE(BN_MUL_SHIFT) |
+        rkt_bn_used(operation)
+           ? DPU_BN_MUL_CFG_BN_MUL_SHIFT_VALUE(rkt_bn_shift(operation)) |
                 DPU_BN_MUL_CFG_BN_MUL_SRC(1)
            : 0);
    EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
@@ -312,10 +317,20 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
       EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(out_scale));
       EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(out_shift - 1));
    } else {
-      EMIT(REG_DPU_EW_CFG,
-           DPU_EW_CFG_EW_RELU_BYPASS(1) | DPU_EW_CFG_EW_OP_CVT_BYPASS(1) |
-              DPU_EW_CFG_EW_LUT_BYPASS(1) | DPU_EW_CFG_EW_OP_BYPASS(1) |
-              DPU_EW_CFG_EW_BYPASS(1));
+      /* A fused PReLU's signs: per-channel int8 operands that multiply
+       * negative values only */
+      if (operation->prelu_sign) {
+         EMIT(REG_DPU_EW_CFG,
+              DPU_EW_CFG_EDATA_SIZE(1) | DPU_EW_CFG_EW_RELU_BYPASS(1) |
+                 DPU_EW_CFG_EW_OP_CVT_BYPASS(1) | DPU_EW_CFG_EW_LUT_BYPASS(1) |
+                 DPU_EW_CFG_EW_OP_SRC(1) | DPU_EW_CFG_EW_MUL_PRELU(1) |
+                 DPU_EW_CFG_EW_OP_TYPE(1));
+      } else {
+         EMIT(REG_DPU_EW_CFG,
+              DPU_EW_CFG_EW_RELU_BYPASS(1) | DPU_EW_CFG_EW_OP_CVT_BYPASS(1) |
+                 DPU_EW_CFG_EW_LUT_BYPASS(1) | DPU_EW_CFG_EW_OP_BYPASS(1) |
+                 DPU_EW_CFG_EW_BYPASS(1));
+      }
       EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, 0);
       EMIT(REG_DPU_EW_CVT_SCALE_VALUE, DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE(1));
       EMIT(REG_DPU_EW_RELUX_CMP_VALUE, 0);
@@ -385,12 +400,13 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
         rkt_resource(operation->biases)->phys_addr);
    /* Bit 2 fetches the BN multipliers */
-   if (operation->per_channel) {
+   if (rkt_bn_used(operation)) {
       EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG,
            DPU_RDMA_RDMA_NRDMA_CFG_NRDMA_DATA_USE(0x4));
       EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR,
            rkt_resource(operation->biases)->phys_addr +
-              rkt_bn_muls_offset(task->output_channels_real));
+              rkt_bn_operands_offset(task->output_channels_real,
+                                     operation->per_channel));
    } else {
       EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 0);
       EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
@@ -410,6 +426,15 @@ fill_first_regcmd(struct rkt_ml_subgraph *subgraph,
               task->output_offset + ew_base_offset);
       EMIT(REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,
            DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE(ew_stride));
+   } else if (operation->prelu_sign) {
+      /* One int8 operand per channel */
+      EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG,
+           DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE(1));
+      EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+           rkt_resource(operation->biases)->phys_addr +
+              rkt_ew_operands_offset(task->output_channels_real,
+                                     operation->per_channel));
+      EMIT(REG_DPU_RDMA_RDMA_EW_SURF_STRIDE, 0);
    } else {
       EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG, DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE(1));
       EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0);

@@ -1115,6 +1115,7 @@ enum pipe_ml_operation_type {
    PIPE_ML_OPERATION_TYPE_MINIMUM,
    PIPE_ML_OPERATION_TYPE_SOFTMAX,
    PIPE_ML_OPERATION_TYPE_MEAN,
+   PIPE_ML_OPERATION_TYPE_PRELU,
 };
 
 enum pipe_ml_pooling_type {

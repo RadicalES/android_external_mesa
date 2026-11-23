@@ -177,6 +177,7 @@ compile_operation(struct rkt_ml_subgraph *subgraph,
 static void
 lower_convolution(struct rkt_ml_subgraph *subgraph,
                   const struct pipe_ml_operation *poperation,
+                  const struct pipe_tensor *prelu_alpha,
                   struct rkt_operation *operation)
 {
    operation->tasks = UTIL_DYNARRAY_INIT;
@@ -211,8 +212,102 @@ lower_convolution(struct rkt_ml_subgraph *subgraph,
    operation->per_channel = poperation->conv.weight_tensor->scales != NULL;
 
    operation->weights = rkt_fill_weights(subgraph, poperation);
-   operation->biases =
-      rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
+   operation->prelu = prelu_alpha != NULL;
+   operation->biases = rkt_fill_biases(
+      subgraph, poperation, prelu_alpha, &operation->truncate_bits,
+      &operation->prelu_shift, &operation->prelu_sign);
+}
+
+/*
+ * The alpha of a PReLU that can be fused into poperations[index]: the only
+ * operation reading its output. A fused ReLU would come after the PReLU.
+ */
+static const struct pipe_tensor *
+fused_prelu_alpha(const struct pipe_ml_operation *poperations, unsigned count,
+                  unsigned index, bool relu)
+{
+   unsigned output = poperations[index].output_tensors[0]->index;
+   const struct pipe_ml_operation *prelu = NULL;
+
+   if (relu)
+      return NULL;
+
+   for (unsigned i = 0; i < count; i++) {
+      for (unsigned j = 0; j < poperations[i].input_count; j++) {
+         if (poperations[i].input_tensors[j]->index != output)
+            continue;
+         if (prelu || poperations[i].type != PIPE_ML_OPERATION_TYPE_PRELU ||
+             j != 0)
+            return NULL;
+         prelu = &poperations[i];
+      }
+   }
+
+   return prelu ? prelu->input_tensors[1] : NULL;
+}
+
+/*
+ * Appends a regular 1x1 convolution with diagonal weights on input, built like
+ * the average pooling below, for an operation with nothing to fuse into. A
+ * depthwise one with a fused addition hangs the NPU.
+ */
+static struct rkt_operation *
+append_identity_convolution(struct rkt_ml_subgraph *subgraph,
+                            const struct pipe_ml_operation *poperation,
+                            struct pipe_tensor *input,
+                            const struct pipe_tensor *prelu_alpha)
+{
+   unsigned channels = input->dims[3];
+   const uint8_t weight_step = 16;
+   uint8_t *weights = calloc(channels * channels, 1);
+   int32_t *biases = calloc(channels, sizeof(int32_t));
+   for (unsigned c = 0; c < channels; c++)
+      weights[c * channels + c] = weight_step;
+
+   struct pipe_tensor weight_tensor = {0};
+   weight_tensor.data = weights;
+   weight_tensor.dims[0] = channels;
+   weight_tensor.dims[1] = 1;
+   weight_tensor.dims[2] = 1;
+   weight_tensor.dims[3] = channels;
+   weight_tensor.zero_point = 0;
+   weight_tensor.is_signed = true;
+   weight_tensor.type_size = 1;
+   weight_tensor.scale = 1.0f / (float)weight_step;
+
+   struct pipe_tensor bias_tensor = {0};
+   bias_tensor.data = (uint8_t *)biases;
+   bias_tensor.dims[0] = channels;
+   bias_tensor.type_size = 4;
+   bias_tensor.scale = input->scale * weight_tensor.scale;
+
+   struct pipe_ml_operation conv = *poperation;
+   conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
+   conv.input_tensors = &input;
+   conv.input_count = 1;
+   conv.conv.weight_tensor = &weight_tensor;
+   conv.conv.bias_tensor = &bias_tensor;
+   conv.conv.stride_x = 1;
+   conv.conv.stride_y = 1;
+   conv.conv.padding_top = 0;
+   conv.conv.padding_bottom = 0;
+   conv.conv.padding_left = 0;
+   conv.conv.padding_right = 0;
+   conv.conv.depthwise = false;
+   conv.conv.pointwise = true;
+   conv.conv.relu = false;
+   conv.conv.dilation_width_factor = 1;
+   conv.conv.dilation_height_factor = 1;
+
+   struct rkt_operation identity = {0};
+   identity.add_tensor = -1;
+   lower_convolution(subgraph, &conv, prelu_alpha, &identity);
+   util_dynarray_append(&subgraph->operations, identity);
+
+   free(weights);
+   free(biases);
+
+   return util_dynarray_top_ptr(&subgraph->operations, struct rkt_operation);
 }
 
 static struct rkt_operation *
@@ -259,6 +354,9 @@ count_tensors(const struct pipe_ml_operation *poperations,
          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
          break;
       case PIPE_ML_OPERATION_TYPE_POOLING:
+         break;
+      case PIPE_ML_OPERATION_TYPE_PRELU:
+         tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
          break;
       default:
          DBG("poperation->type %d\n", poperation->type);
@@ -395,6 +493,34 @@ rkt_ml_operation_supported(struct pipe_ml_device *pdevice,
                   operation->input_tensors[1]->type_size == 1 &&
                   operation->output_tensors[0]->type_size == 1;
       break;
+   case PIPE_ML_OPERATION_TYPE_PRELU: {
+      struct pipe_tensor *input_tensor = operation->input_tensors[0];
+      struct pipe_tensor *alpha = operation->input_tensors[1];
+      struct pipe_tensor *output_tensor = operation->output_tensors[0];
+      unsigned channels = input_tensor->dims[3];
+      unsigned alphas = alpha->dims[0] * alpha->dims[1] * alpha->dims[2] *
+                        alpha->dims[3];
+      /* Without a convolution to fuse into, an identity one */
+      struct rkt_operation identity = {
+         .input_width = input_tensor->dims[2],
+         .input_height = input_tensor->dims[1],
+         .input_channels = channels,
+         .output_channels = channels,
+         .weights_width = 1,
+         .weights_height = 1,
+      };
+
+      /* TODO: Non-8-bit tensors */
+      supported = input_tensor->data == NULL && alpha->data != NULL &&
+                  input_tensor->type_size == 1 && alpha->type_size == 1 &&
+                  output_tensor->type_size == 1 &&
+                  per_tensor_quantization_supported(input_tensor) &&
+                  per_tensor_quantization_supported(alpha) &&
+                  per_tensor_quantization_supported(output_tensor) &&
+                  (alphas == 1 || alphas == channels) &&
+                  rkt_task_input_fits(&identity);
+      break;
+   }
    case PIPE_ML_OPERATION_TYPE_POOLING: {
       struct pipe_tensor *input_tensor = operation->input_tensors[0];
       struct pipe_tensor *output_tensor = operation->output_tensors[0];
@@ -459,7 +585,10 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
 
       switch (poperations[i].type) {
       case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
-         lower_convolution(subgraph, &poperations[i], &operation);
+         lower_convolution(subgraph, &poperations[i],
+                           fused_prelu_alpha(poperations, count, i,
+                                             poperations[i].conv.relu),
+                           &operation);
          util_dynarray_append(&subgraph->operations, operation);
          break;
       case PIPE_ML_OPERATION_TYPE_POOLING: {
@@ -512,7 +641,9 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          conv.conv.dilation_width_factor = 1;
          conv.conv.dilation_height_factor = 1;
 
-         lower_convolution(subgraph, &conv, &operation);
+         lower_convolution(subgraph, &conv,
+                           fused_prelu_alpha(poperations, count, i, false),
+                           &operation);
          util_dynarray_append(&subgraph->operations, operation);
 
          free(weights);
@@ -525,8 +656,8 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
           * one of their inputs, the one that runs last, so that the other
           * input is ready.
           * If there is no such operation (both inputs come from outside the
-          * subgraph), an identity convolution on the first input is inserted
-          * to fuse into.
+          * subgraph, or EW is taken by a fused PReLU), an identity convolution
+          * on the first input is inserted to fuse into.
           */
          struct pipe_tensor *add_tensor = poperations[i].input_tensors[1];
          struct rkt_operation *input_op_1 =
@@ -541,66 +672,16 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
             add_tensor = poperations[i].input_tensors[0];
          }
 
+         /* EW applies the signs of a fused PReLU's negative alphas */
+         if (input_op_2 && input_op_2->prelu_sign)
+            input_op_2 = NULL;
+
          if (input_op_2 == NULL) {
-            /* A regular 1x1 convolution with diagonal weights, built like the
-             * average pooling above: a depthwise one with a fused addition
-             * hangs the NPU.
-             */
-            struct pipe_tensor *conv_in = poperations[i].input_tensors[0];
-            unsigned channels = conv_in->dims[3];
-            const uint8_t weight_step = 16;
-            uint8_t *weights = calloc(channels * channels, 1);
-            int32_t *biases = calloc(channels, sizeof(int32_t));
-            for (unsigned c = 0; c < channels; c++)
-               weights[c * channels + c] = weight_step;
-
-            struct pipe_tensor weight_tensor = {0};
-            weight_tensor.data = weights;
-            weight_tensor.dims[0] = channels;
-            weight_tensor.dims[1] = 1;
-            weight_tensor.dims[2] = 1;
-            weight_tensor.dims[3] = channels;
-            weight_tensor.zero_point = 0;
-            weight_tensor.is_signed = true;
-            weight_tensor.type_size = 1;
-            weight_tensor.scale = 1.0f / (float)weight_step;
-
-            struct pipe_tensor bias_tensor = {0};
-            bias_tensor.data = (uint8_t *)biases;
-            bias_tensor.dims[0] = channels;
-            bias_tensor.type_size = 4;
-            bias_tensor.scale = conv_in->scale * weight_tensor.scale;
-
-            struct pipe_ml_operation conv = poperations[i];
-            conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
-            conv.input_tensors = &conv_in;
-            conv.input_count = 1;
-            conv.conv.weight_tensor = &weight_tensor;
-            conv.conv.bias_tensor = &bias_tensor;
-            conv.conv.stride_x = 1;
-            conv.conv.stride_y = 1;
-            conv.conv.padding_top = 0;
-            conv.conv.padding_bottom = 0;
-            conv.conv.padding_left = 0;
-            conv.conv.padding_right = 0;
-            conv.conv.depthwise = false;
-            conv.conv.pointwise = true;
-            conv.conv.relu = false;
-            conv.conv.dilation_width_factor = 1;
-            conv.conv.dilation_height_factor = 1;
-
-            struct rkt_operation identity = {0};
-            identity.add_tensor = -1;
-            lower_convolution(subgraph, &conv, &identity);
-            util_dynarray_append(&subgraph->operations, identity);
-            input_op_2 = util_dynarray_top_ptr(&subgraph->operations,
-                                               struct rkt_operation);
+            input_op_2 = append_identity_convolution(
+               subgraph, &poperations[i], poperations[i].input_tensors[0], NULL);
             add_tensor = poperations[i].input_tensors[1];
             /* The append may have moved the array */
             input_op_1 = find_producer(subgraph, add_tensor->index);
-
-            free(weights);
-            free(biases);
          }
 
          if (input_op_1 == NULL) {
@@ -618,6 +699,26 @@ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
          input_op_2->output_zero_point =
             rkt_zero_point(poperations[i].output_tensors[0]);
 
+         break;
+      }
+      case PIPE_ML_OPERATION_TYPE_PRELU: {
+         /* Fused into the operation producing the input when there is one
+          * (see fused_prelu_alpha()), else into an identity convolution */
+         const struct pipe_ml_operation *poperation = &poperations[i];
+         struct pipe_tensor *output = poperation->output_tensors[0];
+         struct rkt_operation *producer =
+            find_producer(subgraph, poperation->input_tensors[0]->index);
+
+         if (producer == NULL || !producer->prelu) {
+            append_identity_convolution(subgraph, poperation,
+                                        poperation->input_tensors[0],
+                                        poperation->input_tensors[1]);
+            break;
+         }
+
+         producer->output_index = output->index;
+         producer->output_scale = output->scale;
+         producer->output_zero_point = rkt_zero_point(output);
          break;
       }
       default:

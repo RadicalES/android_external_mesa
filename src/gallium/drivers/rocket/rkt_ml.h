@@ -63,6 +63,13 @@ rkt_zero_point(const struct pipe_tensor *tensor)
  * The shift is shared by all channels, so a single multiplier would lose the
  * precision of small ratios: in units of 2^-BS_MUL_SHIFT, 0.001 becomes 16 and
  * keeps 4 bits, while 0.512 * 2^-9 is 8389 in BS and exact in BN.
+ *
+ * A fused PReLU takes BN, and EW if an alpha is negative (see
+ * rkt_fill_biases()), their operands in the biases buffer from
+ * rkt_bn_operands_offset() and rkt_ew_operands_offset(). With per-channel
+ * weight scales BS then applies the whole ratio r. That only loses precision
+ * for ratios far below the 0.07 seen in real models, such as the ~1e-6 of
+ * channels whose weights are all zero, where it makes no difference.
  */
 #define BS_GROUP      8
 #define BS_MUL_SHIFT  14
@@ -74,6 +81,23 @@ rkt_bn_muls_offset(unsigned output_channels)
 {
    return align(DIV_ROUND_UP(output_channels, BS_GROUP) * BS_GROUP *
                    (sizeof(int32_t) + sizeof(int16_t)),
+                BN_MULS_ALIGN);
+}
+
+/* Where BN's per-channel operands start in the biases buffer */
+static inline unsigned
+rkt_bn_operands_offset(unsigned output_channels, bool per_channel)
+{
+   return per_channel ? rkt_bn_muls_offset(output_channels)
+                      : align(output_channels * sizeof(int32_t), BN_MULS_ALIGN);
+}
+
+/* EW's int8 operands of a fused PReLU, after BN's */
+static inline unsigned
+rkt_ew_operands_offset(unsigned output_channels, bool per_channel)
+{
+   return align(rkt_bn_operands_offset(output_channels, per_channel) +
+                   output_channels * sizeof(int16_t),
                 BN_MULS_ALIGN);
 }
 
@@ -169,10 +193,36 @@ struct rkt_operation {
    float weights_scale; /* the largest one, with per-channel scales */
    bool per_channel;
 
+   /* PReLU fused into BN, its |alpha| in units of 2^-prelu_shift, and EW
+    * applying the signs of negative alphas */
+   bool prelu;
+   unsigned prelu_shift;
+   bool prelu_sign;
+
    int add_tensor;
 
    struct util_dynarray tasks; /* struct split_task */
 };
+
+/* BN applies the per-channel power-of-two scales or a fused PReLU */
+static inline bool
+rkt_bn_used(const struct rkt_operation *operation)
+{
+   return operation->per_channel || operation->prelu;
+}
+
+/* BN's shifts of positive and of negative results */
+static inline unsigned
+rkt_bn_shift(const struct rkt_operation *operation)
+{
+   return operation->prelu ? 0 : BN_MUL_SHIFT;
+}
+
+static inline unsigned
+rkt_bn_neg_shift(const struct rkt_operation *operation)
+{
+   return operation->prelu ? operation->prelu_shift : BN_MUL_SHIFT;
+}
 
 struct rkt_ml_subgraph {
    struct pipe_ml_subgraph base;
